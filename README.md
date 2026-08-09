@@ -55,10 +55,36 @@ below for what a Go rewrite gets and gives up.
   `jspiece.DefaultTimeout`) bounds a runaway/infinite-loop action — CODE
   steps have no such limit, but that's human-reviewed code; a JS piece is
   explicitly meant for code an agent generates with no review gate. Scope
-  is ACTIONS only for now (no JS triggers, no JS `Dropdowns`), and this
-  package doesn't address where JS source text comes from or how it
-  survives a restart — no persistence, matching this project's existing
-  "no persistence" boundary.
+  is ACTIONS only for now (no JS triggers, no JS `Dropdowns`). Persistence
+  — where a JS piece's source lives and how it survives a restart — is now
+  `pkg/catalog` (below), not this package.
+- **Piece catalog persistence & discovery** (`pkg/catalog`): Phase 3 of the
+  "AI-first" direction, closing the gap Phase 2 explicitly left open —
+  `jspiece.New` builds a piece purely in memory, so a piece an agent
+  creates dies with the process, and nothing let an agent check "does a
+  piece for this already exist" before generating a near-duplicate one,
+  which defeats the entire point of a *reused* catalog instead of one
+  recreated every time. A `catalog.Definition` (name, description, and per
+  action: description, a free-text `InputSchema`, and its JS source) is
+  what a `Store` persists; `Definition.ToPiece()` turns it into a real
+  `piece.Piece` via `jspiece.New`, and `RegisterFromStore` loads every
+  Definition in a Store straight into an `Engine`'s registry. Two `Store`
+  implementations, same "simple in-memory default, real persistence is
+  the caller's choice" convention as `piece.Store`/`FileWriter`:
+  `MemoryStore` (dies with the process, mainly for tests) and `FileStore`
+  (one JSON file per piece in a directory — real, actual disk persistence
+  across restarts, zero new dependencies). `catalog.Describe(store)`
+  renders every piece's name/description/actions/input-schema as plain
+  text meant to be handed directly to an agent's context before it
+  decides whether to reuse something instead of authoring a piece again —
+  deliberately plain text for a language model to read, not a search
+  index or embedding lookup; a program that needs the data structurally
+  should call `store.List()` directly. Explicitly not covered: nothing
+  here runs a quality/correctness gate on a Definition before `Save`
+  persists it (an agent could save a broken piece just as easily as a
+  working one), and nothing validates a *flow* that references a
+  cataloged piece before it actually runs — both real, separate gaps,
+  deliberately left open.
 - **CODE step sandbox** (`pkg/sandbox`): runs user JS via
   [goja](https://github.com/dop251/goja) (pure Go, no cgo). Has its own
   direct unit tests (`sandbox_test.go`) — try/catch/finally, nested
@@ -925,3 +951,19 @@ go run ./examples
     either patching goja or abandoning the calling goroutine after a
     deadline while the native call keeps running unsupervised in the
     background, both bigger changes than this testing pass was scoped for.
+- **`pkg/catalog`'s `FileStore` treats a `Definition.Name` as untrusted
+  input, not a safe path segment — a deliberate guard, not an
+  afterthought.** A piece's `Name` can be agent-authored (that's the whole
+  point of this package), and `FileStore` maps it directly to a filename
+  under its store directory. Without validation, a `Name` like
+  `"../../../etc/cron.d/x"` would let a save escape the store directory
+  entirely. `FileStore.path` rejects any name containing a path separator
+  or equal to `"."`/`".."` outright rather than trying to sanitize/clean
+  it — same "reject, don't try to fix adversarial input" posture as
+  `pkg/jspiece`'s guarded `ctx.run.*` hooks.
+  `TestFileStore_RejectsPathTraversalNames` covers both separator styles
+  (`/` and `\`, since this project runs on Windows) plus the bare `.`/`..`
+  cases. Scoped narrowly to what `catalog` actually needs — this is not a
+  general path-sanitization utility, and nothing else in this project
+  currently maps caller-supplied strings to filesystem paths this
+  directly.
