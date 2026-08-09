@@ -79,12 +79,30 @@ below for what a Go rewrite gets and gives up.
   decides whether to reuse something instead of authoring a piece again —
   deliberately plain text for a language model to read, not a search
   index or embedding lookup; a program that needs the data structurally
-  should call `store.List()` directly. Explicitly not covered: nothing
-  here runs a quality/correctness gate on a Definition before `Save`
-  persists it (an agent could save a broken piece just as easily as a
-  working one), and nothing validates a *flow* that references a
-  cataloged piece before it actually runs — both real, separate gaps,
-  deliberately left open.
+  should call `store.List()` directly. A quality gate now covers whether a
+  Definition actually works (below); a *flow* that references a cataloged
+  piece is still never validated ahead of running it — that gap remains.
+- **Quality gate before saving** (`pkg/catalog/validate.go`,
+  `GatedStore`): closes the other half of Phase 3 — a Definition could
+  previously be saved (and later loaded and run for real) without ever
+  having been shown to actually work. Each `ActionDefinition` now carries
+  `Examples` (`Input`/`Auth` in, `WantError` or `CheckOutput`+`WantOutput`
+  expected out); `Validate(def)` runs `piece.Validate` structurally AND
+  actually **executes every example against the real JS-backed action**,
+  same "run it for real, don't just check its shape" discipline as every
+  test in this project. At least one Example per action is required — an
+  action with none fails validation outright, there's no way to skip the
+  check by omission. `GatedStore` wraps any `Store` and refuses `Save` on
+  a validation failure before the underlying store is ever touched — same
+  "wrap the raw op, offer the safe path as a decorator" shape as
+  `piece.RegisterValidated` wrapping `Registry.Register` and
+  `piece.ScopedStore` wrapping a shared `Store`. Output comparison goes
+  through JSON encoding rather than `reflect.DeepEqual` specifically to
+  tolerate goja's int64-vs-float64 export quirks (documented elsewhere in
+  this project) instead of false-failing a correct piece over a numeric
+  type mismatch that was never semantically meaningful.
+  `TestValidate_OutputComparisonToleratesNumericTypeQuirks` proves this
+  directly (`int64(42)` vs. `float64(42)` compares equal).
 - **CODE step sandbox** (`pkg/sandbox`): runs user JS via
   [goja](https://github.com/dop251/goja) (pure Go, no cgo). Has its own
   direct unit tests (`sandbox_test.go`) — try/catch/finally, nested

@@ -5,13 +5,13 @@
 // near-duplicate one. That defeats the whole point of a growing, reused
 // catalog instead of a piece re-created every time it's needed.
 //
-// Deliberately narrow scope: this package covers persistence and
-// discovery (a Definition survives a restart; Store.List gives an agent
-// enough to decide whether to reuse or create) — it does NOT add a
-// quality gate before a piece is saved (nothing here runs tests against a
-// Definition before persisting it) and does NOT validate a flow that
-// references a cataloged piece ahead of running it. Both are real,
-// separate gaps, intentionally left for later.
+// Also covers a quality gate (validate.go, GatedStore): a Definition must
+// carry at least one worked Example per action, and Validate actually RUNS
+// them against the piece before GatedStore.Save persists it — catching a
+// structurally-valid-but-broken piece before it ever reaches the shared
+// catalog. Deliberately still narrow beyond that: nothing here validates a
+// *flow* that references a cataloged piece ahead of running it — a real,
+// separate gap, intentionally left for later.
 package catalog
 
 import (
@@ -46,6 +46,13 @@ type ActionDefinition struct {
 	// Source is the action's JS source — see jspiece.ActionSource.Source
 	// for the exact contract.
 	Source string
+
+	// Examples are worked Input/Output cases Validate actually runs
+	// against this action before GatedStore.Save will persist it — see
+	// validate.go. At least one is required by Validate; there is no
+	// engine-enforced way to check a JS action "works" other than running
+	// it against cases its own author (agent or human) provides.
+	Examples []Example
 }
 
 // Definition is a serializable description of one JS-authored piece —
