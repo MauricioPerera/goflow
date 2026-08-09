@@ -1,0 +1,713 @@
+package pieces_test
+
+// Proves the catalog composes in a real flow, not just in isolated
+// per-piece unit tests: a webhook trigger kicks off a run, an HTTP request
+// fetches JSON from a real (httptest) server, and the JSON piece parses the
+// response body — three different catalog pieces chained through {{ }}
+// templating exactly like any hand-authored piece in pkg/engine's own test
+// suite.
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"goflow/pkg/engine"
+	"goflow/pkg/model"
+	"goflow/pkg/piece"
+	"goflow/pkg/pieces"
+)
+
+func TestCatalog_WebhookThenHTTPThenJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"greeting":"hello","count":2}`))
+	}))
+	defer server.Close()
+
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+
+	parseStep := &model.FlowAction{
+		Name: "parsed", DisplayName: "Parse Response", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "json", ActionName: "parse", Input: map[string]any{
+			"text": "{{ fetch.output.body }}",
+		}},
+	}
+	fetchStep := &model.FlowAction{
+		Name: "fetch", DisplayName: "Fetch", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "http", ActionName: "request", Input: map[string]any{
+			"url": server.URL,
+		}},
+		NextAction: parseStep,
+	}
+	fv := &model.FlowVersion{ID: "fv-catalog-integration", Trigger: &model.FlowTrigger{
+		Name: "trigger_1", DisplayName: "Catch Webhook", Type: model.TriggerPiece,
+		PieceName: "webhook", TriggerName: "catch_hook", Input: map[string]any{},
+		NextAction: fetchStep,
+	}}
+
+	state := engine.New(registry).ExecuteBegin(fv, engine.BeginInput{
+		TriggerPayload: map[string]any{"source": "test"},
+		ExecuteTrigger: true,
+	})
+
+	if state.Verdict.Status != model.FlowRunSucceeded {
+		t.Fatalf("verdict = %+v", state.Verdict)
+	}
+
+	fetchOut := state.Steps["fetch"].Output.(map[string]any)
+	if fetchOut["status"] != 200 {
+		t.Fatalf("fetch status = %v, want 200", fetchOut["status"])
+	}
+
+	parsedOut := state.Steps["parsed"].Output.(map[string]any)
+	data := parsedOut["data"].(map[string]any)
+	if data["greeting"] != "hello" || data["count"] != float64(2) {
+		t.Fatalf("parsed data = %+v", data)
+	}
+}
+
+// TestCatalog_HTTPRetriesAgainstFlakyServer is the catalog's own version of
+// pkg/engine's TestRetryOnFailureSucceedsOnThirdAttempt — same mechanism
+// (RetryOnFailure, backoff, a call counter proving the retry loop actually
+// ran), but exercised through the REAL http piece against a REAL (if fake)
+// server instead of a hand-rolled test piece. This also only works at all
+// because of failOnErrorStatus: the http piece's default behavior (a 500 is
+// just data, Run still succeeds) would never trigger a retry — RetryOnFailure
+// only ever looks at whether Run returned an error, never at Output.
+func TestCatalog_HTTPRetriesAgainstFlakyServer(t *testing.T) {
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&requestCount, 1)
+		if n < 3 {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("temporarily unavailable"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"greeting":"recovered"}`))
+	}))
+	defer server.Close()
+
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+
+	parseStep := &model.FlowAction{
+		Name: "parsed", DisplayName: "Parse Response", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "json", ActionName: "parse", Input: map[string]any{
+			"text": "{{ fetch.output.body }}",
+		}},
+	}
+	fetchStep := &model.FlowAction{
+		Name: "fetch", DisplayName: "Fetch", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "http", ActionName: "request", Input: map[string]any{
+			"url":               server.URL,
+			"failOnErrorStatus": true,
+		}},
+		Error:      &model.ErrorHandling{RetryOnFailure: true},
+		NextAction: parseStep,
+	}
+	fv := &model.FlowVersion{ID: "fv-catalog-retry", Trigger: &model.FlowTrigger{
+		Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+		NextAction: fetchStep,
+	}}
+
+	e := engine.New(registry)
+	e.Retry = engine.RetryConstants{MaxAttempts: 5, ExponentialBase: 1, IntervalMs: 3}
+
+	state := e.ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+
+	if state.Verdict.Status != model.FlowRunSucceeded {
+		t.Fatalf("verdict = %+v, want SUCCEEDED once the retry loop reaches the server's 3rd (successful) response", state.Verdict)
+	}
+	if got := atomic.LoadInt32(&requestCount); got != 3 {
+		t.Fatalf("requestCount = %d, want exactly 3 (2 failures + 1 success) — proof the retry loop actually re-hit the server, not that it succeeded by luck", got)
+	}
+
+	fetchOut := state.Steps["fetch"].Output.(map[string]any)
+	if fetchOut["status"] != 200 {
+		t.Fatalf("fetch status = %v, want 200 (the final, successful attempt)", fetchOut["status"])
+	}
+
+	parsedOut := state.Steps["parsed"].Output.(map[string]any)
+	data := parsedOut["data"].(map[string]any)
+	if data["greeting"] != "recovered" {
+		t.Fatalf("parsed data = %+v", data)
+	}
+}
+
+// TestCatalog_HTTPRespectsRateLimitInRealFlow proves the catalog handles a
+// rate-limited API end to end in a real flow, not via the engine's
+// RetryOnFailure (which is what TestCatalog_HTTPRetriesAgainstFlakyServer
+// exercises) but via the http piece's own respectRetryAfter: the server
+// returns 429 + Retry-After for the first two requests, then succeeds, and
+// the fetch step's Run itself waits and re-sends — no engine-level retry
+// configured on this step at all.
+func TestCatalog_HTTPRespectsRateLimitInRealFlow(t *testing.T) {
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&requestCount, 1)
+		if n < 3 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte("rate limited"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"greeting":"finally"}`))
+	}))
+	defer server.Close()
+
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+
+	parseStep := &model.FlowAction{
+		Name: "parsed", DisplayName: "Parse Response", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "json", ActionName: "parse", Input: map[string]any{
+			"text": "{{ fetch.output.body }}",
+		}},
+	}
+	fetchStep := &model.FlowAction{
+		Name: "fetch", DisplayName: "Fetch", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "http", ActionName: "request", Input: map[string]any{
+			"url":               server.URL,
+			"respectRetryAfter": true,
+		}},
+		NextAction: parseStep,
+	}
+	fv := &model.FlowVersion{ID: "fv-catalog-rate-limit", Trigger: &model.FlowTrigger{
+		Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+		NextAction: fetchStep,
+	}}
+
+	state := engine.New(registry).ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+
+	if state.Verdict.Status != model.FlowRunSucceeded {
+		t.Fatalf("verdict = %+v, want SUCCEEDED once the piece's own rate-limit retry reaches the 3rd (successful) response", state.Verdict)
+	}
+	if got := atomic.LoadInt32(&requestCount); got != 3 {
+		t.Fatalf("requestCount = %d, want exactly 3 (2 rate-limited + 1 success) — proof the http piece itself retried, no engine-level RetryOnFailure was configured on this step", got)
+	}
+
+	fetchOut := state.Steps["fetch"].Output.(map[string]any)
+	if fetchOut["status"] != 200 {
+		t.Fatalf("fetch status = %v, want 200 (the final, successful attempt)", fetchOut["status"])
+	}
+
+	parsedOut := state.Steps["parsed"].Output.(map[string]any)
+	data := parsedOut["data"].(map[string]any)
+	if data["greeting"] != "finally" {
+		t.Fatalf("parsed data = %+v", data)
+	}
+}
+
+// TestCatalog_HTTPSendsOAuth2AuthInRealFlow proves an OAuth2-authenticated
+// call works through the catalog's own http piece in a real flow — not a
+// hand-rolled piece like pkg/engine's TestFlow_OAuth2Auth_Succeeds, whose
+// "crm" piece checked ctx.Auth itself and never actually built an HTTP
+// request. The auth value here flows the exact same way as everywhere else
+// in goflow: a *piece.OAuth2Auth placed under piece.AuthInputKey in the
+// step's Input, resolved untouched (expr.Resolve's default case), and
+// surfaced as ctx.Auth — no OAuth2-specific engine code involved.
+func TestCatalog_HTTPSendsOAuth2AuthInRealFlow(t *testing.T) {
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"whoami":"authenticated"}`))
+	}))
+	defer server.Close()
+
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+
+	parseStep := &model.FlowAction{
+		Name: "parsed", DisplayName: "Parse Response", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "json", ActionName: "parse", Input: map[string]any{
+			"text": "{{ fetch.output.body }}",
+		}},
+	}
+	fetchStep := &model.FlowAction{
+		Name: "fetch", DisplayName: "Fetch", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "http", ActionName: "request", Input: map[string]any{
+			"url": server.URL,
+			piece.AuthInputKey: &piece.OAuth2Auth{
+				AccessToken: "oauth-token-xyz",
+				Data:        map[string]any{"token_type": "Bearer", "expires_in": 3600},
+			},
+		}},
+		NextAction: parseStep,
+	}
+	fv := &model.FlowVersion{ID: "fv-catalog-oauth2", Trigger: &model.FlowTrigger{
+		Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+		NextAction: fetchStep,
+	}}
+
+	state := engine.New(registry).ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+
+	if state.Verdict.Status != model.FlowRunSucceeded {
+		t.Fatalf("verdict = %+v", state.Verdict)
+	}
+	if gotAuth != "Bearer oauth-token-xyz" {
+		t.Fatalf("server saw Authorization = %q, want %q", gotAuth, "Bearer oauth-token-xyz")
+	}
+
+	fetchOut := state.Steps["fetch"].Output.(map[string]any)
+	if fetchOut["status"] != 200 {
+		t.Fatalf("fetch status = %v, want 200", fetchOut["status"])
+	}
+
+	parsedOut := state.Steps["parsed"].Output.(map[string]any)
+	data := parsedOut["data"].(map[string]any)
+	if data["whoami"] != "authenticated" {
+		t.Fatalf("parsed data = %+v", data)
+	}
+}
+
+// TestCatalog_MultiTenancy_ConcurrentTenantsSharingOneRegistryDontLeak asks a
+// different question than pkg/engine's TestMultiTenancy_SeparateEnginesFullyIsolated
+// and TestMultiTenancy_ComposedProjectAndFlowScoping: those prove isolation
+// via separate engines and ScopedStore. None of the four catalog pieces
+// touch Store or FileWriter at all — http/json/delay/webhook are pure
+// per-call logic — so there is no per-tenant STATE for the catalog itself to
+// isolate the way those tests needed. What's actually worth proving here:
+// the realistic deployment shape (ONE process, ONE shared registry/engine,
+// many tenants' flows running concurrently — nobody spins up a fresh Engine
+// per request) never lets one tenant's OAuth2 token or response leak into
+// another's, since the http piece allocates a fresh *http.Request and
+// *http.Client per call with no shared mutable state to race on. Run with
+// -race; each tenant's server also rejects any request not carrying ITS OWN
+// token, so a leaked/crossed auth header is impossible to miss.
+func TestCatalog_MultiTenancy_ConcurrentTenantsSharingOneRegistryDontLeak(t *testing.T) {
+	const tenantCount = 8
+
+	type tenant struct {
+		name   string
+		token  string
+		server *httptest.Server
+	}
+	tenants := make([]*tenant, tenantCount)
+	for i := range tenants {
+		te := &tenant{name: fmt.Sprintf("tenant-%d", i), token: fmt.Sprintf("token-%d", i)}
+		te.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "Bearer "+te.token {
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`{"tenant":"WRONG-AUTH-LEAKED"}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"tenant":%q}`, te.name)
+		}))
+		tenants[i] = te
+	}
+	defer func() {
+		for _, te := range tenants {
+			te.server.Close()
+		}
+	}()
+
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+	e := engine.New(registry) // ONE engine/registry shared by every tenant below
+
+	results := make([]*model.ExecutionState, tenantCount)
+	var wg sync.WaitGroup
+	for i, te := range tenants {
+		wg.Add(1)
+		go func(i int, te *tenant) {
+			defer wg.Done()
+			parseStep := &model.FlowAction{
+				Name: "parsed", DisplayName: "Parse Response", Type: model.ActionPiece,
+				Piece: &model.PieceSettings{PieceName: "json", ActionName: "parse", Input: map[string]any{
+					"text": "{{ fetch.output.body }}",
+				}},
+			}
+			fetchStep := &model.FlowAction{
+				Name: "fetch", DisplayName: "Fetch", Type: model.ActionPiece,
+				Piece: &model.PieceSettings{PieceName: "http", ActionName: "request", Input: map[string]any{
+					"url":              te.server.URL,
+					piece.AuthInputKey: &piece.OAuth2Auth{AccessToken: te.token},
+				}},
+				NextAction: parseStep,
+			}
+			fv := &model.FlowVersion{ID: fmt.Sprintf("fv-tenant-%d", i), Trigger: &model.FlowTrigger{
+				Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+				NextAction: fetchStep,
+			}}
+			results[i] = e.ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+		}(i, te)
+	}
+	wg.Wait()
+
+	for i, te := range tenants {
+		state := results[i]
+		if state.Verdict.Status != model.FlowRunSucceeded {
+			t.Fatalf("tenant %d verdict = %+v", i, state.Verdict)
+		}
+		parsedOut := state.Steps["parsed"].Output.(map[string]any)
+		data := parsedOut["data"].(map[string]any)
+		if data["tenant"] != te.name {
+			t.Fatalf("tenant %d got %+v, want tenant %q — cross-tenant auth/response leak", i, data, te.name)
+		}
+	}
+}
+
+// TestCatalog_EncryptDecryptRoundTripThroughRealFlow is the catalog's own
+// version of pkg/engine's TestFlow_EncryptDecryptRoundTrip — same mechanism
+// (AES-GCM, key via ctx.Auth), but through the real crypto piece instead of
+// the hand-rolled "vault" test fixture, chained with the real json piece to
+// prove the ciphertext composes as an ordinary string value through {{ }}
+// templating like anything else.
+func TestCatalog_EncryptDecryptRoundTripThroughRealFlow(t *testing.T) {
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+
+	key := []byte("0123456789abcdef") // AES-128
+
+	decryptStep := &model.FlowAction{
+		Name: "decrypt", DisplayName: "Decrypt", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "crypto", ActionName: "decrypt", Input: map[string]any{
+			piece.AuthInputKey: key,
+			"ciphertext":       "{{ envelope.output.data.ciphertext }}",
+		}},
+	}
+	// Round-trips the ciphertext through the json piece too (stringify then
+	// parse) — proving it survives as an ordinary opaque string value
+	// through the rest of the catalog, not just through direct step output.
+	envelopeStep := &model.FlowAction{
+		Name: "envelope", DisplayName: "Envelope", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "json", ActionName: "parse", Input: map[string]any{
+			"text": "{{ envelope_text.output.text }}",
+		}},
+		NextAction: decryptStep,
+	}
+	envelopeTextStep := &model.FlowAction{
+		Name: "envelope_text", DisplayName: "Envelope Text", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "json", ActionName: "stringify", Input: map[string]any{
+			"data": map[string]any{"ciphertext": "{{ encrypt.output.ciphertext }}"},
+		}},
+		NextAction: envelopeStep,
+	}
+	encryptStep := &model.FlowAction{
+		Name: "encrypt", DisplayName: "Encrypt", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "crypto", ActionName: "encrypt", Input: map[string]any{
+			piece.AuthInputKey: key,
+			"plaintext":        "the launch codes are 12345",
+		}},
+		NextAction: envelopeTextStep,
+	}
+	fv := &model.FlowVersion{ID: "fv-catalog-crypto", Trigger: &model.FlowTrigger{
+		Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+		NextAction: encryptStep,
+	}}
+
+	state := engine.New(registry).ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+
+	if state.Verdict.Status != model.FlowRunSucceeded {
+		t.Fatalf("verdict = %+v", state.Verdict)
+	}
+
+	ciphertext, _ := state.Steps["encrypt"].Output.(map[string]any)["ciphertext"].(string)
+	if ciphertext == "" || ciphertext == "the launch codes are 12345" {
+		t.Fatalf("ciphertext = %q, want a real (non-empty, non-plaintext) encrypted value", ciphertext)
+	}
+
+	decryptOut := state.Steps["decrypt"].Output.(map[string]any)
+	if decryptOut["plaintext"] != "the launch codes are 12345" {
+		t.Fatalf("decrypt output = %+v", decryptOut)
+	}
+}
+
+// TestCatalog_DecryptWithWrongKeyFailsClearly is the catalog's own version
+// of pkg/engine's TestFlow_DecryptWithWrongKeyFailsClearly.
+func TestCatalog_DecryptWithWrongKeyFailsClearly(t *testing.T) {
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+
+	rightKey := []byte("0123456789abcdef")
+	wrongKey := []byte("fedcba9876543210")
+
+	decryptStep := &model.FlowAction{
+		Name: "decrypt", DisplayName: "Decrypt", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "crypto", ActionName: "decrypt", Input: map[string]any{
+			piece.AuthInputKey: wrongKey, // deliberately not the key encrypt used
+			"ciphertext":       "{{ encrypt.output.ciphertext }}",
+		}},
+	}
+	encryptStep := &model.FlowAction{
+		Name: "encrypt", DisplayName: "Encrypt", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "crypto", ActionName: "encrypt", Input: map[string]any{
+			piece.AuthInputKey: rightKey,
+			"plaintext":        "top secret",
+		}},
+		NextAction: decryptStep,
+	}
+	fv := &model.FlowVersion{ID: "fv-catalog-crypto-wrong-key", Trigger: &model.FlowTrigger{
+		Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+		NextAction: encryptStep,
+	}}
+
+	state := engine.New(registry).ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+
+	if state.Verdict.Status != model.FlowRunFailed {
+		t.Fatalf("verdict = %+v, want FAILED — GCM authentication must reject the wrong key", state.Verdict)
+	}
+}
+
+// TestCatalog_StorageWriteThroughRealFlow proves storage.write works through
+// the real catalog (pieces.RegisterAll), not just the piece's own isolated
+// unit tests — the first catalog piece to touch ctx.Files at all.
+func TestCatalog_StorageWriteThroughRealFlow(t *testing.T) {
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+
+	writeStep := &model.FlowAction{
+		Name: "write", DisplayName: "Write", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "storage", ActionName: "write", Input: map[string]any{
+			"fileName": "greeting.txt",
+			"content":  "hello from the catalog",
+			"format":   "text",
+		}},
+	}
+	fv := &model.FlowVersion{ID: "fv-catalog-storage", Trigger: &model.FlowTrigger{
+		Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+		NextAction: writeStep,
+	}}
+
+	e := engine.New(registry)
+	state := e.ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+
+	if state.Verdict.Status != model.FlowRunSucceeded {
+		t.Fatalf("verdict = %+v", state.Verdict)
+	}
+	url, _ := state.Steps["write"].Output.(map[string]any)["fileURL"].(string)
+	if url == "" {
+		t.Fatal("fileURL is empty")
+	}
+	writer := e.Files.(*piece.MemoryFileWriter)
+	data, ok := writer.Get(url)
+	if !ok || string(data) != "hello from the catalog" {
+		t.Fatalf("stored data = %q, ok=%v", data, ok)
+	}
+}
+
+// TestCatalog_ApprovalPauseResumeThroughRealFlow proves approval.request
+// works through the real catalog: a flow pauses on it, resumes with a
+// decision, and a chained step reads the decision via {{ }} templating —
+// the first catalog piece to actually pause a flow.
+func TestCatalog_ApprovalPauseResumeThroughRealFlow(t *testing.T) {
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+
+	summarizeStep := &model.FlowAction{
+		Name: "summarize", DisplayName: "Summarize", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "json", ActionName: "stringify", Input: map[string]any{
+			"data": map[string]any{"wasApproved": "{{ approve.output.approved }}"},
+		}},
+	}
+	approveStep := &model.FlowAction{
+		Name: "approve", DisplayName: "Approve", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "approval", ActionName: "request", Input: map[string]any{
+			"message": "ship it?",
+		}},
+		NextAction: summarizeStep,
+	}
+	fv := &model.FlowVersion{ID: "fv-catalog-approval", Trigger: &model.FlowTrigger{
+		Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+		NextAction: approveStep,
+	}}
+
+	e := engine.New(registry)
+	begun := e.ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+	if begun.Verdict.Status != model.FlowRunPaused {
+		t.Fatalf("verdict = %+v, want PAUSED", begun.Verdict)
+	}
+
+	resumed := e.ExecuteResume(fv, engine.ResumeInput{
+		PriorState:    begun,
+		ResumePayload: map[string]any{"approved": true},
+	})
+	if resumed.Verdict.Status != model.FlowRunSucceeded {
+		t.Fatalf("verdict = %+v, want SUCCEEDED", resumed.Verdict)
+	}
+	text, _ := resumed.Steps["summarize"].Output.(map[string]any)["text"].(string)
+	if text != `{"wasApproved":true}` {
+		t.Fatalf("summarize text = %q", text)
+	}
+}
+
+// TestCatalog_NewPiecesComposeInRealOrderFlow chains all eight pieces added
+// in this batch (storage, approval is pause-specific so excluded here,
+// webhook_reply, text, datetime, hash, regex, csv) plus the pre-existing
+// webhook trigger into one realistic flow: a webhook delivers a raw order
+// line and its HMAC signature, the flow verifies the signature, extracts
+// fields via regex, uppercases the order id, stamps a timestamp, builds a
+// CSV log line, persists it, and replies synchronously with what it did.
+// Every step's input comes from a PRIOR step's output via {{ }} templating
+// (including array-index access, {{ x.output.groups[0] }}) — this is the
+// piece-to-piece composition unit tests can't catch, since each piece's own
+// _test.go calls Run directly with hand-built Input maps.
+func TestCatalog_NewPiecesComposeInRealOrderFlow(t *testing.T) {
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+
+	secretKey := []byte("order-webhook-secret-key-123456")
+	body := "order_id=ord-4521;amount=99.50"
+	mac := hmac.New(sha256.New, secretKey)
+	mac.Write([]byte(body))
+	wantSignature := hex.EncodeToString(mac.Sum(nil))
+
+	respondStep := &model.FlowAction{
+		Name: "respond", DisplayName: "Respond", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "webhook_reply", ActionName: "respond", Input: map[string]any{
+			"status": int64(200),
+			"body": map[string]any{
+				"orderId": "{{ upper_id.output.text }}",
+				"fileURL": "{{ persist.output.fileURL }}",
+			},
+		}},
+	}
+	persistStep := &model.FlowAction{
+		Name: "persist", DisplayName: "Persist", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "storage", ActionName: "write", Input: map[string]any{
+			"fileName": "orders.csv",
+			"content":  "{{ csv_line.output.text }}",
+			"format":   "text",
+		}},
+		NextAction: respondStep,
+	}
+	csvLineStep := &model.FlowAction{
+		Name: "csv_line", DisplayName: "CSV Line", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "csv", ActionName: "stringify", Input: map[string]any{
+			"headers": []any{"orderId", "amount", "status", "timestamp"},
+			"rows": []any{
+				map[string]any{
+					"orderId":   "{{ upper_id.output.text }}",
+					"amount":    "{{ extract.output.groups[1] }}",
+					"status":    "PROCESSED",
+					"timestamp": "{{ now_step.output.iso }}",
+				},
+			},
+		}},
+		NextAction: persistStep,
+	}
+	nowStep := &model.FlowAction{
+		Name: "now_step", DisplayName: "Now", Type: model.ActionPiece,
+		Piece:      &model.PieceSettings{PieceName: "datetime", ActionName: "now", Input: map[string]any{}},
+		NextAction: csvLineStep,
+	}
+	upperIDStep := &model.FlowAction{
+		Name: "upper_id", DisplayName: "Uppercase Order ID", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "text", ActionName: "case", Input: map[string]any{
+			"text": "{{ extract.output.groups[0] }}",
+			"mode": "upper",
+		}},
+		NextAction: nowStep,
+	}
+	extractStep := &model.FlowAction{
+		Name: "extract", DisplayName: "Extract Order Fields", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "regex", ActionName: "extract_groups", Input: map[string]any{
+			"text":    "{{ trigger_1.output.body }}",
+			"pattern": `order_id=([a-z0-9-]+);amount=([0-9.]+)`,
+		}},
+		NextAction: upperIDStep,
+	}
+	verifyStep := &model.FlowAction{
+		Name: "verify", DisplayName: "Verify Signature", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "hash", ActionName: "hmac", Input: map[string]any{
+			piece.AuthInputKey: secretKey,
+			"text":             "{{ trigger_1.output.body }}",
+			"algorithm":        "sha256",
+		}},
+		NextAction: extractStep,
+	}
+	fv := &model.FlowVersion{ID: "fv-new-pieces-compose", Trigger: &model.FlowTrigger{
+		Name: "trigger_1", DisplayName: "Catch Webhook", Type: model.TriggerPiece,
+		PieceName: "webhook", TriggerName: "catch_hook", Input: map[string]any{},
+		NextAction: verifyStep,
+	}}
+
+	e := engine.New(registry)
+	state := e.ExecuteBegin(fv, engine.BeginInput{
+		TriggerPayload: map[string]any{"body": body, "signature": wantSignature},
+		ExecuteTrigger: true,
+	})
+
+	if state.Verdict.Status != model.FlowRunSucceeded {
+		t.Fatalf("verdict = %+v", state.Verdict)
+	}
+
+	verifyOut := state.Steps["verify"].Output.(map[string]any)
+	if verifyOut["hex"] != wantSignature {
+		t.Fatalf("hmac = %v, want %v", verifyOut["hex"], wantSignature)
+	}
+
+	extractOut := state.Steps["extract"].Output.(map[string]any)
+	groups := extractOut["groups"].([]string)
+	if len(groups) != 2 || groups[0] != "ord-4521" || groups[1] != "99.50" {
+		t.Fatalf("groups = %#v", groups)
+	}
+
+	upperOut := state.Steps["upper_id"].Output.(map[string]any)
+	if upperOut["text"] != "ORD-4521" {
+		t.Fatalf("upper_id text = %q", upperOut["text"])
+	}
+
+	nowOut := state.Steps["now_step"].Output.(map[string]any)
+	iso, _ := nowOut["iso"].(string)
+	if iso == "" {
+		t.Fatal("now_step iso is empty")
+	}
+
+	csvOut := state.Steps["csv_line"].Output.(map[string]any)
+	wantCSVLine := fmt.Sprintf("orderId,amount,status,timestamp\nORD-4521,99.50,PROCESSED,%s\n", iso)
+	if csvOut["text"] != wantCSVLine {
+		t.Fatalf("csv_line text = %q, want %q", csvOut["text"], wantCSVLine)
+	}
+
+	persistOut := state.Steps["persist"].Output.(map[string]any)
+	fileURL, _ := persistOut["fileURL"].(string)
+	if fileURL == "" {
+		t.Fatal("persist fileURL is empty")
+	}
+	writer := e.Files.(*piece.MemoryFileWriter)
+	stored, ok := writer.Get(fileURL)
+	if !ok || string(stored) != wantCSVLine {
+		t.Fatalf("stored file = %q, ok=%v, want %q", stored, ok, wantCSVLine)
+	}
+
+	if state.RespondedEarly == nil || state.RespondedEarly.Status != 200 {
+		t.Fatalf("RespondedEarly = %+v", state.RespondedEarly)
+	}
+	respondedBody := state.RespondedEarly.Body.(map[string]any)
+	if respondedBody["orderId"] != "ORD-4521" || respondedBody["fileURL"] != fileURL {
+		t.Fatalf("respondedBody = %+v", respondedBody)
+	}
+}
