@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -709,5 +710,83 @@ func TestCatalog_NewPiecesComposeInRealOrderFlow(t *testing.T) {
 	respondedBody := state.RespondedEarly.Body.(map[string]any)
 	if respondedBody["orderId"] != "ORD-4521" || respondedBody["fileURL"] != fileURL {
 		t.Fatalf("respondedBody = %+v", respondedBody)
+	}
+}
+
+// TestJSONDefinedFlow_ExecutesThroughRealCatalog is the decisive proof for
+// model.ParseFlowVersion: this flow was never built as a Go struct literal
+// at all — it exists ONLY as the JSON string below, exactly the shape an
+// external caller (a human, or an AI agent) would produce. It's parsed,
+// registered against the real catalog, and executed exactly like every
+// other integration test in this file. Also exercises hash.hmac's string
+// auth path (added specifically because a JSON-defined flow can never
+// produce a []byte value for Input[piece.AuthInputKey]).
+func TestJSONDefinedFlow_ExecutesThroughRealCatalog(t *testing.T) {
+	flowJSON := `{
+		"id": "fv-json-defined",
+		"trigger": {
+			"name": "trigger_1",
+			"displayName": "Trigger",
+			"type": "EMPTY",
+			"nextAction": {
+				"name": "sign",
+				"displayName": "Sign",
+				"type": "PIECE",
+				"piece": {
+					"pieceName": "hash",
+					"actionName": "hmac",
+					"input": {
+						"text": "{{ trigger_1.output.body }}",
+						"algorithm": "sha256",
+						"auth": "topsecret"
+					}
+				},
+				"nextAction": {
+					"name": "shout",
+					"displayName": "Shout",
+					"type": "PIECE",
+					"piece": {
+						"pieceName": "text",
+						"actionName": "case",
+						"input": {
+							"text": "{{ sign.output.hex }}",
+							"mode": "upper"
+						}
+					}
+				}
+			}
+		}
+	}`
+
+	fv, err := model.ParseFlowVersion([]byte(flowJSON))
+	if err != nil {
+		t.Fatalf("ParseFlowVersion: %v", err)
+	}
+
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+
+	state := engine.New(registry).ExecuteBegin(fv, engine.BeginInput{
+		TriggerPayload: map[string]any{"body": "hello world"},
+	})
+
+	if state.Verdict.Status != model.FlowRunSucceeded {
+		t.Fatalf("verdict = %+v", state.Verdict)
+	}
+
+	mac := hmac.New(sha256.New, []byte("topsecret"))
+	mac.Write([]byte("hello world"))
+	wantHex := hex.EncodeToString(mac.Sum(nil))
+
+	signOut := state.Steps["sign"].Output.(map[string]any)
+	if signOut["hex"] != wantHex {
+		t.Fatalf("sign hex = %v, want %v", signOut["hex"], wantHex)
+	}
+
+	shoutOut := state.Steps["shout"].Output.(map[string]any)
+	if shoutOut["text"] != strings.ToUpper(wantHex) {
+		t.Fatalf("shout text = %v, want %v", shoutOut["text"], strings.ToUpper(wantHex))
 	}
 }

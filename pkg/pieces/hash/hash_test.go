@@ -64,6 +64,33 @@ func TestHash_HMAC_KnownVector(t *testing.T) {
 	}
 }
 
+func TestHash_HMAC_StringAuthKeyWorksLikeBytes(t *testing.T) {
+	p := hashpiece.New()
+	act := p.Actions["hmac"]
+
+	out, err := act.Run(piece.ActionContext{
+		Input: map[string]any{"text": "hello", "algorithm": "sha256"},
+		Auth:  "my-secret",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	stringHex := out.(map[string]any)["hex"]
+
+	out, err = act.Run(piece.ActionContext{
+		Input: map[string]any{"text": "hello", "algorithm": "sha256"},
+		Auth:  []byte("my-secret"),
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	bytesHex := out.(map[string]any)["hex"]
+
+	if stringHex != bytesHex {
+		t.Fatalf("string auth produced %q, []byte auth produced %q, want identical", stringHex, bytesHex)
+	}
+}
+
 func TestHash_HMAC_UnsupportedAlgorithmFailsClearly(t *testing.T) {
 	p := hashpiece.New()
 	act := p.Actions["hmac"]

@@ -36,6 +36,30 @@ func TestCrypto_EncryptDecryptRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCrypto_StringAuthKeyWorksLikeBytes(t *testing.T) {
+	p := cryptopiece.New()
+	encrypt, decrypt := p.Actions["encrypt"], p.Actions["decrypt"]
+
+	const key = "0123456789abcdef" // AES-128, passed as a string, not []byte
+	out, err := encrypt.Run(piece.ActionContext{
+		Input: map[string]any{"plaintext": "secret"}, Auth: key,
+	})
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	ciphertext := out.(map[string]any)["ciphertext"].(string)
+
+	out, err = decrypt.Run(piece.ActionContext{
+		Input: map[string]any{"ciphertext": ciphertext}, Auth: key,
+	})
+	if err != nil {
+		t.Fatalf("decrypt: %v", err)
+	}
+	if got := out.(map[string]any)["plaintext"]; got != "secret" {
+		t.Fatalf("plaintext = %q", got)
+	}
+}
+
 func TestCrypto_DifferentKeyLengths(t *testing.T) {
 	p := cryptopiece.New()
 	encrypt, decrypt := p.Actions["encrypt"], p.Actions["decrypt"]

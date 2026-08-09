@@ -1,9 +1,11 @@
 // Package hash provides goflow's "Hash" catalog piece: keyless digests
 // (md5/sha1/sha256/sha512) and HMAC signatures. hmac's key travels via
-// ctx.Auth as a []byte, same secret-through-Auth convention as
-// pkg/pieces/crypto's encryption key — the real-world use case is verifying
-// an incoming webhook's signature (e.g. a provider's HMAC-SHA256 header),
-// tying directly into the webhook catalog piece.
+// ctx.Auth as a []byte or a string (its UTF-8 bytes), same secret-through-Auth
+// convention as pkg/pieces/crypto's encryption key — the string case exists
+// so a JSON-authored flow (see model.ParseFlowVersion), which can never
+// produce a []byte value, can still use this action — the real-world use
+// case is verifying an incoming webhook's signature (e.g. a provider's
+// HMAC-SHA256 header), tying directly into the webhook catalog piece.
 package hash
 
 import (
@@ -78,9 +80,9 @@ func hmacAction() piece.Action {
 			if !ok {
 				return nil, fmt.Errorf("missing required input: text (string)")
 			}
-			key, ok := ctx.Auth.([]byte)
+			key, ok := authKey(ctx.Auth)
 			if !ok || len(key) == 0 {
-				return nil, fmt.Errorf("missing HMAC key: expected a []byte under Input[%q]", piece.AuthInputKey)
+				return nil, fmt.Errorf("missing HMAC key: expected a []byte or string under Input[%q]", piece.AuthInputKey)
 			}
 			algorithm, _ := ctx.Input["algorithm"].(string)
 			var newHash func() stdhash.Hash
@@ -98,6 +100,19 @@ func hmacAction() piece.Action {
 			mac.Write([]byte(text))
 			return map[string]any{"hex": hex.EncodeToString(mac.Sum(nil))}, nil
 		},
+	}
+}
+
+// authKey accepts either a []byte (the original convention) or a string
+// (its UTF-8 bytes) — see this package's doc comment for why.
+func authKey(auth any) ([]byte, bool) {
+	switch v := auth.(type) {
+	case []byte:
+		return v, true
+	case string:
+		return []byte(v), true
+	default:
+		return nil, false
 	}
 }
 

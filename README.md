@@ -24,6 +24,18 @@ below for what a Go rewrite gets and gives up.
   under `go test -race`, not just assumed — since each `ExecuteBegin`/
   `ExecuteActionRun` call allocates its own fresh `*model.ExecutionState`
   and nothing touches an action's `Input` map except to read it.
+- **JSON flow definitions** (`pkg/model/json.go`, `model.ParseFlowVersion`):
+  every flow-definition type (`FlowVersion` down to `Condition`) carries a
+  `json` tag, so a flow can be authored as data — by a human, or an AI
+  agent — instead of only as Go struct literals. `Input` values decode as
+  whatever `encoding/json` produces for arbitrary JSON; there's no JSON
+  representation for `*piece.OAuth2Auth`, but a plain string works for every
+  other secret a catalog piece needs (`http`'s Authorization header,
+  `crypto`'s and `hash`'s keys — the latter two were extended to accept a
+  string alongside `[]byte` specifically so a JSON-defined flow can use
+  them at all). Runtime/result types (`StepOutput`, `Verdict`,
+  `ExecutionState`) deliberately have no tags — nothing has asked for those
+  to be caller-authored data yet.
 - **CODE step sandbox** (`pkg/sandbox`): runs user JS via
   [goja](https://github.com/dop251/goja) (pure Go, no cgo). Has its own
   direct unit tests (`sandbox_test.go`) — try/catch/finally, nested
@@ -711,3 +723,37 @@ go run ./examples
   included here — its pause/resume shape doesn't fit a single linear
   `ExecuteBegin` chain, and it's already proven end-to-end on its own via
   `TestCatalog_ApprovalPauseResumeThroughRealFlow`.
+- **JSON flow definitions were built as phase 1 of an explicit "AI-first"
+  direction**: instead of a large fixed node catalog most users barely
+  touch (the stated problem with n8n/activepieces-style tools), the goal is
+  an AI defining flows as data, and growing the catalog itself when a real
+  gap appears — rather than hand-coding a piece per use. Phase 1 only
+  covers the FLOW side: `model.ParseFlowVersion` plus `json` tags on every
+  definition type. Adding json tags was mechanical (Go's default
+  marshaling already handles pointer trees like `FlowAction.NextAction` and
+  `RouterSettings.Children` correctly) — the one real finding was that
+  `pkg/pieces/crypto` and `pkg/pieces/hash`'s `ctx.Auth` handling
+  (`ctx.Auth.([]byte)` only) made both pieces **entirely unusable from a
+  JSON-defined flow**: JSON has no `[]byte` type, so a JSON-supplied secret
+  always decodes as a Go `string`, and the type assertion would just fail
+  silently ("missing key") even though a key was supplied. Fixed by adding
+  a string case to both (`authKey` in each package) — a small, safe,
+  backward-compatible change (existing `[]byte`-passing tests untouched)
+  that was necessary, not optional, for those two pieces to be reachable
+  from JSON at all. `TestJSONDefinedFlow_ExecutesThroughRealCatalog`
+  (`pkg/pieces/integration_test.go`) is the decisive proof: that flow exists
+  *only* as a JSON string in the test — never built as a Go struct — parsed
+  via `ParseFlowVersion` and executed through the real catalog, including
+  `hash.hmac`'s new string-auth path.
+- **Phase 2 (deliberately not started): letting an AI add a genuinely new
+  piece to the catalog without a Go recompile.** Every catalog piece today
+  is Go source code registered at compile time
+  (`pieces.RegisterAll`'s hardcoded import list) — an AI "adding a node" in
+  this repo today still means writing a `.go` file and rebuilding the
+  binary (what the goflow-piece-authoring skill and `TICKETS.md` both
+  assume). The architecturally sound path for true runtime piece authoring
+  is JS-defined pieces on top of the goja sandbox already embedded for CODE
+  steps — but that needs a JS-facing equivalent of the Piece contract
+  (`ctx.Auth`/`ctx.Files`/`ctx.Run.Stop`/`Respond`/`Dropdowns`), which
+  doesn't exist yet. Not attempted here; noted so this isn't mistaken for
+  "AI can add pieces at runtime" already working.

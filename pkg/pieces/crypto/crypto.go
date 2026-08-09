@@ -13,7 +13,11 @@
 // Key management (generating, storing, rotating the AES key) is not this
 // piece's job, same "not this engine's job" boundary as OAuth2 token
 // refresh — the caller supplies the key via ctx.Auth, however it manages
-// that key's lifecycle.
+// that key's lifecycle. ctx.Auth may be a []byte (the original convention)
+// or a string (its UTF-8 bytes used directly) — the latter exists because a
+// JSON-authored flow (see model.ParseFlowVersion) can never produce a
+// []byte value, only JSON-native types; without the string case this piece
+// would be unusable from a JSON-defined flow at all.
 package crypto
 
 import (
@@ -45,9 +49,9 @@ func encryptAction() piece.Action {
 	return piece.Action{
 		Name: "encrypt", DisplayName: "Encrypt",
 		Run: func(ctx piece.ActionContext) (any, error) {
-			key, ok := ctx.Auth.([]byte)
+			key, ok := authKey(ctx.Auth)
 			if !ok || len(key) == 0 {
-				return nil, fmt.Errorf("missing encryption key: expected a []byte under Input[%q]", piece.AuthInputKey)
+				return nil, fmt.Errorf("missing encryption key: expected a []byte or string under Input[%q]", piece.AuthInputKey)
 			}
 			plaintext, ok := ctx.Input["plaintext"].(string)
 			if !ok {
@@ -71,9 +75,9 @@ func decryptAction() piece.Action {
 	return piece.Action{
 		Name: "decrypt", DisplayName: "Decrypt",
 		Run: func(ctx piece.ActionContext) (any, error) {
-			key, ok := ctx.Auth.([]byte)
+			key, ok := authKey(ctx.Auth)
 			if !ok || len(key) == 0 {
-				return nil, fmt.Errorf("missing decryption key: expected a []byte under Input[%q]", piece.AuthInputKey)
+				return nil, fmt.Errorf("missing decryption key: expected a []byte or string under Input[%q]", piece.AuthInputKey)
 			}
 			ciphertextB64, ok := ctx.Input["ciphertext"].(string)
 			if !ok {
@@ -98,6 +102,19 @@ func decryptAction() piece.Action {
 			}
 			return map[string]any{"plaintext": string(plaintext)}, nil
 		},
+	}
+}
+
+// authKey accepts either a []byte (the original convention) or a string
+// (its UTF-8 bytes) — see this package's doc comment for why.
+func authKey(auth any) ([]byte, bool) {
+	switch v := auth.(type) {
+	case []byte:
+		return v, true
+	case string:
+		return []byte(v), true
+	default:
+		return nil, false
 	}
 }
 

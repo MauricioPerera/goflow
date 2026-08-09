@@ -85,42 +85,51 @@ const (
 )
 
 // Condition is one comparison inside a branch's condition group.
+//
+// json tags on this and every other flow-DEFINITION type below (down to
+// FlowVersion) exist so a flow can be authored as JSON data — see
+// ParseFlowVersion in json.go — instead of only as Go struct literals. The
+// runtime/result types further down (StepOutput, Verdict, ExecutionState,
+// etc.) deliberately have no tags: nothing has asked for those to be
+// caller-authored data yet, and Go's default field-name marshaling already
+// covers ad hoc inspection (see Engine's own use of json.Marshal for log
+// size estimation).
 type Condition struct {
-	Operator      BranchOperator
-	FirstValue    string // template string, resolved with {{ }} before evaluating
-	SecondValue   string // template string, resolved with {{ }} before evaluating
-	CaseSensitive bool
+	Operator      BranchOperator `json:"operator"`
+	FirstValue    string         `json:"firstValue"`  // template string, resolved with {{ }} before evaluating
+	SecondValue   string         `json:"secondValue"` // template string, resolved with {{ }} before evaluating
+	CaseSensitive bool           `json:"caseSensitive"`
 }
 
 // RouterBranch is one arm of a ROUTER action. Conditions is an OR-of-AND
 // group list, matching activepieces: Conditions[i] (a group) must ALL be
 // true; any group matching makes the branch match.
 type RouterBranch struct {
-	Name       string
-	Type       BranchType
-	Conditions [][]Condition // ignored when Type == BranchFallback
+	Name       string        `json:"name"`
+	Type       BranchType    `json:"type"`
+	Conditions [][]Condition `json:"conditions,omitempty"` // ignored when Type == BranchFallback
 }
 
 // ErrorHandling controls retry/continue behavior for CODE and PIECE actions.
 type ErrorHandling struct {
-	RetryOnFailure    bool
-	ContinueOnFailure bool
+	RetryOnFailure    bool `json:"retryOnFailure"`
+	ContinueOnFailure bool `json:"continueOnFailure"`
 }
 
 // FlowAction is one node in the action chain. Type selects exactly one of
 // Code/Piece/Router/Loop to be non-nil.
 type FlowAction struct {
-	Name        string
-	DisplayName string
-	Type        FlowActionType
-	Skip        bool
-	NextAction  *FlowAction
-	Error       *ErrorHandling
+	Name        string         `json:"name"`
+	DisplayName string         `json:"displayName"`
+	Type        FlowActionType `json:"type"`
+	Skip        bool           `json:"skip,omitempty"`
+	NextAction  *FlowAction    `json:"nextAction,omitempty"`
+	Error       *ErrorHandling `json:"error,omitempty"`
 
-	Code   *CodeSettings
-	Piece  *PieceSettings
-	Router *RouterSettings
-	Loop   *LoopSettings
+	Code   *CodeSettings   `json:"code,omitempty"`
+	Piece  *PieceSettings  `json:"piece,omitempty"`
+	Router *RouterSettings `json:"router,omitempty"`
+	Loop   *LoopSettings   `json:"loop,omitempty"`
 }
 
 // CodeSettings holds a CODE action's inputs and JS source. Unlike
@@ -128,50 +137,50 @@ type FlowAction struct {
 // time), the source lives inline — see pkg/sandbox for the execution
 // contract.
 type CodeSettings struct {
-	Input  map[string]any // values may contain {{ }} templates, resolved before running
-	Source string         // JS source: must evaluate to a function (params) => value
+	Input  map[string]any `json:"input,omitempty"` // values may contain {{ }} templates, resolved before running
+	Source string         `json:"source"`          // JS source: must evaluate to a function (params) => value
 }
 
 // PieceSettings holds a PIECE action's inputs and which registered piece/action to invoke.
 type PieceSettings struct {
-	PieceName  string
-	ActionName string
-	Input      map[string]any
+	PieceName  string         `json:"pieceName"`
+	ActionName string         `json:"actionName"`
+	Input      map[string]any `json:"input,omitempty"`
 }
 
 // RouterSettings holds a ROUTER action's branches and their child actions.
 // Children is index-aligned with Branches: Children[i] runs if Branches[i] matches.
 type RouterSettings struct {
-	Branches      []RouterBranch
-	Children      []*FlowAction
-	ExecutionType RouterExecutionType
+	Branches      []RouterBranch      `json:"branches"`
+	Children      []*FlowAction       `json:"children"`
+	ExecutionType RouterExecutionType `json:"executionType"`
 }
 
 // LoopSettings holds a LOOP_ON_ITEMS action's item source and per-iteration body.
 type LoopSettings struct {
-	Items           string // template string resolving to an array
-	FirstLoopAction *FlowAction
+	Items           string      `json:"items"` // template string resolving to an array
+	FirstLoopAction *FlowAction `json:"firstLoopAction,omitempty"`
 }
 
 // FlowTrigger is the entry point of a flow.
 type FlowTrigger struct {
-	Name        string
-	DisplayName string
-	Type        FlowTriggerType
-	NextAction  *FlowAction
+	Name        string          `json:"name"`
+	DisplayName string          `json:"displayName"`
+	Type        FlowTriggerType `json:"type"`
+	NextAction  *FlowAction     `json:"nextAction,omitempty"`
 
 	// Populated only when Type == TriggerPiece.
-	PieceName   string
-	TriggerName string
-	Input       map[string]any
+	PieceName   string         `json:"pieceName,omitempty"`
+	TriggerName string         `json:"triggerName,omitempty"`
+	Input       map[string]any `json:"input,omitempty"`
 }
 
 // FlowVersion is the full definition of one flow.
 type FlowVersion struct {
-	ID          string
-	FlowID      string
-	DisplayName string
-	Trigger     *FlowTrigger
+	ID          string       `json:"id"`
+	FlowID      string       `json:"flowId,omitempty"`
+	DisplayName string       `json:"displayName,omitempty"`
+	Trigger     *FlowTrigger `json:"trigger"`
 }
 
 // StepOutput is the recorded result of one executed step (action or trigger).
