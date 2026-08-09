@@ -36,6 +36,29 @@ below for what a Go rewrite gets and gives up.
   them at all). Runtime/result types (`StepOutput`, `Verdict`,
   `ExecutionState`) deliberately have no tags — nothing has asked for those
   to be caller-authored data yet.
+- **JS-authored pieces** (`pkg/jspiece`, `jspiece.New`/`NewAction`): Phase 2
+  of the "AI-first" direction — an action can be authored as JS source
+  (`(ctx) => value`, synchronous only, same rule as CODE steps) instead of
+  Go code, and the resulting `piece.Piece` goes through the exact same
+  `piece.Validate`/`RegisterValidated` path as any hand-written Go piece —
+  the engine cannot tell the difference. This is what makes a piece
+  something an agent can create and use *at runtime, with no Go recompile*,
+  closing the gap Phase 1 (JSON flows, above) explicitly left open. `ctx`
+  gives JS near-parity with Go's `ActionContext`: `ctx.input`, `ctx.auth`
+  (`*piece.OAuth2Auth` becomes `{accessToken, data, props}`, `[]byte`
+  becomes a string), `ctx.executionType`, `ctx.resumePayload`,
+  `ctx.files.write(fileName, content)`, `ctx.run.stop`/`respond`/
+  `waitForWaitpoint`, and `ctx.fetch({url, method, headers, body})` for a
+  real synchronous HTTP call — deliberately the one capability beyond pure
+  logic and the `ActionContext` hooks (see "Design decisions" for the
+  tradeoff). A 5s execution deadline (`goja.Runtime.Interrupt`, via
+  `jspiece.DefaultTimeout`) bounds a runaway/infinite-loop action — CODE
+  steps have no such limit, but that's human-reviewed code; a JS piece is
+  explicitly meant for code an agent generates with no review gate. Scope
+  is ACTIONS only for now (no JS triggers, no JS `Dropdowns`), and this
+  package doesn't address where JS source text comes from or how it
+  survives a restart — no persistence, matching this project's existing
+  "no persistence" boundary.
 - **CODE step sandbox** (`pkg/sandbox`): runs user JS via
   [goja](https://github.com/dop251/goja) (pure Go, no cgo). Has its own
   direct unit tests (`sandbox_test.go`) — try/catch/finally, nested
@@ -757,3 +780,61 @@ go run ./examples
   (`ctx.Auth`/`ctx.Files`/`ctx.Run.Stop`/`Respond`/`Dropdowns`), which
   doesn't exist yet. Not attempted here; noted so this isn't mistaken for
   "AI can add pieces at runtime" already working.
+- **Building the Phase 2 loader (`pkg/jspiece`) found a real, pre-existing
+  bug in `pkg/sandbox` that had shipped since the very first version of
+  this project, undetected the whole time.** `sandbox.Run`'s Promise
+  rejection (`isPromiseLike`) checked `goja.Object.ClassName() == "Promise"`
+  — but goja's actual `ClassName()` for a Promise object is `"Object"`, not
+  `"Promise"`. The check never once matched. `sandbox.Run` was silently
+  returning the raw `*goja.Promise` value as a CODE step's `Output` for any
+  async function, instead of rejecting it — exactly the "resolves to
+  `[object Promise]`-shaped trap" the function's own doc comment says it
+  guards against. Undetected because no test ever called `sandbox.Run` with
+  a Promise-returning source — `sandbox_test.go` covered try/catch/finally
+  fidelity thoroughly but never this path, and every `pkg/engine` CODE-step
+  test happens to use synchronous sources. Found by writing `pkg/jspiece`,
+  which copied the same (broken) check, then wrote a real test for it
+  first — the test failed immediately by returning `nil` error, not the
+  expected rejection, forcing an actual investigation. Root cause: `Export()`
+  on a Promise value returns a `*goja.Promise`, not something
+  `ClassName()`-detectable as `"Object"` vs `"Promise"` — confirmed by a
+  throwaway diagnostic Go program, not guessed. Fixed the check in **both**
+  packages (`_, ok := result.Export().(*goja.Promise)`), and added
+  `TestRun_PromiseReturnIsRejected` to `pkg/sandbox/sandbox_test.go` — a gap
+  that existed since before this Phase 2 work started, closed as a
+  byproduct of it.
+- **`ctx.fetch` gives JS pieces real, unrestricted outbound network
+  access — a deliberate risk, confirmed explicitly rather than defaulted
+  to.** The alternative (pure logic + `ctx.files`/`ctx.run`/`ctx.auth`
+  only, no network) is safer for code an agent generates and registers
+  with no human review, but makes JS pieces unable to call a real API at
+  all — a large chunk of what makes a piece useful. Chose network access;
+  there is no SSRF protection (no blocked internal/private address ranges)
+  — noted here as a real gap, not silently accepted. `fetchJS`'s shape
+  (`{url, method, headers, body}` in, `{status, headers, body}` out)
+  deliberately mirrors `pkg/pieces/http`'s contract for consistency, though
+  the two share no code.
+- **`ctx.fetch({})` (missing `url`), `ctx.files.write` and `ctx.run.*`'s
+  Go-typed arguments (fixed arity: `write(fileName, content)`,
+  `stop(resp)`, `waitForWaitpoint(id)`) were deliberately NOT modeled as
+  `goja.FunctionCall` raw bindings with manual optional-argument handling.**
+  Considered it (to avoid any doubt about how goja converts a missing/extra
+  JS argument into a Go function's parameters) but confirmed via `go doc`
+  that "any other Go function is wrapped so that the arguments are
+  automatically converted" — bundling `fetch`'s options into a single
+  object argument (`ctx.fetch({url, ...})`) sidesteps the
+  optional-second-argument question entirely rather than needing to solve
+  it, and the fixed-arity hooks are always called with all their arguments
+  by any well-formed piece. Simpler than it first looked; verified by the
+  tests actually passing, not just by reading the doc.
+- **A returned JS number's exported Go type depends on whether it passed
+  through untouched or was computed.** `ctx.fetch(...)`'s `status` (an
+  untouched `resp.StatusCode` `int`, wrapped and handed back to JS without
+  modification) exports back to Go as a plain `int`. `Number(res.body) * 2`
+  (genuine JS arithmetic) exports as `int64` for a whole number — both
+  confirmed empirically (a throwaway diagnostic program for the former,
+  `TestJSPiece_RunsThroughRealEngineFlow`'s passing assertion for the
+  latter) rather than assumed from the pre-existing "int64 vs float64
+  depending on whether arithmetic occurred" note elsewhere in this file.
+  Same lesson as every other numeric-quirk finding in this project: don't
+  guess goja's export type, check it.

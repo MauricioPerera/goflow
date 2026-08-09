@@ -42,16 +42,8 @@ func Run(source string, params map[string]any) (any, error) {
 	}
 
 	exported := result.Export()
-	if isPromiseLike(result) {
+	if _, ok := exported.(*goja.Promise); ok {
 		return nil, fmt.Errorf("sandbox: code returned a Promise — async/await is not supported in v1, return a value synchronously")
 	}
 	return exported, nil
-}
-
-func isPromiseLike(v goja.Value) bool {
-	obj, ok := v.(*goja.Object)
-	if !ok {
-		return false
-	}
-	return obj.ClassName() == "Promise"
 }

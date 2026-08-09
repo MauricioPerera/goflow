@@ -144,6 +144,28 @@ func TestRun_CustomErrorClassPreservesTypeAndMessage(t *testing.T) {
 	}
 }
 
+// TestRun_PromiseReturnIsRejected proves the behavior sandbox.go's own doc
+// comment has claimed since it was written: a returned Promise is rejected,
+// not silently resolved to "[object Promise]" or awaited. No test ever
+// exercised this before — the original implementation detected a Promise
+// via `goja.Object.ClassName() == "Promise"`, but goja's actual ClassName()
+// for a Promise object is "Object", not "Promise" (confirmed by inspecting
+// what Export() returns instead: a *goja.Promise). That check never once
+// matched, so Run() was silently returning the *goja.Promise value itself
+// (exported) on every async function — exactly the bad-trap behavior the
+// doc comment says this guards against. Fixed by checking
+// `result.Export().(*goja.Promise)` instead of ClassName().
+func TestRun_PromiseReturnIsRejected(t *testing.T) {
+	source := `(params) => Promise.resolve(42)`
+	_, err := sandbox.Run(source, map[string]any{})
+	if err == nil {
+		t.Fatal("Run() error = nil, want a rejection — a returned Promise must never resolve to a Go value")
+	}
+	if !strings.Contains(err.Error(), "Promise") {
+		t.Fatalf("err = %v, want it to mention the Promise rejection", err)
+	}
+}
+
 func TestRun_FinallyRunsOnBothPaths(t *testing.T) {
 	source := `(params) => {
 		const log = []
