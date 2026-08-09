@@ -12,11 +12,35 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/dop251/goja"
 
 	"goflow/pkg/model"
 )
+
+// DefaultTimeout bounds how long a single {{ }} expression's INTERPRETED
+// execution (loops, JS function calls) may run before being forcibly
+// interrupted via goja.Runtime.Interrupt. Found missing while building an
+// adversarial/fuzz test battery against this project's goja-based
+// packages: unlike pkg/jspiece and pkg/sandbox's CODE steps, Eval had no
+// execution limit at all — and since Phase 1 (model.ParseFlowVersion) lets
+// a flow's Input values, including {{ }} expressions, arrive as external/
+// agent-authored JSON data, an expression like "{{ while(true){} }}" would
+// hang the executing goroutine forever with zero recovery, on every single
+// step resolution in every flow.
+//
+// Real, confirmed limitation of this backstop, not just a theoretical
+// caveat (see TestEval_TimeoutDoesNotBoundNativeBuiltInWallClockTime):
+// goja.Interrupt "does not interrupt native Go functions (which includes
+// all built-ins)" — a native call already in progress (e.g.
+// String.prototype.repeat on a huge count) runs to FULL completion,
+// paying its entire CPU/memory cost, regardless of this timeout; the
+// interrupt only discards the result afterward instead of preventing the
+// cost. So this bounds runaway loops/recursion, but NOT a single
+// expensive native built-in call — same blind spot in pkg/jspiece, which
+// shares this exact mechanism.
+var DefaultTimeout = 5 * time.Second
 
 // wholeTemplate matches a string that is ENTIRELY one {{ ... }} block, e.g.
 // "{{ 1 + 2 }}" — the whole-match case returns the raw JS-evaluated value
@@ -56,8 +80,17 @@ func Eval(expression string, scope Scope) (any, error) {
 			return nil, fmt.Errorf("expr: binding %q: %w", name, err)
 		}
 	}
+
+	timer := time.AfterFunc(DefaultTimeout, func() {
+		vm.Interrupt("expr: expression timed out")
+	})
+	defer timer.Stop()
+
 	v, err := vm.RunString(expression)
 	if err != nil {
+		if interrupted, ok := err.(*goja.InterruptedError); ok {
+			return nil, fmt.Errorf("expr: %v", interrupted)
+		}
 		return nil, fmt.Errorf("expr: evaluating %q: %w", expression, err)
 	}
 	return v.Export(), nil

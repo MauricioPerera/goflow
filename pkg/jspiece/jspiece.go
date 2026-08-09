@@ -29,14 +29,24 @@ import (
 	"goflow/pkg/piece"
 )
 
-// DefaultTimeout bounds how long a single JS action's Run call may execute
-// before being forcibly interrupted. pkg/sandbox's CODE step has no such
-// limit — but that's code a human wrote and could review before it ships.
-// A JS piece is explicitly meant for code an agent generates and registers
-// at runtime with no human review gate; goja has no CPU/memory sandboxing
-// of its own (see pkg/sandbox's doc comment), so an execution deadline is
-// the one cheap backstop available against an infinite loop or a runaway
-// piece.
+// DefaultTimeout bounds how long a single JS action's INTERPRETED execution
+// (loops, JS function calls) may run before being forcibly interrupted via
+// goja.Runtime.Interrupt. pkg/sandbox's CODE step has no such limit — but
+// that's code a human wrote and could review before it ships. A JS piece
+// is explicitly meant for code an agent generates and registers at runtime
+// with no human review gate; goja has no CPU/memory sandboxing of its own
+// (see pkg/sandbox's doc comment), so an execution deadline is the one
+// cheap backstop available against an infinite loop or a runaway piece.
+//
+// Confirmed limitation (see pkg/expr's identical DefaultTimeout and its
+// TestEval_TimeoutDoesNotBoundNativeBuiltInWallClockTime, since this
+// package shares the exact same goja.Interrupt mechanism): a native
+// built-in call already in progress — a huge string/array allocation via
+// String.prototype.repeat, new Array(n), etc. — is NOT preempted. It runs
+// to full completion, paying its entire CPU/memory cost, before the
+// pending interrupt is even noticed; only the RESULT gets discarded
+// afterward. This timeout bounds runaway loops/recursion, not a single
+// expensive native call.
 var DefaultTimeout = 5 * time.Second
 
 // DefaultFetchTimeout bounds a single ctx.fetch(...) call made from JS
@@ -133,13 +143,45 @@ func buildContext(ctx piece.ActionContext) map[string]any {
 		"resumePayload": ctx.ResumePayload,
 		"files": map[string]any{
 			"write": func(fileName, content string) (string, error) {
+				if ctx.Files == nil {
+					return "", fmt.Errorf("ctx.files is not available in this execution context")
+				}
 				return ctx.Files.Write(fileName, []byte(content))
 			},
 		},
+		// Each hook is guarded against being nil before calling it — a real
+		// Go nil-pointer panic from inside a goja-called native function
+		// propagates straight out of act.Run() uncaught (confirmed directly:
+		// calling ctx.run.stop with a zero-value piece.RunHooks panics, not
+		// errors). The engine itself always wires all three hooks, so this
+		// never fires in a normal flow run — it protects any OTHER caller of
+		// a JS-backed piece.Action that doesn't (a bare unit test, a future
+		// "run this piece standalone" tool). Returning a non-nil error as
+		// the last return value makes goja throw a normal, catchable JS
+		// exception instead — see ToValue's doc comment on multi-return Go
+		// functions.
 		"run": map[string]any{
-			"stop":             func(resp map[string]any) { ctx.Run.Stop(toWebhookResponse(resp)) },
-			"respond":          func(resp map[string]any) { ctx.Run.Respond(toWebhookResponse(resp)) },
-			"waitForWaitpoint": func(id string) { ctx.Run.WaitForWaitpoint(id) },
+			"stop": func(resp map[string]any) error {
+				if ctx.Run.Stop == nil {
+					return fmt.Errorf("ctx.run.stop is not available in this execution context")
+				}
+				ctx.Run.Stop(toWebhookResponse(resp))
+				return nil
+			},
+			"respond": func(resp map[string]any) error {
+				if ctx.Run.Respond == nil {
+					return fmt.Errorf("ctx.run.respond is not available in this execution context")
+				}
+				ctx.Run.Respond(toWebhookResponse(resp))
+				return nil
+			},
+			"waitForWaitpoint": func(id string) error {
+				if ctx.Run.WaitForWaitpoint == nil {
+					return fmt.Errorf("ctx.run.waitForWaitpoint is not available in this execution context")
+				}
+				ctx.Run.WaitForWaitpoint(id)
+				return nil
+			},
 		},
 		"fetch": fetchJS,
 	}

@@ -854,3 +854,74 @@ go run ./examples
   `storage.write`, both real catalog pieces. Passed on the first run — no
   registry conflicts, no cross-piece type mismatches between JS-exported
   and Go-native values.
+- **An intense, three-part test battery (adversarial security, engine-scale
+  concurrency/load, and fuzzing) found two real bugs and one real,
+  previously-undocumented safety limitation — worth a consolidated summary
+  since it spans several packages.**
+  - **Adversarial (`pkg/jspiece/adversarial_test.go`)**: deep recursion,
+    prototype pollution across calls, thrown non-Error values, circular
+    return objects, SSRF-reaching fetch, concurrent isolation under
+    `-race` — all held. Found and fixed one real bug:
+    `ctx.run.stop`/`respond`/`waitForWaitpoint` and `ctx.files.write`
+    called from JS against a zero-value `piece.ActionContext` (no hooks
+    wired — e.g. any bare `act.Run()` call outside the engine, which is
+    what most of this package's own tests already do) used to panic with
+    an uncaught Go nil-pointer dereference instead of returning a clean
+    error. The real engine always wires all three hooks, so this never
+    fired in a normal flow — but crashed the calling goroutine for any
+    other caller. Fixed by guarding each hook and returning an error
+    instead (goja converts a Go function's trailing `error` return into a
+    normal, catchable JS exception).
+  - **Concurrency/load (`pkg/engine/stress_test.go`)**: scaled the
+    existing `TestConcurrentFlowRuns_*` tests up an order of magnitude —
+    real catalog pieces under concurrent load, a 5,000-item
+    `LOOP_ON_ITEMS`, a 200-deep nested `ROUTER` chain, a shared registry
+    under simultaneous reads and flow execution — all correct and
+    race-free. One genuine test-infrastructure limit found (not an engine
+    bug): hammering a single local `httptest.Server` with 500 simultaneous
+    raw connections hit Windows' TCP accept-queue limits
+    (`WSAECONNREFUSED`), reproducible across repeated runs. Not a goflow
+    issue — dialed back to 150 concurrent runs against one listener, which
+    is stable and still a real scale increase over the original tests'
+    50.
+  - **Fuzzing (`pkg/model/fuzz_test.go`, `pkg/expr/fuzz_test.go`,
+    `pkg/jspiece/fuzz_test.go`)**: native Go fuzzing (`go test -fuzz`)
+    against `model.ParseFlowVersion` (~12M execs), `expr.Eval`/
+    `expr.Resolve` (~2M execs combined), and JS piece source (~500K
+    execs) — zero panics found across all three. Building `FuzzEval`
+    exposed a real, previously-missing safeguard: `expr.Eval` (the `{{ }}`
+    templating engine — reachable with agent-authored input via Phase 1's
+    JSON flows) had **no execution timeout at all**, unlike
+    `pkg/jspiece`/`pkg/sandbox`. A `{{ while(true){} }}` in any flow's
+    Input would have hung the executing goroutine forever, on every step
+    resolution, with zero recovery. Fixed by adding the same
+    `goja.Interrupt`-based `DefaultTimeout` (5s) the other two packages
+    already use.
+  - **The deeper finding, surfaced only by combining fuzzing with direct
+    measurement, not by fuzzing alone**: that new timeout (and the
+    pre-existing ones in `pkg/jspiece`/`pkg/sandbox`) does NOT bound
+    wall-clock execution time the way it looks like it should.
+    `goja.Runtime.Interrupt`'s own doc comment says it "does not interrupt
+    native Go functions (which includes all built-ins)" — read naively,
+    that sounds like "native calls are just uncovered." A direct,
+    measured comparison
+    (`TestEval_TimeoutDoesNotBoundNativeBuiltInWallClockTime`) shows
+    something more serious: a native built-in call already in progress —
+    `String.prototype.repeat` on a huge count, `new Array(n)` — runs to
+    **full completion**, paying its entire CPU/memory cost, no matter how
+    long that naturally takes; the timeout only discards the result
+    afterward instead of returning it, it never prevents the cost. A
+    100M-char `repeat()` took the same ~200ms whether the timeout was 1ms
+    or absent. First surfaced as an anomaly (one fuzz seed,
+    `'x'.repeat(1e9)`, took 39.5s under `-race` despite a 30ms timeout
+    override) — confirmed with an isolated diagnostic comparing
+    interrupted vs. uninterrupted native calls at several sizes before
+    writing it up, not assumed from the anomaly alone. Documented in all
+    three affected `DefaultTimeout` doc comments (`pkg/expr`,
+    `pkg/jspiece`) as a real, load-bearing limitation: these timeouts
+    protect against runaway *interpreted* execution (loops, JS function
+    calls) but provide no bound whatsoever on a single expensive native
+    built-in call. No fix attempted — bounding native call cost would mean
+    either patching goja or abandoning the calling goroutine after a
+    deadline while the native call keeps running unsupervised in the
+    background, both bigger changes than this testing pass was scoped for.
