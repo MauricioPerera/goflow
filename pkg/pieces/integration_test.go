@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"goflow/pkg/engine"
+	"goflow/pkg/jspiece"
 	"goflow/pkg/model"
 	"goflow/pkg/piece"
 	"goflow/pkg/pieces"
@@ -788,5 +789,94 @@ func TestJSONDefinedFlow_ExecutesThroughRealCatalog(t *testing.T) {
 	shoutOut := state.Steps["shout"].Output.(map[string]any)
 	if shoutOut["text"] != strings.ToUpper(wantHex) {
 		t.Fatalf("shout text = %v, want %v", shoutOut["text"], strings.ToUpper(wantHex))
+	}
+}
+
+// TestCatalog_JSPieceComposesWithRealCatalog proves a JS-authored piece
+// (pkg/jspiece) coexists in the same registry as the full Go catalog with
+// no special-casing — registered alongside pieces.RegisterAll's thirteen
+// Go pieces, chained through {{ }} templating both directions (a real
+// catalog trigger feeds it, its own output feeds a real catalog piece),
+// and persisted through pkg/pieces/storage. The pure-logic risk scoring
+// this JS piece does (no equivalent exists as a Go catalog piece) is
+// exactly the kind of one-off, flow-specific logic Phase 2 exists for:
+// nobody should have to write and ship a Go piece for it.
+func TestCatalog_JSPieceComposesWithRealCatalog(t *testing.T) {
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+
+	riskPiece := jspiece.New("risk_score", "Risk Score", []jspiece.ActionSource{
+		{
+			Name: "classify", DisplayName: "Classify",
+			Source: `(ctx) => {
+				const amount = Number(ctx.input.amount);
+				let level;
+				if (amount > 1000) level = "high";
+				else if (amount > 100) level = "medium";
+				else level = "low";
+				return { level: level, amount: amount };
+			}`,
+		},
+	})
+	if err := registry.RegisterValidated(riskPiece); err != nil {
+		t.Fatalf("RegisterValidated(risk_score): %v", err)
+	}
+
+	persistStep := &model.FlowAction{
+		Name: "persist", DisplayName: "Persist", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "storage", ActionName: "write", Input: map[string]any{
+			"fileName": "risk.json",
+			"content":  "{{ report.output.text }}",
+			"format":   "text",
+		}},
+	}
+	reportStep := &model.FlowAction{
+		Name: "report", DisplayName: "Report", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "json", ActionName: "stringify", Input: map[string]any{
+			"data": map[string]any{
+				"level":  "{{ score.output.level }}",
+				"amount": "{{ score.output.amount }}",
+			},
+		}},
+		NextAction: persistStep,
+	}
+	scoreStep := &model.FlowAction{
+		Name: "score", DisplayName: "Score", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "risk_score", ActionName: "classify", Input: map[string]any{
+			"amount": "{{ trigger_1.output.amount }}",
+		}},
+		NextAction: reportStep,
+	}
+	fv := &model.FlowVersion{ID: "fv-catalog-js", Trigger: &model.FlowTrigger{
+		Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+		NextAction: scoreStep,
+	}}
+
+	e := engine.New(registry)
+	state := e.ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{"amount": int64(750)}})
+
+	if state.Verdict.Status != model.FlowRunSucceeded {
+		t.Fatalf("verdict = %+v", state.Verdict)
+	}
+
+	scoreOut := state.Steps["score"].Output.(map[string]any)
+	if scoreOut["level"] != "medium" {
+		t.Fatalf("score.level = %v, want medium", scoreOut["level"])
+	}
+
+	reportOut := state.Steps["report"].Output.(map[string]any)
+	reportText, _ := reportOut["text"].(string)
+	if reportText == "" {
+		t.Fatal("report text is empty")
+	}
+
+	persistOut := state.Steps["persist"].Output.(map[string]any)
+	fileURL, _ := persistOut["fileURL"].(string)
+	writer := e.Files.(*piece.MemoryFileWriter)
+	stored, ok := writer.Get(fileURL)
+	if !ok || string(stored) != reportText {
+		t.Fatalf("stored file = %q, ok=%v, want %q", stored, ok, reportText)
 	}
 }

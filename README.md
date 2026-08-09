@@ -838,3 +838,19 @@ go run ./examples
   depending on whether arithmetic occurred" note elsewhere in this file.
   Same lesson as every other numeric-quirk finding in this project: don't
   guess goja's export type, check it.
+- **Tested a JS piece registered alongside the real catalog, not just in
+  `pkg/jspiece`'s own isolated registry.** `pkg/jspiece`'s existing tests
+  (including one full engine flow) all used a bare `piece.NewRegistry()`
+  with only the JS piece in it — never proved a JS piece coexists safely
+  with `pieces.RegisterAll`'s thirteen Go pieces in the same registry, or
+  that its output/input actually composes with real catalog pieces through
+  `{{ }}` templating in both directions.
+  `TestCatalog_JSPieceComposesWithRealCatalog`
+  (`pkg/pieces/integration_test.go`) does both: a `risk_score` JS piece
+  (pure classification logic with no Go catalog equivalent — the exact
+  kind of one-off, flow-specific logic Phase 2 exists so nobody has to
+  write and ship a Go piece for) is fed by a real trigger's payload,
+  classifies it, and its output feeds `json.stringify` then
+  `storage.write`, both real catalog pieces. Passed on the first run — no
+  registry conflicts, no cross-piece type mismatches between JS-exported
+  and Go-native values.
