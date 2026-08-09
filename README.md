@@ -81,7 +81,8 @@ below for what a Go rewrite gets and gives up.
   index or embedding lookup; a program that needs the data structurally
   should call `store.List()` directly. A quality gate now covers whether a
   Definition actually works (below); a *flow* that references a cataloged
-  piece is still never validated ahead of running it — that gap remains.
+  piece is checked before running by `pkg/flowvalidate` (below), the last
+  of the four AI-first gaps.
 - **Quality gate before saving** (`pkg/catalog/validate.go`,
   `GatedStore`): closes the other half of Phase 3 — a Definition could
   previously be saved (and later loaded and run for real) without ever
@@ -103,6 +104,36 @@ below for what a Go rewrite gets and gives up.
   type mismatch that was never semantically meaningful.
   `TestValidate_OutputComparisonToleratesNumericTypeQuirks` proves this
   directly (`int64(42)` vs. `float64(42)` compares equal).
+- **Flow validation** (`pkg/flowvalidate`): the fourth and last AI-first
+  gap — a flow (especially one built entirely from Phase 1's JSON data,
+  potentially agent-authored end to end) was never checked for structural
+  soundness before its first real run, which matters once that run has
+  real side effects. `Validate(fv, registry)` walks every reachable step
+  (trigger → `NextAction` chain → each `ROUTER` branch's own chain → each
+  `LOOP_ON_ITEMS` body's own chain) and reports, without stopping at the
+  first problem: a `FlowActionType` whose matching settings field
+  (`Code`/`Piece`/`Router`/`Loop`) is nil; a `PIECE` action or trigger
+  referencing a piece/action that doesn't exist in `registry` (pass `nil`
+  to skip this specific check); `Router.Children`/`Router.Branches` length
+  mismatch; duplicate step names anywhere in the flow (silently clobber
+  each other in `ExecutionState.Steps`, a real and easy mistake); and,
+  most importantly, **a cycle in any `NextAction` chain** — confirmed by
+  reading `Engine.executeChain`'s actual dispatch loop first (a plain
+  `for action != nil { ...; action = action.NextAction }`, no cycle
+  protection at all) rather than assuming: an author-introduced cycle
+  would hang `ExecuteBegin` forever, with zero recovery. Every `{{ }}`
+  expression found anywhere in `Input` maps, `Condition` values, and
+  `LOOP_ON_ITEMS.Items` is checked for valid JS *syntax* via
+  `goja.Compile` — confirmed via `go doc` to build an internal
+  representation without executing anything, so this is safe against
+  adversarial expressions the same way the other `Validate` functions in
+  this project are. Deliberately NOT semantic: this can't and doesn't try
+  to prove `{{ step_1.output.foo }}` will resolve correctly — that depends
+  on `step_1`'s real output once it actually runs, and a bad reference
+  already surfaces as a normal, clear `expr.Eval` error at that point;
+  duplicating that check here would mean simulating execution or risking
+  false positives on expressions this package genuinely can't evaluate
+  ahead of time.
 - **CODE step sandbox** (`pkg/sandbox`): runs user JS via
   [goja](https://github.com/dop251/goja) (pure Go, no cgo). Has its own
   direct unit tests (`sandbox_test.go`) — try/catch/finally, nested
