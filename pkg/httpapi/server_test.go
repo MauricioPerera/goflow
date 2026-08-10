@@ -280,6 +280,97 @@ func TestFlowsRun_MalformedJSON_400(t *testing.T) {
 	}
 }
 
+func simpleLinearFlow() model.FlowVersion {
+	return model.FlowVersion{
+		ID: "fv-export-test",
+		Trigger: &model.FlowTrigger{
+			Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+			NextAction: &model.FlowAction{
+				Name: "double", DisplayName: "Double", Type: model.ActionCode,
+				Code: &model.CodeSettings{
+					Input:  map[string]any{"n": 21},
+					Source: `(params) => ({ doubled: params.n * 2 })`,
+				},
+			},
+		},
+	}
+}
+
+func TestFlowsExportJS_SimpleCodeChain_Succeeds(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "POST", "/flows/export/js", exportRequest{Flow: simpleLinearFlow()}, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/javascript") {
+		t.Fatalf("Content-Type = %q, want application/javascript", ct)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "async function runFlow(") {
+		t.Fatalf("body missing runFlow, want the generated exporter module:\n%s", body)
+	}
+	if !strings.Contains(body, `"id": "fv-export-test"`) {
+		t.Fatalf("body missing the embedded flow JSON:\n%s", body)
+	}
+}
+
+func TestFlowsExportJS_UnsupportedFlow_400(t *testing.T) {
+	srv := newTestServer(t)
+	fv := model.FlowVersion{
+		ID: "fv-bad-export",
+		Trigger: &model.FlowTrigger{
+			Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+			NextAction: &model.FlowAction{
+				Name: "route", DisplayName: "Route", Type: model.ActionRouter,
+				Router: &model.RouterSettings{},
+			},
+		},
+	}
+	rec := do(t, srv, "POST", "/flows/export/js", exportRequest{Flow: fv}, true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	errStr, _ := m["error"].(string)
+	if !strings.Contains(errStr, "route") || !strings.Contains(errStr, "ROUTER") {
+		t.Fatalf("error = %q, want it to name the unsupported ROUTER action", errStr)
+	}
+}
+
+func TestFlowsExportJS_NoAuth_401(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "POST", "/flows/export/js", exportRequest{Flow: simpleLinearFlow()}, false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestFlowExportJS_NamedFlow_Succeeds(t *testing.T) {
+	srv := newTestServer(t)
+	fv := simpleLinearFlow()
+	def := flowstore.FlowDefinition{Name: "my-flow", DisplayName: "My Flow", Flow: fv}
+	rec := do(t, srv, "POST", "/flows", def, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("save status = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = do(t, srv, "POST", "/flows/my-flow/export/js", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "async function runFlow(") {
+		t.Fatalf("body missing runFlow:\n%s", rec.Body.String())
+	}
+}
+
+func TestFlowExportJS_UnknownName_404(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "POST", "/flows/no-such-flow/export/js", nil, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 // TestRecoverMiddleware_PanicBecomes500 drives the actual recover middleware
 // the server uses, wrapping a handler that panics, and asserts it produces a
 // 500 JSON body instead of propagating the panic.

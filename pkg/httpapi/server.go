@@ -25,6 +25,7 @@ import (
 
 	"goflow/pkg/catalog"
 	"goflow/pkg/credentials"
+	"goflow/pkg/exportjs"
 	"goflow/pkg/flowstore"
 	"goflow/pkg/mcpapi"
 	"goflow/pkg/model"
@@ -95,6 +96,11 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /flows/{name}", s.auth(http.HandlerFunc(s.handleFlowGet)))
 	mux.Handle("DELETE /flows/{name}", s.auth(http.HandlerFunc(s.handleFlowDelete)))
 	mux.Handle("POST /flows/{name}/run", s.auth(http.HandlerFunc(s.handleFlowRun)))
+	// /flows/export/js and /flows/{name}/export/js mirror the ad-hoc-vs-named
+	// split of /flows/run and /flows/{name}/run, but for pkg/exportjs instead
+	// of pkg/engine — see handleFlowsExportJS.
+	mux.Handle("POST /flows/export/js", s.auth(http.HandlerFunc(s.handleFlowsExportJS)))
+	mux.Handle("POST /flows/{name}/export/js", s.auth(http.HandlerFunc(s.handleFlowExportJS)))
 	// POST /webhooks/{name} is deliberately NOT behind s.auth — see
 	// handleWebhook's doc comment for why and what gates it instead.
 	mux.HandleFunc("POST /webhooks/{name}", s.handleWebhook)
@@ -366,6 +372,61 @@ func (s *Server) handleFlowRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.runFlowVersion(w, &def.Flow, name, req.Trigger, req.ExecuteTrigger)
+}
+
+// exportRequest is the body shape POST /flows/export/js expects — the same
+// {"flow": ...} envelope runRequest uses for POST /flows/run, minus the
+// trigger fields an export never needs (the generated JS takes its trigger
+// payload as runFlow's own argument at call time, not baked in here).
+type exportRequest struct {
+	Flow model.FlowVersion `json:"flow"`
+}
+
+// handleFlowsExportJS handles POST /flows/export/js — export an ad-hoc
+// FlowVersion to a single, self-contained JavaScript file via pkg/exportjs.
+// Only a flow within exportjs.Supported's subset (an EMPTY trigger plus a
+// linear chain of CODE-only actions) can be exported; anything else is a
+// 400 naming every unsupported trigger/action, not just the first —
+// exportjs.Export's own error already lists them all.
+func (s *Server) handleFlowsExportJS(w http.ResponseWriter, r *http.Request) {
+	var req exportRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSExport(w, &req.Flow)
+}
+
+// handleFlowExportJS handles POST /flows/{name}/export/js — fetch a saved
+// flow by name (404 if missing) and export it exactly like
+// handleFlowsExportJS does for an ad-hoc one.
+func (s *Server) handleFlowExportJS(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	def, ok, err := s.flowStore.Get(name)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	writeJSExport(w, &def.Flow)
+}
+
+// writeJSExport runs exportjs.Export and writes the outcome: the generated
+// JS verbatim as the whole response body (Content-Type
+// application/javascript) on success, or a 400 {"error": ...} naming every
+// unsupported trigger/action on failure.
+func writeJSExport(w http.ResponseWriter, fv *model.FlowVersion) {
+	js, err := exportjs.Export(fv)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(js))
 }
 
 // handleWebhook handles POST /webhooks/{name} — the ingress route a THIRD

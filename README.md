@@ -616,6 +616,37 @@ below for what a Go rewrite gets and gives up.
   inline in `Server.buildRegistry` — is what lets `pkg/scheduler` validate
   and run a flow against the exact same piece registry every other
   transport uses, without duplicating that assembly a third time.
+- **Export a simple linear flow to standalone JavaScript** (`pkg/exportjs`,
+  wired in as `POST /flows/export/js` and `POST /flows/{name}/export/js`):
+  a flow made of an `EMPTY` trigger plus a linear chain of `CODE`-only
+  actions — no `ROUTER`, `LOOP_ON_ITEMS`, or `PIECE` action, no
+  `PIECE_TRIGGER` — can be exported to a single, self-contained `.js` file
+  with no goflow/goja/Go dependency at all, runnable directly in Node or a
+  browser. `exportjs.Supported` reports every unsupported trigger/action a
+  flow has (not just the first), and `exportjs.Export` refuses to produce
+  output for a flow that fails it, naming each violation.
+  The generated file isn't an approximation: `{{ }}` template resolution is
+  re-hosted as real JS (`new Function(...)` against the same named
+  step-scope bindings `pkg/expr` builds — the same approach `pkg/expr`
+  itself takes, since it also evaluates `{{ }}` content as real JS through
+  goja, just re-hosted here instead of in goja), and the retry/backoff
+  (`maxAttempts: 4`, exponential base 2, 2s base interval),
+  `ContinueOnFailure`, `Skip`, and chain-walking/verdict logic mirror
+  `pkg/engine` exactly. The output shape matches `model.ExecutionState`
+  field-for-field, including the always-present `Iterations`/`LastItem`/
+  `LastIndex` on every step (Go's `json.Marshal` includes them regardless —
+  no `omitempty` tag on those three fields), so tooling built against a
+  normal goflow run's output works against an export's output unchanged.
+  Verified end-to-end: the same flow, run through the real engine and
+  through the exported JS under real Node.js, produced identical output
+  (`Steps`, `Verdict`) field-for-field except `DurationMs`.
+  Known, disclosed differences from running the same flow through goflow
+  itself: no per-step execution timeout (`goja.Interrupt` has no
+  synchronous-JS equivalent in a real engine); relies on `new Function(...)`
+  for dynamic code evaluation (fine in Node/browsers unconditionally, but
+  worth checking against a CSP-restricted deployment target); an async
+  (Promise-returning) `CODE` step is rejected, matching `pkg/sandbox.Run`'s
+  synchronous-only rule exactly.
 
 ## Explicitly NOT in v1
 
@@ -626,7 +657,8 @@ deployable product — but two things originally listed here as absent no
 longer are, and should be stated plainly rather than left stale:
 
 - **"No server/API" is no longer true.** `pkg/httpapi` + `cmd/server` is a
-  real HTTP server (`/health`, `/catalog`, `/pieces*`, `/flows*`,
+  real HTTP server (`/health`, `/catalog`, `/pieces*`, `/flows*`
+  (including `/flows/export/js` and `/flows/{name}/export/js`),
   `/credentials*`, `/runs*`, `/mcp`, `/oauth/*`, `/.well-known/oauth-*`,
   `/webhooks/{name}` (deliberately public — see "What's here" above),
   deployed and
