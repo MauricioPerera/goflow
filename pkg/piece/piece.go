@@ -71,6 +71,23 @@ type ActionContext struct {
 	ResumePayload any // set only when ExecutionType == model.ExecutionResume
 	Files         FileWriter
 
+	// Store lets an action remember state across separate flow runs — the
+	// action-side counterpart to TriggerContext.Store (same interface, same
+	// "nil unless the caller supplies one" rule for a Piece.Run invoked
+	// directly). Unlike TriggerContext.Store, *Engine DOES wire this one in
+	// (Engine.Store, defaulting to a fresh MemoryStore in New()) for every
+	// PIECE action it runs, through both ExecuteBegin and
+	// ExecuteActionRun — an action's cross-run memory doesn't depend on an
+	// external scheduler the way a polling trigger's does, so there's no
+	// reason to leave it for the caller to wire by hand. Not scoped per flow
+	// by default: two flows sharing one Engine share one Store, same as
+	// Engine.Files — wrap Engine.Store in a *ScopedStore (or use one Engine
+	// per tenant) if that matters, exactly the pattern
+	// TestMultipleFlowsSameTrigger_ScopedStoreIsolatesCursors and
+	// TestMultiTenancy_SeparateEnginesFullyIsolated already prove for
+	// triggers and Files.
+	Store Store
+
 	// Run exposes the hooks a Piece action calls to affect the surrounding
 	// flow run — pause it, or reply synchronously to whatever triggered it
 	// over a webhook. Mirrors activepieces' context.run.{waitForWaitpoint,

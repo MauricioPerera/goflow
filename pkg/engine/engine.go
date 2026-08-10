@@ -34,10 +34,14 @@ type Engine struct {
 	Retry           RetryConstants
 	MaxLogSizeBytes int // 0 disables the check
 	Files           piece.FileWriter
+	Store           piece.Store // wired into every PIECE action's ActionContext.Store — see its doc comment
 }
 
 func New(registry *piece.Registry) *Engine {
-	return &Engine{Registry: registry, Retry: DefaultRetryConstants, Files: piece.NewMemoryFileWriter()}
+	return &Engine{
+		Registry: registry, Retry: DefaultRetryConstants,
+		Files: piece.NewMemoryFileWriter(), Store: piece.NewMemoryStore(),
+	}
 }
 
 // BeginInput configures a fresh (non-resumed) run.
@@ -327,6 +331,7 @@ func (e *Engine) executePiece(action *model.FlowAction, state *model.ExecutionSt
 			Auth:          resolvedInput[piece.AuthInputKey],
 			ResumePayload: state.ResumePayload,
 			Files:         e.Files,
+			Store:         e.Store,
 			Run: piece.RunHooks{
 				WaitForWaitpoint: func(string) { paused = true },
 				Stop:             func(resp *model.WebhookResponse) { stopResp = resp },

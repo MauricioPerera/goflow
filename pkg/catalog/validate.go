@@ -238,6 +238,7 @@ func runExample(actionPath string, index int, act piece.Action, ex Example) []Va
 		Input: ex.Input,
 		Auth:  ex.Auth,
 		Files: piece.NewMemoryFileWriter(),
+		Store: piece.NewMemoryStore(),
 		Run: piece.RunHooks{
 			Stop:             func(*model.WebhookResponse) {},
 			Respond:          func(*model.WebhookResponse) {},

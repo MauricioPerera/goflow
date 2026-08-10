@@ -821,6 +821,105 @@ func TestMultiTenancy_SeparateEnginesFullyIsolated(t *testing.T) {
 	}
 }
 
+// counterPieceRegistry builds a registry with one action ("bump") that reads
+// an int64 counter from ctx.Store under key, increments it, writes it back,
+// and returns the new value — the smallest possible proof that
+// ActionContext.Store round-trips through a real action Run.
+func counterPieceRegistry(key string) *piece.Registry {
+	registry := piece.NewRegistry()
+	registry.Register(piece.Piece{
+		Name: "counter", DisplayName: "Counter",
+		Actions: map[string]piece.Action{
+			"bump": {
+				Name: "bump", DisplayName: "Bump",
+				Run: func(ctx piece.ActionContext) (any, error) {
+					if ctx.Store == nil {
+						return nil, fmt.Errorf("ActionContext.Store is nil")
+					}
+					n, _ := ctx.Store.Get(key)
+					count, _ := n.(int64)
+					count++
+					ctx.Store.Put(key, count)
+					return map[string]any{"count": count}, nil
+				},
+			},
+		},
+	})
+	return registry
+}
+
+// TestExecutePiece_ActionContextGetsEngineStore proves the gap TICKETS.md's
+// "Not included" section used to describe (ActionContext had no Store field
+// at all) is closed: a PIECE action's ctx.Store is Engine.Store, and — unlike
+// TriggerContext.Store, which Engine.ExecuteBegin never populates — the
+// engine wires it in on every run without the caller doing anything, and it
+// persists across separate ExecuteBegin calls on the same *Engine, exactly
+// like Engine.Files already does.
+func TestExecutePiece_ActionContextGetsEngineStore(t *testing.T) {
+	registry := counterPieceRegistry("hits")
+	e := engine.New(registry)
+	action := &model.FlowAction{
+		Name: "bump", DisplayName: "Bump", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "counter", ActionName: "bump", Input: map[string]any{}},
+	}
+	fv := &model.FlowVersion{ID: "fv-counter", Trigger: trigger(action)}
+
+	first := e.ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+	assertOutput(t, first, "bump", map[string]any{"count": int64(1)})
+
+	second := e.ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+	assertOutput(t, second, "bump", map[string]any{"count": int64(2)})
+
+	if v, ok := e.Store.Get("hits"); !ok || v.(int64) != 2 {
+		t.Fatalf("e.Store.Get(%q) = %v, %v, want 2, true — Engine.Store must be the same instance ActionContext.Store wrapped", "hits", v, ok)
+	}
+}
+
+// TestExecuteActionRun_ActionContextGetsEngineStore proves the standalone
+// (no-flow) run path wires the same Store — ExecuteActionRun reuses
+// executePiece internally, so this mostly guards against that changing.
+func TestExecuteActionRun_ActionContextGetsEngineStore(t *testing.T) {
+	registry := counterPieceRegistry("standalone_hits")
+	e := engine.New(registry)
+	action := &model.FlowAction{
+		Name: "bump", DisplayName: "Bump", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "counter", ActionName: "bump", Input: map[string]any{}},
+	}
+
+	state := e.ExecuteActionRun(action, engine.ActionRunInput{})
+	assertOutput(t, state, "bump", map[string]any{"count": int64(1)})
+
+	state2 := e.ExecuteActionRun(action, engine.ActionRunInput{})
+	assertOutput(t, state2, "bump", map[string]any{"count": int64(2)})
+}
+
+// TestEngineStore_SharedAcrossFlowsUnlessScoped mirrors
+// TestMultipleFlowsSameTrigger_UnscopedSharedStoreClashes /
+// _ScopedStoreIsolatesCursors for the action side: one Engine.Store is
+// shared by every flow that Engine runs, same as Engine.Files — a caller
+// that needs per-flow isolation wraps it in a *piece.ScopedStore (or uses
+// one Engine per tenant, per TestMultiTenancy_SeparateEnginesFullyIsolated),
+// same as it would for Files.
+func TestEngineStore_SharedAcrossFlowsUnlessScoped(t *testing.T) {
+	registry := counterPieceRegistry("shared_key")
+	e := engine.New(registry)
+	action := &model.FlowAction{
+		Name: "bump", DisplayName: "Bump", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "counter", ActionName: "bump", Input: map[string]any{}},
+	}
+
+	fvA := &model.FlowVersion{ID: "flow-a", Trigger: trigger(action)}
+	fvB := &model.FlowVersion{ID: "flow-b", Trigger: trigger(action)}
+
+	stateA := e.ExecuteBegin(fvA, engine.BeginInput{TriggerPayload: map[string]any{}})
+	assertOutput(t, stateA, "bump", map[string]any{"count": int64(1)})
+
+	// Same underlying key, different flow — clashes by default, exactly like
+	// an unscoped Store already does for triggers.
+	stateB := e.ExecuteBegin(fvB, engine.BeginInput{TriggerPayload: map[string]any{}})
+	assertOutput(t, stateB, "bump", map[string]any{"count": int64(2)})
+}
+
 // A "sync webhook, immediate response" flow: a webhook-style PIECE trigger
 // (real, non-EMPTY — see TestRealTrigger) feeding a PIECE action that calls
 // Run.Stop or Run.Respond — activepieces' mechanism for a flow to reply to

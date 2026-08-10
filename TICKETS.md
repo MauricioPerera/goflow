@@ -354,7 +354,19 @@ order**; delimiter-length validation error; empty-text edge case for
   SMTP — was resolved with a hand-rolled, stdlib-only fake SMTP server in
   `email_test.go`, keeping the same "real I/O against a real (if fake)
   protocol server" stance as every other catalog piece.
-- **A `Store`-using action piece** — not possible today: `ActionContext`
-  has no `Store` field at all (only `TriggerContext` does). Not a catalog
-  gap to close with a piece; if this turns out to matter, it's an engine
-  question, not a ticket for this batch.
+- ~~**A `Store`-using action piece** — not possible today: `ActionContext`
+  has no `Store` field at all (only `TriggerContext` does).~~ Done: this WAS
+  an engine question, as this note said — `ActionContext.Store` now exists
+  (`pkg/piece/piece.go`), and `*Engine` wires it (`Engine.Store`, defaulting
+  to a fresh `MemoryStore` in `New()`) into every PIECE action through both
+  `ExecuteBegin` and `ExecuteActionRun`. Unlike `TriggerContext.Store`
+  (still nil unless a caller supplies one directly — the engine never
+  builds a `TriggerContext` with one), an action's `ctx.Store` is always
+  non-nil when run through `*Engine`, since an action's cross-run memory
+  doesn't depend on an external polling scheduler the way a trigger's does.
+  Not scoped per flow automatically — one `Engine.Store` is shared by every
+  flow that Engine runs, same convention as `Engine.Files`; wrap it in a
+  `*piece.ScopedStore` or use one `*Engine` per tenant for isolation. See
+  `TestExecutePiece_ActionContextGetsEngineStore`,
+  `TestExecuteActionRun_ActionContextGetsEngineStore`, and
+  `TestEngineStore_SharedAcrossFlowsUnlessScoped` in `pkg/engine/engine_test.go`.
