@@ -206,6 +206,67 @@ func TestPostPieces_AcceptsValidDefinition(t *testing.T) {
 	}
 }
 
+func TestPiecesExport_ReturnsFullDefinitionIncludingSourceAndExamples(t *testing.T) {
+	srv := newTestServer(t)
+	def := catalog.Definition{
+		Name: "exportable", DisplayName: "Exportable", Description: "a test piece",
+		Actions: []catalog.ActionDefinition{{
+			Name: "ok", DisplayName: "OK", Description: "returns ok",
+			Source: "(params) => ({ ok: true })",
+			Examples: []catalog.Example{{
+				Input:       map[string]any{},
+				CheckOutput: true,
+				WantOutput:  map[string]any{"ok": true},
+			}},
+		}},
+	}
+	if rec := do(t, srv, "POST", "/pieces", def, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save status = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec := do(t, srv, "GET", "/pieces/export", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Pieces []catalog.Definition `json:"pieces"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, rec.Body.String())
+	}
+	if len(body.Pieces) != 1 || body.Pieces[0].Name != "exportable" {
+		t.Fatalf("pieces = %+v, want exactly one named \"exportable\"", body.Pieces)
+	}
+	got := body.Pieces[0]
+	if len(got.Actions) != 1 || got.Actions[0].Source != "(params) => ({ ok: true })" {
+		t.Fatalf("exported Definition is missing its action Source, want the DescribeCombined-lossy fields to be REAL data here: %+v", got)
+	}
+	if len(got.Actions[0].Examples) != 1 {
+		t.Fatalf("exported Definition is missing its action Examples: %+v", got.Actions[0])
+	}
+}
+
+func TestPiecesExport_EmptyCatalog_ReturnsEmptyArray(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/pieces/export", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	pieces, ok := m["pieces"].([]any)
+	if !ok || len(pieces) != 0 {
+		t.Fatalf("pieces = %v, want an empty array", m["pieces"])
+	}
+}
+
+func TestPiecesExport_NoAuth_401(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/pieces/export", nil, false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
 func TestFlowsRun_SimpleCodeAction_Succeeds(t *testing.T) {
 	srv := newTestServer(t)
 	fv := model.FlowVersion{

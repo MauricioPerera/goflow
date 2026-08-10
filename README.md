@@ -526,7 +526,7 @@ below for what a Go rewrite gets and gives up.
   OAuth access token) already has that exact same access on every httpapi
   route today — there's no scopes/permissions concept anywhere in this
   project to make MCP meaningfully narrower, so none of this is a new
-  privilege, only new reachability. Fourteen fixed tools are always present
+  privilege, only new reachability. Fifteen fixed tools are always present
   in `tools/list` alongside the per-flow ones, each with a real, precise
   `inputSchema` (unlike a per-flow tool's deliberately permissive one,
   since these have well-defined Go types behind them, not an untyped
@@ -537,12 +537,18 @@ below for what a Go rewrite gets and gives up.
   `ActionDefinition.InputSchema` already occupy elsewhere in this project,
   for the same reason. Shipped in two tiers so mutating power didn't land
   bundled with what was initially a pure discoverability improvement:
-  - Read-only: `goflow_describe_catalog`, `goflow_list_flows`,
-    `goflow_get_flow`, `goflow_list_runs`, `goflow_get_run`,
-    `goflow_export_flow_js` (the MCP equivalent of `POST /flows/export/js`
-    and `POST /flows/{name}/export/js` combined into one tool — takes
-    exactly one of `name` or `flow`, since export runs no code and
-    persists nothing either way, unlike `goflow_run_flow` below).
+  - Read-only: `goflow_describe_catalog`, `goflow_export_catalog` (the MCP
+    equivalent of `GET /pieces/export` — every JS-authored piece's FULL
+    `Definition`, source and examples included, not `goflow_describe_
+    catalog`'s lossy text; feed one entry straight back into
+    `goflow_save_piece` to recreate it elsewhere. Built-in Go pieces have
+    no `Definition` — native code, not data — and never appear here),
+    `goflow_list_flows`, `goflow_get_flow`, `goflow_list_runs`,
+    `goflow_get_run`, `goflow_export_flow_js` (the MCP equivalent of
+    `POST /flows/export/js` and `POST /flows/{name}/export/js` combined
+    into one tool — takes exactly one of `name` or `flow`, since export
+    runs no code and persists nothing either way, unlike `goflow_run_flow`
+    below).
   - Write: `goflow_save_flow` and `goflow_delete_flow` (through the exact
     same `*flowstore.GatedStore` `POST`/`DELETE /flows` use — a flow
     referencing a missing piece is rejected, never partially saved);
@@ -573,7 +579,7 @@ below for what a Go rewrite gets and gives up.
     ever committing to `goflow_save_flow`.
 
   A saved flow (or, symmetrically, a credential name) that collides with
-  one of the fourteen reserved names is excluded from `tools/list` — not
+  one of the fifteen reserved names is excluded from `tools/list` — not
   deleted, not un-runnable/un-referenceable by name over HTTP — just
   shadowed in this one listing, and `tools/call` resolves that name to the
   fixed tool the same way, so the two methods never disagree about what a
@@ -686,6 +692,20 @@ below for what a Go rewrite gets and gives up.
   `github.com/dop251/goja`: `github.com/aws/aws-lambda-go`, to receive
   invocations the way AWS actually documents and maintains, rather than
   hand-rolling a client against the Lambda Runtime API.
+- **Export the piece catalog** (`GET /pieces/export`, MCP's
+  `goflow_export_catalog`): the piece-authoring story was always "the AI
+  populates the catalog itself" (see JS-authored pieces above), so the
+  actual gap wasn't authoring — it was that nothing could get a saved
+  piece's real content back OUT in a re-importable shape.
+  `catalog.DescribeCombined` (`GET /catalog`, `goflow_describe_catalog`)
+  is deliberately lossy plain text for a model to READ, not parse — it
+  never included `Source` or `Examples`. `catalog.Store.List()` already
+  returned the full `Definition` internally (exactly what `Save` accepts,
+  making a round trip mechanically trivial), just never exposed through
+  any route — this closes that. Only JS-authored pieces are covered:
+  built-in Go pieces (`pkg/pieces.All()`) are native code, not data, so
+  they have no `Definition` and never appear in the export; `GET
+  /catalog`'s text still describes them alongside the JS-authored ones.
 
 ## Explicitly NOT in v1
 

@@ -19,10 +19,14 @@
 // none of this is a new privilege, only new reachability. Shipped in two
 // tiers on purpose, so mutating power didn't land bundled with what was
 // initially a pure discoverability improvement: goflow_describe_catalog,
-// goflow_list_flows, goflow_get_flow, goflow_list_runs, goflow_get_run,
-// and goflow_export_flow_js are read-only (export runs no code and
-// persists nothing, whether given a saved flow's name or an ad-hoc one —
-// see toolExportFlowJS's own description); goflow_save_flow, goflow_delete_flow,
+// goflow_export_catalog, goflow_list_flows, goflow_get_flow,
+// goflow_list_runs, goflow_get_run, and goflow_export_flow_js are
+// read-only (export runs no code and persists nothing, whether given a
+// saved flow's name or an ad-hoc one — see toolExportFlowJS's own
+// description; goflow_export_catalog is the same idea for a JS-authored
+// piece's full Definition, since goflow_describe_catalog's own text is
+// lossy on purpose — see toolExportCatalog's own description);
+// goflow_save_flow, goflow_delete_flow,
 // goflow_save_piece, goflow_delete_piece, goflow_list_credentials,
 // goflow_save_credential, and goflow_delete_credential mutate state — the
 // exact same mutations POST/DELETE /flows, POST/DELETE /pieces, and
@@ -117,6 +121,7 @@ const (
 	toolListRuns        = "goflow_list_runs"
 	toolGetRun          = "goflow_get_run"
 	toolExportFlowJS    = "goflow_export_flow_js"
+	toolExportCatalog   = "goflow_export_catalog"
 
 	toolSaveFlow         = "goflow_save_flow"
 	toolDeleteFlow       = "goflow_delete_flow"
@@ -135,6 +140,7 @@ var reservedToolNames = map[string]bool{
 	toolListRuns:        true,
 	toolGetRun:          true,
 	toolExportFlowJS:    true,
+	toolExportCatalog:   true,
 
 	toolSaveFlow:         true,
 	toolDeleteFlow:       true,
@@ -165,6 +171,11 @@ func metaToolDescriptors() []map[string]any {
 		{
 			"name":        toolDescribeCatalog,
 			"description": "Describe every available piece — built-in Go pieces and persisted JS-authored pieces — with their actions, descriptions, and input schemas, as plain text meant to be read directly before authoring a flow or a new piece.",
+			"inputSchema": emptySchema,
+		},
+		{
+			"name":        toolExportCatalog,
+			"description": "Export every JS-authored catalog piece as its full Definition — name, actions/triggers with their real source code and examples — unlike goflow_describe_catalog, whose text is for reading, not re-importing. Feed any one entry straight back into goflow_save_piece (or POST /pieces) to recreate it elsewhere. Built-in Go pieces have no Definition (they're native code, not data) and never appear here — goflow_describe_catalog still covers them in its own text.",
 			"inputSchema": emptySchema,
 		},
 		{
@@ -348,6 +359,21 @@ func (h *Handler) callDescribeCatalog(w http.ResponseWriter, req rawRequest) {
 		return
 	}
 	writeToolText(w, req.ID, false, text)
+}
+
+// callExportCatalog returns every JS-authored piece's full Definition —
+// h.CatalogStore.List() already returns that (see catalog.Store's own
+// interface), unlike catalog.DescribeCombined's lossy text rendering
+// callDescribeCatalog uses — so this needs no separate assembly, just the
+// raw list wrapped the same way every other list-shaped tool result here
+// already is.
+func (h *Handler) callExportCatalog(w http.ResponseWriter, req rawRequest) {
+	defs, err := h.CatalogStore.List()
+	if err != nil {
+		writeError(w, req.ID, -32603, "internal error: "+err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, map[string]any{"pieces": defs})
 }
 
 // flowSummary mirrors pkg/httpapi's own flowSummary — metadata only, never
@@ -837,6 +863,9 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 	switch params.Name {
 	case toolDescribeCatalog:
 		h.callDescribeCatalog(w, req)
+		return
+	case toolExportCatalog:
+		h.callExportCatalog(w, req)
 		return
 	case toolListFlows:
 		h.callListFlows(w, req)

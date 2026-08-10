@@ -91,6 +91,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/catalog", s.auth(http.HandlerFunc(s.handleCatalog)))
 	mux.Handle("/pieces", s.auth(http.HandlerFunc(s.handlePieces)))
 	mux.Handle("DELETE /pieces/{name}", s.auth(http.HandlerFunc(s.handlePieceDelete)))
+	// GET /pieces/export returns every JS-authored piece's FULL Definition
+	// (source, examples — everything Save accepts), unlike GET /catalog's
+	// DescribeCombined text — see handlePiecesExport.
+	mux.Handle("GET /pieces/export", s.auth(http.HandlerFunc(s.handlePiecesExport)))
 	mux.Handle("POST /flows/run", s.auth(http.HandlerFunc(s.handleFlowsRun)))
 	mux.Handle("/flows", s.auth(http.HandlerFunc(s.handleFlows)))
 	mux.Handle("GET /flows/{name}", s.auth(http.HandlerFunc(s.handleFlowGet)))
@@ -198,6 +202,23 @@ func (s *Server) handlePieceDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "name": name})
+}
+
+// handlePiecesExport handles GET /pieces/export — every JS-authored piece
+// currently in the catalog, as full Definitions (name, actions/triggers
+// with their real Source and Examples, not just DescribeCombined's lossy
+// text) so the result can be fed back into POST /pieces (or
+// goflow_save_piece) one at a time to recreate the catalog elsewhere.
+// Built-in Go pieces (pkg/pieces.All()) have no Definition — they're
+// native code, not data — so they never appear here; GET /catalog still
+// describes them in its own text alongside these.
+func (s *Server) handlePiecesExport(w http.ResponseWriter, r *http.Request) {
+	defs, err := s.store.List()
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"pieces": defs})
 }
 
 // runRequest is the body shape POST /flows/run expects.

@@ -977,6 +977,60 @@ func TestSavePiece_ValidExample_PersistedAndDescribed(t *testing.T) {
 	}
 }
 
+// --- goflow_export_catalog ---------------------------------------------
+
+func TestExportCatalog_ReturnsFullDefinitionIncludingSourceAndExamples(t *testing.T) {
+	h, catStore := newHandlerWithFlowsAndCatalog(t)
+	def := catalog.Definition{
+		Name: "risk_score", DisplayName: "Risk Score", Description: "classifies risk",
+		Actions: []catalog.ActionDefinition{{
+			Name: "run", DisplayName: "Run", Description: "runs it",
+			Source: "(ctx) => ({ doubled: Number(ctx.input.x) * 2 })",
+			Examples: []catalog.Example{{
+				Input: map[string]any{"x": float64(5)}, CheckOutput: true,
+				WantOutput: map[string]any{"doubled": float64(10)},
+			}},
+		}},
+	}
+	if err := catStore.Save(def); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	result := callTool(t, h, toolExportCatalog, nil)
+	if result["isError"] != false {
+		t.Fatalf("isError = %v, want false: %v", result["isError"], result)
+	}
+	var body struct {
+		Pieces []catalog.Definition `json:"pieces"`
+	}
+	toolText(t, result, &body)
+	if len(body.Pieces) != 1 || body.Pieces[0].Name != "risk_score" {
+		t.Fatalf("pieces = %+v, want exactly one named risk_score", body.Pieces)
+	}
+	got := body.Pieces[0]
+	if len(got.Actions) != 1 || got.Actions[0].Source != "(ctx) => ({ doubled: Number(ctx.input.x) * 2 })" {
+		t.Fatalf("exported Definition is missing its action Source: %+v", got)
+	}
+	if len(got.Actions[0].Examples) != 1 {
+		t.Fatalf("exported Definition is missing its action Examples: %+v", got.Actions[0])
+	}
+}
+
+func TestExportCatalog_EmptyCatalog_ReturnsEmptyArray(t *testing.T) {
+	h, _ := newHandlerWithFlowsAndCatalog(t)
+	result := callTool(t, h, toolExportCatalog, nil)
+	if result["isError"] != false {
+		t.Fatalf("isError = %v, want false: %v", result["isError"], result)
+	}
+	var body struct {
+		Pieces []catalog.Definition `json:"pieces"`
+	}
+	toolText(t, result, &body)
+	if len(body.Pieces) != 0 {
+		t.Fatalf("pieces = %+v, want empty", body.Pieces)
+	}
+}
+
 func TestSavePiece_FailingExample_IsErrorTrueNotPersisted(t *testing.T) {
 	h, catStore := newHandlerWithFlowsAndCatalog(t)
 	result := callTool(t, h, toolSavePiece, map[string]any{
