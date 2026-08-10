@@ -382,12 +382,12 @@ below for what a Go rewrite gets and gives up.
   substituted value with `<credential:name>` afterward. Both passes are
   required together: the engine records each step's already-resolved Input
   verbatim, and `POST /flows/run`, `POST /flows/{name}/run`, and MCP's
-  `tools/call` all serialize that Input straight back in the response —
-  without the redaction pass a resolved secret would leak into the
-  HTTP/MCP reply. Every way to run a flow — ad-hoc, named, MCP `tools/call`,
-  `POST /webhooks/{name}`, and `pkg/scheduler` (all below) — goes through
-  `RunWithCredentials` (via `RunWithHistory`) now, not just `flowstore.Run`
-  directly. A flow
+  `tools/call`/`goflow_run_flow` all serialize that Input straight back in
+  the response — without the redaction pass a resolved secret would leak
+  into the HTTP/MCP reply. Every way to run a flow — ad-hoc, named, MCP
+  `tools/call`, MCP `goflow_run_flow`, `POST /webhooks/{name}`, and
+  `pkg/scheduler` (all below) — goes through `RunWithCredentials` (via
+  `RunWithHistory`) now, not just `flowstore.Run` directly. A flow
   referencing a credential that isn't stored fails as a validation error
   (400/`isError`), the same
   category as referencing a piece that doesn't exist — not a 500.
@@ -450,9 +450,9 @@ below for what a Go rewrite gets and gives up.
   `RunWithHistory` wraps `RunWithCredentials` (credentials already resolved
   *and redacted* by the time a run reaches it, so a secret never gets as far
   as the history store) and is now the single path every way to run a flow
-  calls — `POST /flows/run`, `POST /flows/{name}/run`, MCP's `tools/call`,
-  `POST /webhooks/{name}`, and `pkg/scheduler` — so a run is recorded
-  identically regardless of which one triggered it. Unlike `catalog.Store`/`credentials.Store`/`flowstore.Store`,
+  calls — `POST /flows/run`, `POST /flows/{name}/run`, MCP's `tools/call`
+  and `goflow_run_flow`, `POST /webhooks/{name}`, and `pkg/scheduler` — so a
+  run is recorded identically regardless of which one triggered it. Unlike `catalog.Store`/`credentials.Store`/`flowstore.Store`,
   a run record has no caller-chosen name to key on, so `Store.Save` assigns
   a fresh random id and hands it back, the way a database insert returns a
   generated primary key. A run is recorded on both success AND failure (a
