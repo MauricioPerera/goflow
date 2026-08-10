@@ -232,7 +232,7 @@ below for what a Go rewrite gets and gives up.
   and every pitfall in this list, meant to be loaded before writing a new
   `piece.Piece{...}` literal at all — catching a mistake before it's typed
   beats catching it after.
-- **A small piece catalog** (`pkg/pieces`): sixteen independently-tested,
+- **A small piece catalog** (`pkg/pieces`): seventeen independently-tested,
   ready-to-use pieces — `http` (a real `net/http` request, auth sent as an
   `Authorization` header — a plain string verbatim, or a `*piece.OAuth2Auth`
   formatted as `Bearer <AccessToken>` — a timeout so a hung server can't hang a
@@ -248,7 +248,10 @@ below for what a Go rewrite gets and gives up.
   its own doc comment for why that's a deliberately different mechanism
   from activepieces' waitpoint-based Delay piece), `webhook` (a generic
   pass-through trigger — the reusable version of every ad-hoc "hub" fixture
-  built across `pkg/engine`'s own tests), and `crypto` (AES-GCM
+  built across `pkg/engine`'s own tests), `schedule` (a real POLLING trigger
+  — fires at most once per configured `intervalSeconds`, inert on its own
+  until `pkg/scheduler` actually calls it on a timer; see the `pkg/scheduler`
+  entry below), `crypto` (AES-GCM
   encrypt/decrypt, key via `ctx.Auth` as a `[]byte` — the catalog version of
   the hand-rolled "vault" piece `TestFlow_EncryptDecryptRoundTrip` already
   proved in `pkg/engine`; no key management, that's the caller's job),
@@ -269,7 +272,7 @@ below for what a Go rewrite gets and gives up.
   `smtp.PlainAuth` when `ctx.Auth` is a `"user:password"` string,
   unauthenticated otherwise — tested against a hand-rolled, stdlib-only
   fake SMTP server). `pieces.RegisterAll(registry)` registers all
-  sixteen in one call; `pieces.All()` if you want to filter
+  seventeen in one call; `pieces.All()` if you want to filter
   first. No dynamic discovery, no marketplace, no versioning — add a piece
   by importing its package and listing it in `pieces.go`, same as any other
   Go dependency. Every catalog piece calls `piece.MustValidate` on itself in
@@ -343,9 +346,11 @@ below for what a Go rewrite gets and gives up.
   `model.FlowVersion` in the request body, validated then executed, the
   full `*model.ExecutionState` as the response) — all gated by a single
   shared bearer token (`GOFLOW_API_TOKEN`, compared via
-  `crypto/subtle.ConstantTimeCompare`) except `/health` and the
+  `crypto/subtle.ConstantTimeCompare`) except `/health`, the
   unauthenticated-by-necessity OAuth endpoints (`pkg/oauth`, below — they
-  ARE the mechanism a client without a token yet uses to get one). An
+  ARE the mechanism a client without a token yet uses to get one), and
+  `POST /webhooks/{name}` (below — a third party has no way to know that
+  token either; gated a different way, see its own entry). An
   OAuth-issued access token is accepted everywhere the static token is,
   through the same check. `cmd/server/main.go`
   refuses to start without the token configured — never boots an
