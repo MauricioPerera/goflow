@@ -1,6 +1,6 @@
 # Catalog expansion — tickets for parallel implementation
 
-Nine independent tickets, one new catalog piece each. No engine changes in
+Eight independent tickets, one new catalog piece each. No engine changes in
 any of them — every gap here is closable entirely inside `pkg/pieces/<name>`.
 Designed to be handed out one-per-implementer with zero cross-ticket
 dependencies (Tier 2 tickets don't depend on Tier 1, and none of the Tier 1
