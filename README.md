@@ -1016,3 +1016,22 @@ go run ./examples
   general path-sanitization utility, and nothing else in this project
   currently maps caller-supplied strings to filesystem paths this
   directly.
+- **`TestAIFirst_AllFourPhasesTogether` (`pkg/pieces/ai_first_test.go`) is
+  the capstone test for the whole AI-first direction — every phase
+  combined in one flow, none hand-waved.** An agent authors a JS piece
+  with no Go catalog equivalent (`order_utils.summarize`); it's saved
+  through a `GatedStore` (Phase 3's quality gate actually runs its
+  `Example` before allowing the save) onto a `FileStore` (real disk
+  persistence). A *separate* `FileStore` instance, pointed at the same
+  directory, stands in for a later session — nothing but the directory
+  carries over. The flow chaining that persisted piece with three real Go
+  catalog pieces (`http`, `json`, `text`, `storage`) exists only as a JSON
+  string (Phase 1) — never a Go struct literal. `flowvalidate.Validate`
+  (Phase 4) checks the parsed flow against the full registry before it's
+  ever executed. Passed on the first real run (after a sloppy first draft
+  — a leftover unused placeholder block and a dead import — was caught and
+  cleaned up before running, not left in). No engine or piece changes were
+  needed to make four independently-built subsystems compose this way;
+  each one's own "goes through the same path as any other piece/flow" design
+  choice is what made this work rather than needing a fifth, glue-specific
+  mechanism.
