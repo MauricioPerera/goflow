@@ -28,3 +28,11 @@ func (s *GatedStore) Get(name string) (Definition, bool, error) {
 func (s *GatedStore) List() ([]Definition, error) {
 	return s.Underlying.List()
 }
+
+// Delete is a pass-through to Underlying, without re-validating — same
+// criterion flowstore.GatedStore.Delete already documents: a piece already
+// on disk was valid when it was saved, and deleting it needs no quality
+// check at all.
+func (s *GatedStore) Delete(name string) error {
+	return s.Underlying.Delete(name)
+}

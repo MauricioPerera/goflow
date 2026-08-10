@@ -21,12 +21,13 @@
 // initially a pure discoverability improvement: goflow_describe_catalog,
 // goflow_list_flows, goflow_get_flow, goflow_list_runs, and
 // goflow_get_run are read-only; goflow_save_flow, goflow_delete_flow,
-// goflow_save_piece, goflow_list_credentials, goflow_save_credential, and
-// goflow_delete_credential mutate state — the exact same mutations
-// POST/DELETE /flows, POST /pieces, and POST/GET/DELETE /credentials
-// already allow over HTTP, through the exact same underlying Store calls
-// (including catalog.GatedStore's and flowstore.GatedStore's validation
-// gates — a tool call can't bypass either), just reachable without HTTP.
+// goflow_save_piece, goflow_delete_piece, goflow_list_credentials,
+// goflow_save_credential, and goflow_delete_credential mutate state — the
+// exact same mutations POST/DELETE /flows, POST/DELETE /pieces, and
+// POST/GET/DELETE /credentials already allow over HTTP, through the exact
+// same underlying Store calls (including catalog.GatedStore's and
+// flowstore.GatedStore's validation gates — a tool call can't bypass
+// either), just reachable without HTTP.
 //
 // Everything here is encoding/json + net/http — JSON-RPC 2.0 is simple enough
 // that pulling in a library would add a dependency for nothing, matching the
@@ -108,6 +109,7 @@ const (
 	toolSaveFlow         = "goflow_save_flow"
 	toolDeleteFlow       = "goflow_delete_flow"
 	toolSavePiece        = "goflow_save_piece"
+	toolDeletePiece      = "goflow_delete_piece"
 	toolListCredentials  = "goflow_list_credentials"
 	toolSaveCredential   = "goflow_save_credential"
 	toolDeleteCredential = "goflow_delete_credential"
@@ -123,6 +125,7 @@ var reservedToolNames = map[string]bool{
 	toolSaveFlow:         true,
 	toolDeleteFlow:       true,
 	toolSavePiece:        true,
+	toolDeletePiece:      true,
 	toolListCredentials:  true,
 	toolSaveCredential:   true,
 	toolDeleteCredential: true,
@@ -224,6 +227,15 @@ func metaToolDescriptors() []map[string]any {
 					},
 				},
 				"required": []string{"name"},
+			},
+		},
+		{
+			"name":        toolDeletePiece,
+			"description": "Delete a JS-authored catalog piece by name. Irreversible. A flow still referencing this piece will fail to run afterward — goflow_describe_catalog no longer lists it, but nothing checks for existing references before deleting (same as flowstore's own flow-vs-piece relationship: a piece can be removed out from under a flow that names it).",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"name": map[string]any{"type": "string"}},
+				"required":   []string{"name"},
 			},
 		},
 		{
@@ -455,6 +467,27 @@ func (h *Handler) callSavePiece(w http.ResponseWriter, req rawRequest, args map[
 		return
 	}
 	writeToolText(w, req.ID, false, map[string]any{"saved": true, "name": def.Name})
+}
+
+// callDeletePiece deletes a JS-authored piece by name. catalog.ErrNotFound
+// becomes a clear "no piece named X" tool result; any other error is
+// reported the same way, mirroring how DELETE /pieces/{name} treats every
+// non-ErrNotFound failure as a 400, never a 500.
+func (h *Handler) callDeletePiece(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	name, _ := args["name"].(string)
+	if name == "" {
+		writeToolText(w, req.ID, true, "missing required argument: name")
+		return
+	}
+	if err := h.CatalogStore.Delete(name); err != nil {
+		if err == catalog.ErrNotFound {
+			writeToolText(w, req.ID, true, fmt.Sprintf("no piece named %q", name))
+			return
+		}
+		writeToolText(w, req.ID, true, err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, map[string]any{"deleted": true, "name": name})
 }
 
 func (h *Handler) callListCredentials(w http.ResponseWriter, req rawRequest) {
@@ -736,6 +769,9 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 		return
 	case toolSavePiece:
 		h.callSavePiece(w, req, params.Arguments)
+		return
+	case toolDeletePiece:
+		h.callDeletePiece(w, req, params.Arguments)
 		return
 	case toolListCredentials:
 		h.callListCredentials(w, req)

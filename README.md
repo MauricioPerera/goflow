@@ -342,7 +342,8 @@ below for what a Go rewrite gets and gives up.
   wrapped around the library — `net/http` + `crypto/subtle`, no new
   dependency. `GET /health` (unauthenticated liveness), `GET /catalog`
   (`catalog.DescribeCombined`), `POST /pieces` (saves through the same
-  `GatedStore` quality gate), `POST /flows/run` (ad-hoc: a
+  `GatedStore` quality gate) and `DELETE /pieces/{name}` (no gate needed —
+  see the MCP meta tools entry below for why), `POST /flows/run` (ad-hoc: a
   `model.FlowVersion` in the request body, validated then executed, the
   full `*model.ExecutionState` as the response) — all gated by a single
   shared bearer token (`GOFLOW_API_TOKEN`, compared via
@@ -525,7 +526,7 @@ below for what a Go rewrite gets and gives up.
   OAuth access token) already has that exact same access on every httpapi
   route today — there's no scopes/permissions concept anywhere in this
   project to make MCP meaningfully narrower, so none of this is a new
-  privilege, only new reachability. Eleven fixed tools are always present
+  privilege, only new reachability. Twelve fixed tools are always present
   in `tools/list` alongside the per-flow ones, each with a real, precise
   `inputSchema` (unlike a per-flow tool's deliberately permissive one,
   since these have well-defined Go types behind them, not an untyped
@@ -541,18 +542,24 @@ below for what a Go rewrite gets and gives up.
   - Write: `goflow_save_flow` and `goflow_delete_flow` (through the exact
     same `*flowstore.GatedStore` `POST`/`DELETE /flows` use — a flow
     referencing a missing piece is rejected, never partially saved);
-    `goflow_save_piece` (through the exact same `*catalog.GatedStore`
-    `POST /pieces` uses — every action/trigger/dropdown's examples are
-    actually RUN before the piece is persisted; one failing example
-    rejects the whole piece); `goflow_list_credentials`,
-    `goflow_save_credential`, `goflow_delete_credential` (a credential's
-    value is never echoed back in a tool result, matching
-    `POST /credentials` exactly — `Store.Get`, the only thing that ever
-    returns a decrypted value, is for trusted Go callers only and is never
-    wired to any transport, MCP included).
+    `goflow_save_piece` and `goflow_delete_piece` (through the exact same
+    `*catalog.GatedStore` `POST`/`DELETE /pieces` use — every
+    action/trigger/dropdown's examples are actually RUN before a save
+    persists, one failing example rejects the whole piece, and delete
+    needs no gate at all, since removal can't fail a quality check the
+    way a save can — same reasoning `flowstore.GatedStore.Delete` already
+    documents); `goflow_list_credentials`, `goflow_save_credential`,
+    `goflow_delete_credential` (a credential's value is never echoed back
+    in a tool result, matching `POST /credentials` exactly — `Store.Get`,
+    the only thing that ever returns a decrypted value, is for trusted Go
+    callers only and is never wired to any transport, MCP included).
+    `goflow_delete_piece` closes a gap found while smoke-testing the rest
+    of this tier live: nothing, on ANY transport, could remove a catalog
+    piece before this — `catalog.Store` itself had no `Delete` method at
+    all, so `DELETE /pieces/{name}` is new over HTTP too, not just MCP.
 
   A saved flow (or, symmetrically, a credential name) that collides with
-  one of the eleven reserved names is excluded from `tools/list` — not
+  one of the twelve reserved names is excluded from `tools/list` — not
   deleted, not un-runnable/un-referenceable by name over HTTP — just
   shadowed in this one listing, and `tools/call` resolves that name to the
   fixed tool the same way, so the two methods never disagree about what a
@@ -609,7 +616,7 @@ deployable product — but two things originally listed here as absent no
 longer are, and should be stated plainly rather than left stale:
 
 - **"No server/API" is no longer true.** `pkg/httpapi` + `cmd/server` is a
-  real HTTP server (`/health`, `/catalog`, `/pieces`, `/flows*`,
+  real HTTP server (`/health`, `/catalog`, `/pieces*`, `/flows*`,
   `/credentials*`, `/runs*`, `/mcp`, `/oauth/*`, `/.well-known/oauth-*`,
   `/webhooks/{name}` (deliberately public — see "What's here" above),
   deployed and

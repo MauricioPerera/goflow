@@ -1070,3 +1070,44 @@ func TestDeleteCredential_UnknownName_IsErrorTrue(t *testing.T) {
 		t.Fatalf("isError = %v, want true for an unknown credential name", result["isError"])
 	}
 }
+
+func TestDeletePiece_ExistingThenGoneFromCatalog(t *testing.T) {
+	h, catStore := newHandlerWithFlowsAndCatalog(t)
+	if err := catStore.Save(catalog.Definition{
+		Name: "killme_piece", DisplayName: "Kill Me",
+		Actions: []catalog.ActionDefinition{{
+			Name: "run", DisplayName: "Run", Source: "(ctx) => ({ ok: true })",
+			Examples: []catalog.Example{{Input: map[string]any{}, CheckOutput: true, WantOutput: map[string]any{"ok": true}}},
+		}},
+	}); err != nil {
+		t.Fatalf("catStore.Save: %v", err)
+	}
+
+	result := callTool(t, h, toolDeletePiece, map[string]any{"name": "killme_piece"})
+	if result["isError"] != false {
+		t.Fatalf("delete_piece isError = %v, want false: %v", result["isError"], result)
+	}
+
+	descResult := callTool(t, h, toolDescribeCatalog, nil)
+	item, _ := descResult["content"].([]any)[0].(map[string]any)
+	text, _ := item["text"].(string)
+	if strings.Contains(text, "killme_piece") {
+		t.Fatalf("deleted piece still in describe_catalog: %s", text)
+	}
+}
+
+func TestDeletePiece_UnknownName_IsErrorTrue(t *testing.T) {
+	h, _ := newHandlerWithFlowsAndCatalog(t)
+	result := callTool(t, h, toolDeletePiece, map[string]any{"name": "never-existed"})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true for an unknown piece name", result["isError"])
+	}
+}
+
+func TestDeletePiece_MissingNameArgument_IsErrorTrue(t *testing.T) {
+	h, _ := newHandlerWithFlowsAndCatalog(t)
+	result := callTool(t, h, toolDeletePiece, map[string]any{})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true when name is missing", result["isError"])
+	}
+}

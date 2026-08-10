@@ -1327,3 +1327,57 @@ func TestGetFlows_ListsWebhookEnabled(t *testing.T) {
 		t.Fatalf("plain.webhookEnabled = %v, want false", byName["plain"]["webhookEnabled"])
 	}
 }
+
+func validPieceDef(name string) catalog.Definition {
+	return catalog.Definition{
+		Name: name, DisplayName: "Valid Piece", Description: "a test piece",
+		Actions: []catalog.ActionDefinition{{
+			Name: "ok", DisplayName: "OK", Description: "returns ok",
+			Source: "(params) => ({ ok: true })",
+			Examples: []catalog.Example{{
+				Input:       map[string]any{},
+				CheckOutput: true,
+				WantOutput:  map[string]any{"ok": true},
+			}},
+		}},
+	}
+}
+
+func TestDeletePiece_NoAuth_401(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "DELETE", "/pieces/whatever", nil, false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestDeletePiece_ExistingThenGone(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/pieces", validPieceDef("killme"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	rec := do(t, srv, "DELETE", "/pieces/killme", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	if m["deleted"] != true || m["name"] != "killme" {
+		t.Fatalf("body = %v, want deleted=true name=killme", m)
+	}
+	// A subsequent GET /catalog no longer lists it.
+	rec = do(t, srv, "GET", "/catalog", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("catalog: status = %d, want 200", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "killme") {
+		t.Fatalf("deleted piece still listed in catalog: %s", rec.Body.String())
+	}
+}
+
+func TestDeletePiece_Missing_404(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "DELETE", "/pieces/never-existed", nil, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}

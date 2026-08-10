@@ -15,6 +15,7 @@
 package catalog
 
 import (
+	"errors"
 	"fmt"
 
 	"goflow/pkg/jspiece"
@@ -186,7 +187,18 @@ type Store interface {
 	Save(def Definition) error
 	Get(name string) (Definition, bool, error)
 	List() ([]Definition, error)
+	// Delete removes the Definition named name. A missing name returns
+	// ErrNotFound (not a generic error), so the HTTP/MCP layer can map it to
+	// "not found" without inspecting the underlying error — same contract
+	// as flowstore.Store.Delete/credentials.Store.Delete.
+	Delete(name string) error
 }
+
+// ErrNotFound is returned by Delete when no Definition exists for the given
+// name — same sentinel-error convention as flowstore.ErrNotFound and
+// credentials.ErrNotFound, so every Store's Delete in this project is
+// distinguishable-from-a-real-failure the same way.
+var ErrNotFound = errors.New("catalog: not found")
 
 // RegisterFromStore loads every Definition in store, converts each to a
 // piece.Piece, and registers it into r via RegisterValidated — the

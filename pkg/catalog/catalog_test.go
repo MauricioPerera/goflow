@@ -76,6 +76,19 @@ func storeContract(t *testing.T, store catalog.Store) {
 	if got.Description != "an updated description" {
 		t.Fatalf("Get() after overwrite: Description = %q", got.Description)
 	}
+
+	if err := store.Delete("never-existed"); err != catalog.ErrNotFound {
+		t.Fatalf("Delete(never-existed) error = %v, want catalog.ErrNotFound", err)
+	}
+	if err := store.Delete("risk_score"); err != nil {
+		t.Fatalf("Delete(risk_score) error = %v, want nil", err)
+	}
+	if _, ok, err := store.Get("risk_score"); err != nil || ok {
+		t.Fatalf("Get(risk_score) after Delete = ok=%v err=%v, want ok=false", ok, err)
+	}
+	if defs, err := store.List(); err != nil || len(defs) != 0 {
+		t.Fatalf("List() after Delete = %+v, err=%v, want empty", defs, err)
+	}
 }
 
 func TestMemoryStore_ImplementsStoreContract(t *testing.T) {
@@ -129,6 +142,31 @@ func TestFileStore_RejectsPathTraversalNames(t *testing.T) {
 		if err := store.Save(def); err == nil {
 			t.Fatalf("Save(name=%q) error = nil, want a rejection", name)
 		}
+		if err := store.Delete(name); err == nil || err == catalog.ErrNotFound {
+			t.Fatalf("Delete(name=%q) error = %v, want a path-rejection error, not ErrNotFound or nil", name, err)
+		}
+	}
+}
+
+// TestGatedStore_DeletePassesThroughWithoutValidation proves Delete needs no
+// quality gate — GatedStore.Delete is a pure pass-through to Underlying,
+// same reasoning flowstore.GatedStore.Delete's own doc comment gives:
+// removal can't fail a quality check the way a Save can.
+func TestGatedStore_DeletePassesThroughWithoutValidation(t *testing.T) {
+	underlying := catalog.NewMemoryStore()
+	if err := underlying.Save(sampleDefinition("risk_score")); err != nil {
+		t.Fatalf("underlying.Save: %v", err)
+	}
+	gated := &catalog.GatedStore{Underlying: underlying}
+
+	if err := gated.Delete("risk_score"); err != nil {
+		t.Fatalf("gated.Delete: %v", err)
+	}
+	if _, ok, _ := underlying.Get("risk_score"); ok {
+		t.Fatal("risk_score still present in the underlying store after gated.Delete")
+	}
+	if err := gated.Delete("risk_score"); err != catalog.ErrNotFound {
+		t.Fatalf("second Delete error = %v, want catalog.ErrNotFound", err)
 	}
 }
 

@@ -103,6 +103,24 @@ func (s *FileStore) Get(name string) (Definition, bool, error) {
 	return def, true, nil
 }
 
+// Delete removes the piece file for name. If no such file exists it returns
+// ErrNotFound (not the raw os.IsNotExist) so the HTTP/MCP layer can map it
+// to "not found" without inspecting the underlying error — same shape as
+// flowstore.FileStore.Delete/credentials.FileStore.Delete.
+func (s *FileStore) Delete(name string) error {
+	p, err := s.path(name)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(p); err != nil {
+		if os.IsNotExist(err) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("catalog: deleting %q: %w", name, err)
+	}
+	return nil
+}
+
 func (s *FileStore) List() ([]Definition, error) {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {

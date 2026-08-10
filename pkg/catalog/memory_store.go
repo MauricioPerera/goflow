@@ -39,3 +39,13 @@ func (s *MemoryStore) List() ([]Definition, error) {
 	}
 	return out, nil
 }
+
+func (s *MemoryStore) Delete(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.defs[name]; !ok {
+		return ErrNotFound
+	}
+	delete(s.defs, name)
+	return nil
+}

@@ -89,6 +89,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.Handle("/catalog", s.auth(http.HandlerFunc(s.handleCatalog)))
 	mux.Handle("/pieces", s.auth(http.HandlerFunc(s.handlePieces)))
+	mux.Handle("DELETE /pieces/{name}", s.auth(http.HandlerFunc(s.handlePieceDelete)))
 	mux.Handle("POST /flows/run", s.auth(http.HandlerFunc(s.handleFlowsRun)))
 	mux.Handle("/flows", s.auth(http.HandlerFunc(s.handleFlows)))
 	mux.Handle("GET /flows/{name}", s.auth(http.HandlerFunc(s.handleFlowGet)))
@@ -173,6 +174,24 @@ func (s *Server) handlePieces(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"saved": true, "name": def.Name})
+}
+
+// handlePieceDelete handles DELETE /pieces/{name}. The store's ErrNotFound
+// maps to 404; any other error to 400 — same convention as
+// handleFlowDelete/handleCredentialDelete. Deleting a piece needs no gate
+// (catalog.GatedStore.Delete is a pure pass-through): nothing about removal
+// can fail a quality check the way a Save can.
+func (s *Server) handlePieceDelete(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if err := s.store.Delete(name); err != nil {
+		if err == catalog.ErrNotFound {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "name": name})
 }
 
 // runRequest is the body shape POST /flows/run expects.
