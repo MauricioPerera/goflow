@@ -381,9 +381,30 @@ below for what a Go rewrite gets and gives up.
   process started), rejecting a flow that references a missing piece before
   it ever reaches disk. `POST`/`GET /flows`, `GET`/`DELETE /flows/{name}`,
   and `POST /flows/{name}/run` share the same execution path as the ad-hoc
-  route (`flowstore.Run`, extracted once a third caller — MCP, below —
-  needed it too, so the three transports can't drift apart in what "run a
-  flow" means).
+  route (`flowstore.Run`/`RunWithCredentials`/`RunWithHistory`, extracted
+  once a third caller — MCP, below — needed it too, so the three transports
+  can't drift apart in what "run a flow" means).
+- **Persistent run history** (`pkg/runstore`, wired in as
+  `flowstore.RunWithHistory`): closes the gap this file used to describe
+  under "Explicitly NOT in v1" — a `Verdict`/`Steps` map that existed only
+  for the duration of one call and was returned to the caller, never stored.
+  `RunWithHistory` wraps `RunWithCredentials` (credentials already resolved
+  *and redacted* by the time a run reaches it, so a secret never gets as far
+  as the history store) and is now the single path all three transports
+  call — `POST /flows/run`, `POST /flows/{name}/run`, and MCP's
+  `tools/call` — so a run is recorded identically regardless of which one
+  triggered it. Unlike `catalog.Store`/`credentials.Store`/`flowstore.Store`,
+  a run record has no caller-chosen name to key on, so `Store.Save` assigns
+  a fresh random id and hands it back, the way a database insert returns a
+  generated primary key. A run is recorded on both success AND failure (a
+  FAILED verdict belongs in history exactly as much as a SUCCEEDED one) but
+  NOT when the flow never actually ran — a validation failure or a
+  registry-build fault records nothing, the same reasoning a rejected
+  malformed HTTP request elsewhere in this project doesn't get logged as a
+  completed one. `GET /runs` lists every run (metadata only — a run's full
+  state can be large); `GET /runs/{id}` returns the full record. Same
+  on-disk shape as the other three stores: one JSON file per record, atomic
+  write, zero new dependencies.
 - **Flows as MCP tools** (`pkg/mcpapi`): a hand-written JSON-RPC 2.0
   transport — no SDK, no streaming SSE, no sessions — mounted at
   `POST /mcp` under the same bearer auth as everything else. Implements the
@@ -448,8 +469,8 @@ longer are, and should be stated plainly rather than left stale:
 
 - **"No server/API" is no longer true.** `pkg/httpapi` + `cmd/server` is a
   real HTTP server (`/health`, `/catalog`, `/pieces`, `/flows*`,
-  `/credentials*`, `/mcp` — see "What's here" above), deployed and running
-  on a real VPS as a systemd service. "No auth" is also no longer true, but
+  `/credentials*`, `/runs*`, `/mcp` — see "What's here" above), deployed and
+  running on a real VPS as a systemd service. "No auth" is also no longer true, but
   stays narrow: every non-public route requires either the single shared
   bearer token (constant-time compared) or an access token minted by
   `pkg/oauth`'s single-tenant OAuth 2.1 authorization server (see its "What's
@@ -458,11 +479,12 @@ longer are, and should be stated plainly rather than left stale:
   spec-compliant flow, it does not add new principals.
 - **"No persistence" is no longer true in general.** `pkg/catalog` persists
   piece definitions, `pkg/credentials` persists secrets encrypted at rest,
-  and `pkg/flowstore` persists named flows — all real, cross-restart disk
-  persistence. None of them is a general-purpose database: no flow
-  execution history or run log is recorded anywhere — a `Verdict`/`Steps`
-  map exists only for the duration of one `ExecuteBegin`/`ExecuteActionRun`
-  call and is returned to the caller, never stored.
+  `pkg/flowstore` persists named flows, and `pkg/runstore` persists a record
+  of every run — all real, cross-restart disk persistence. None of them is a
+  general-purpose database (no query language, no indexes beyond "list
+  everything and filter client-side"), but the specific gap this section used
+  to name — a `Verdict`/`Steps` map existing only for the duration of one
+  call and never stored — is closed; see the `pkg/runstore` entry above.
 
 Still true: no UI, no piece marketplace, no streaming progress (a request
 gets one JSON response at the end, not incremental updates), no distributed

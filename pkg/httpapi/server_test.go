@@ -17,6 +17,7 @@ import (
 	"goflow/pkg/credentials"
 	"goflow/pkg/flowstore"
 	"goflow/pkg/model"
+	"goflow/pkg/runstore"
 )
 
 // testCredKey is a fixed 32-byte AES-256 key for the credentials store in
@@ -42,7 +43,11 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatalf("flowstore.NewFileStore: %v", err)
 	}
-	return NewServer(&catalog.GatedStore{Underlying: fs}, credStore, flowStore, "secret-token", "http://testserver")
+	runStore, err := runstore.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("runstore.NewFileStore: %v", err)
+	}
+	return NewServer(&catalog.GatedStore{Underlying: fs}, credStore, flowStore, runStore, "secret-token", "http://testserver")
 }
 
 // credDir returns the on-disk directory backing the server's credentials
@@ -894,5 +899,142 @@ func TestOAuthEndToEnd_AccessTokenGrantsTheSameAccessAsStaticToken(t *testing.T)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("%s %s with OAuth access token: status = %d, want 200, body=%s", req.method, req.path, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+func TestGetRuns_NoAuth_401(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/runs", nil, false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestGetRuns_Empty_EmptyList(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/runs", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	runs, ok := m["runs"].([]any)
+	if !ok || len(runs) != 0 {
+		t.Fatalf("runs = %v, want an empty list", m["runs"])
+	}
+}
+
+// TestPostFlowsRun_RecordedInHistory proves an AD-HOC run (POST /flows/run,
+// no persisted flow involved) shows up in GET /runs with an empty flowName —
+// runstore.RunWithHistory records it just like a named run.
+func TestPostFlowsRun_RecordedInHistory(t *testing.T) {
+	srv := newTestServer(t)
+	fv := model.FlowVersion{
+		ID: "fv-test",
+		Trigger: &model.FlowTrigger{
+			Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+			NextAction: &model.FlowAction{
+				Name: "double", DisplayName: "Double", Type: model.ActionCode,
+				Code: &model.CodeSettings{
+					Input:  map[string]any{"n": 21},
+					Source: `(params) => ({ doubled: params.n * 2 })`,
+				},
+			},
+		},
+	}
+	if rec := do(t, srv, "POST", "/flows/run", runRequest{Flow: fv}, true); rec.Code != http.StatusOK {
+		t.Fatalf("run: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("list: status = %d, want 200; body=%s", listRec.Code, listRec.Body.String())
+	}
+	m := decode(t, listRec)
+	runs, _ := m["runs"].([]any)
+	if len(runs) != 1 {
+		t.Fatalf("runs = %v, want exactly 1 recorded run", m["runs"])
+	}
+	summary, _ := runs[0].(map[string]any)
+	if summary["FlowName"] != "" {
+		t.Fatalf("FlowName = %v, want \"\" for an ad-hoc run", summary["FlowName"])
+	}
+	if summary["Status"] != string(model.FlowRunSucceeded) {
+		t.Fatalf("Status = %v, want SUCCEEDED", summary["Status"])
+	}
+	id, _ := summary["ID"].(string)
+	if id == "" {
+		t.Fatal("summary has no ID")
+	}
+
+	getRec := do(t, srv, "GET", "/runs/"+id, nil, true)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("get: status = %d, want 200; body=%s", getRec.Code, getRec.Body.String())
+	}
+	full := decode(t, getRec)
+	state, _ := full["State"].(map[string]any)
+	steps, _ := state["Steps"].(map[string]any)
+	if _, ok := steps["double"]; !ok {
+		t.Fatalf("recorded run's State.Steps missing \"double\": %v", state)
+	}
+}
+
+// TestPostFlowRun_ByName_RecordedWithFlowName proves a NAMED run
+// (POST /flows/{name}/run) is recorded with that name, distinguishing it
+// from an ad-hoc run in the same history.
+func TestPostFlowRun_ByName_RecordedWithFlowName(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", validFlowDef("double-it"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, srv, "POST", "/flows/double-it/run", flowRunRequest{}, true); rec.Code != http.StatusOK {
+		t.Fatalf("run: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	m := decode(t, listRec)
+	runs, _ := m["runs"].([]any)
+	if len(runs) != 1 {
+		t.Fatalf("runs = %v, want exactly 1 recorded run", m["runs"])
+	}
+	summary, _ := runs[0].(map[string]any)
+	if summary["FlowName"] != "double-it" {
+		t.Fatalf("FlowName = %v, want %q", summary["FlowName"], "double-it")
+	}
+}
+
+func TestGetRun_UnknownID_404(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/runs/never-existed", nil, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostFlowsRun_ValidationFailure_NotRecordedInHistory proves a flow that
+// never actually ran (rejected by flowvalidate before execution) does NOT
+// pollute run history — mirrors
+// flowstore.TestRunWithHistory_ValidationFailure_NotRecorded through the
+// real HTTP layer.
+func TestPostFlowsRun_ValidationFailure_NotRecordedInHistory(t *testing.T) {
+	srv := newTestServer(t)
+	fv := model.FlowVersion{
+		ID: "fv-bad",
+		Trigger: &model.FlowTrigger{
+			Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+			NextAction: &model.FlowAction{
+				Name: "badstep", DisplayName: "Bad", Type: model.ActionPiece,
+				Piece: &model.PieceSettings{PieceName: "no_such_piece", ActionName: "no_such_action"},
+			},
+		},
+	}
+	if rec := do(t, srv, "POST", "/flows/run", runRequest{Flow: fv}, true); rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	m := decode(t, listRec)
+	runs, _ := m["runs"].([]any)
+	if len(runs) != 0 {
+		t.Fatalf("runs = %v, want nothing recorded for a flow that never ran", m["runs"])
 	}
 }

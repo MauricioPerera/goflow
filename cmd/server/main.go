@@ -13,6 +13,7 @@ import (
 	"goflow/pkg/credentials"
 	"goflow/pkg/flowstore"
 	"goflow/pkg/httpapi"
+	"goflow/pkg/runstore"
 )
 
 func main() {
@@ -64,6 +65,11 @@ func main() {
 		flowsDir = "./data/flows"
 	}
 
+	runsDir := os.Getenv("GOFLOW_RUNS_DIR")
+	if runsDir == "" {
+		runsDir = "./data/runs"
+	}
+
 	// GOFLOW_OAUTH_ISSUER is this server's externally-reachable base URL —
 	// required for the OAuth 2.1 metadata pkg/oauth serves to point a client
 	// at URLs it can actually reach (e.g. the real https://host behind a
@@ -97,7 +103,12 @@ func main() {
 		log.Fatalf("opening flows store at %q: %v", flowsDir, err)
 	}
 
-	srv := httpapi.NewServer(gated, credStore, flowStore, token, issuer)
-	log.Printf("goflow-server listening on %s (catalog: %s, credentials: %s, flows: %s, oauth issuer: %s)", addr, catalogDir, credentialsDir, flowsDir, issuer)
+	runStore, err := runstore.NewFileStore(runsDir)
+	if err != nil {
+		log.Fatalf("opening runs store at %q: %v", runsDir, err)
+	}
+
+	srv := httpapi.NewServer(gated, credStore, flowStore, runStore, token, issuer)
+	log.Printf("goflow-server listening on %s (catalog: %s, credentials: %s, flows: %s, runs: %s, oauth issuer: %s)", addr, catalogDir, credentialsDir, flowsDir, runsDir, issuer)
 	log.Fatal(http.ListenAndServe(addr, srv.Handler()))
 }

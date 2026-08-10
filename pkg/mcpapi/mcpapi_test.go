@@ -12,6 +12,7 @@ import (
 	"goflow/pkg/flowstore"
 	"goflow/pkg/model"
 	"goflow/pkg/piece"
+	"goflow/pkg/runstore"
 )
 
 // testCredKey is a fixed 32-byte AES-256 key for the credentials store in
@@ -47,7 +48,7 @@ func newHandlerWithFlows(t *testing.T, defs ...flowstore.FlowDefinition) *Handle
 			t.Fatalf("Save %q: %v", def.Name, err)
 		}
 	}
-	return NewHandler(fs, emptyRegistryBuilder, credStore)
+	return NewHandler(fs, emptyRegistryBuilder, credStore, runstore.NewMemoryStore())
 }
 
 // newHandlerWithFlowsAndCreds is newHandlerWithFlows but also returns the
@@ -68,7 +69,28 @@ func newHandlerWithFlowsAndCreds(t *testing.T, defs ...flowstore.FlowDefinition)
 			t.Fatalf("Save %q: %v", def.Name, err)
 		}
 	}
-	return NewHandler(fs, emptyRegistryBuilder, credStore), credStore
+	return NewHandler(fs, emptyRegistryBuilder, credStore, runstore.NewMemoryStore()), credStore
+}
+
+// newHandlerWithFlowsAndHistory is newHandlerWithFlows but also returns the
+// runstore.Store, so a test can confirm a tools/call was actually recorded.
+func newHandlerWithFlowsAndHistory(t *testing.T, defs ...flowstore.FlowDefinition) (*Handler, runstore.Store) {
+	t.Helper()
+	fs, err := flowstore.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	credStore, err := credentials.NewFileStore(t.TempDir(), testCredKey)
+	if err != nil {
+		t.Fatalf("credentials.NewFileStore: %v", err)
+	}
+	for _, def := range defs {
+		if err := fs.Save(def); err != nil {
+			t.Fatalf("Save %q: %v", def.Name, err)
+		}
+	}
+	historyStore := runstore.NewMemoryStore()
+	return NewHandler(fs, emptyRegistryBuilder, credStore, historyStore), historyStore
 }
 
 // doublesArgFlow is a "double it" flow that reads n from the TRIGGER payload
@@ -494,5 +516,34 @@ func TestToolsCall_MissingCredential_IsErrorTrueMentionsName(t *testing.T) {
 	text, _ := item["text"].(string)
 	if !strings.Contains(text, "relay") {
 		t.Fatalf("error text does not name the missing credential: %s", text)
+	}
+}
+
+// TestToolsCall_RecordedInHistory proves a tools/call run goes through
+// flowstore.RunWithHistory exactly like an HTTP-triggered run does —
+// recorded with the tool's name as FlowName, discoverable via the same
+// runstore.Store an HTTP GET /runs would read from.
+func TestToolsCall_RecordedInHistory(t *testing.T) {
+	h, hist := newHandlerWithFlowsAndHistory(t, doublesArgFlow())
+	rec := call(t, h, map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{"name": "double-it", "arguments": map[string]any{"n": 7}},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	summaries, err := hist.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("List() = %+v, want exactly 1 recorded run", summaries)
+	}
+	if summaries[0].FlowName != "double-it" {
+		t.Fatalf("recorded FlowName = %q, want %q", summaries[0].FlowName, "double-it")
+	}
+	if summaries[0].Status != model.FlowRunSucceeded {
+		t.Fatalf("recorded Status = %v, want SUCCEEDED", summaries[0].Status)
 	}
 }

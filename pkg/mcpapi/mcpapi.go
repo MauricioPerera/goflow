@@ -3,8 +3,9 @@
 // SSE, no sessions. One POST endpoint speaks just enough of the protocol for
 // an LLM client to discover and run the flows persisted in a flowstore.Store:
 // initialize, notifications/initialized, tools/list, and tools/call. The
-// shared "validate then run" logic is flowstore.Run, the same path
-// POST /flows/run uses, so a tool call and an HTTP run execute identically.
+// shared "validate then run" logic is flowstore.RunWithHistory, the same
+// path POST /flows/run and POST /flows/{name}/run use, so a tool call and an
+// HTTP run execute identically and are recorded identically.
 //
 // Everything here is encoding/json + net/http — JSON-RPC 2.0 is simple enough
 // that pulling in a library would add a dependency for nothing, matching the
@@ -21,6 +22,7 @@ import (
 	"goflow/pkg/flowstore"
 	"goflow/pkg/model"
 	"goflow/pkg/piece"
+	"goflow/pkg/runstore"
 )
 
 // Handler is an http.Handler that speaks MCP (JSON-RPC 2.0) over a single POST
@@ -37,15 +39,21 @@ type Handler struct {
 	// the JSON-RPC result. May be nil only when no saved flow references a
 	// credential.
 	CredStore credentials.Store
+	// HistoryStore records every tools/call run — the same run-history
+	// mechanism POST /flows/run and POST /flows/{name}/run use, via
+	// flowstore.RunWithHistory, so a tool call recorded in GET /runs looks
+	// identical to an HTTP-triggered run. May be nil (recording disabled),
+	// matching CredStore's nil-means-off convention.
+	HistoryStore runstore.Store
 }
 
-// NewHandler returns a Handler wired to flowStore, buildRegistry, and
-// credStore. It is the caller's job to gate it with auth (httpapi.Server
-// mounts it behind its bearer-token middleware, same as every other route);
-// this package does not know about auth on purpose — pkg/httpapi owns that
-// concern.
-func NewHandler(flowStore flowstore.Store, buildRegistry func() (*piece.Registry, error), credStore credentials.Store) *Handler {
-	return &Handler{FlowStore: flowStore, BuildRegistry: buildRegistry, CredStore: credStore}
+// NewHandler returns a Handler wired to flowStore, buildRegistry, credStore,
+// and historyStore. It is the caller's job to gate it with auth
+// (httpapi.Server mounts it behind its bearer-token middleware, same as
+// every other route); this package does not know about auth on purpose —
+// pkg/httpapi owns that concern.
+func NewHandler(flowStore flowstore.Store, buildRegistry func() (*piece.Registry, error), credStore credentials.Store, historyStore runstore.Store) *Handler {
+	return &Handler{FlowStore: flowStore, BuildRegistry: buildRegistry, CredStore: credStore, HistoryStore: historyStore}
 }
 
 // nullID is the JSON-RPC id used when no id could be read from the request
@@ -239,7 +247,7 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 		return
 	}
 
-	state, validationErrs, runErr := flowstore.RunWithCredentials(&def.Flow, h.BuildRegistry, h.CredStore, params.Arguments, false)
+	state, validationErrs, runErr := flowstore.RunWithHistory(&def.Flow, h.BuildRegistry, h.CredStore, h.HistoryStore, def.Name, params.Arguments, false)
 	if runErr != nil {
 		writeError(w, req.ID, -32603, "internal error: "+runErr.Error())
 		return

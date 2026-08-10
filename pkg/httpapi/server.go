@@ -31,6 +31,7 @@ import (
 	"goflow/pkg/oauth"
 	"goflow/pkg/piece"
 	"goflow/pkg/pieces"
+	"goflow/pkg/runstore"
 )
 
 // Server holds the shared, read-mostly state for every request: the catalog
@@ -38,14 +39,17 @@ import (
 // but typed as the interface so tests can pass any Store), the named-flow
 // store (a *flowstore.GatedStore wrapping whatever flowstore.Store the
 // caller passed, built inside NewServer so the gate reuses this server's
-// own buildRegistry), the bearer token every non-public route is gated on,
-// and oauthSrv — the OAuth 2.1 authorization server (pkg/oauth) that lets a
-// spec-compliant MCP client authenticate without knowing that static token
-// directly. See auth's doc comment for how the two credential forms compose.
+// own buildRegistry), runStore (every completed run, via
+// flowstore.RunWithHistory — see GET /runs), the bearer token every
+// non-public route is gated on, and oauthSrv — the OAuth 2.1 authorization
+// server (pkg/oauth) that lets a spec-compliant MCP client authenticate
+// without knowing that static token directly. See auth's doc comment for
+// how the two credential forms compose.
 type Server struct {
 	store          catalog.Store
 	credStore      credentials.Store
 	flowStore      *flowstore.GatedStore
+	runStore       runstore.Store
 	token          string
 	expectedBearer []byte // "Bearer " + token, precomputed once — see auth
 	oauthSrv       *oauth.Server
@@ -54,18 +58,21 @@ type Server struct {
 // NewServer returns a Server that authorizes non-public routes with token
 // (directly, or via an OAuth access token oauthSrv issued for it — see
 // auth), reads/writes catalog Definitions through store, manages encrypted
-// credentials through credStore, and persists named flows through flowStore.
-// flowStore is the RAW store (no gate): NewServer wraps it in a
-// *flowstore.GatedStore itself, wiring the gate's BuildRegistry to this
-// server's own buildRegistry — so /flows (save) validates a flow against the
-// exact same piece registry /flows/run and every other route assembles,
-// without duplicating that assembly in cmd/server/main.go. credStore is
-// never asked to decrypt over HTTP — only Save/List/Delete are exposed; Get
-// is for trusted Go callers. issuer is this server's externally-reachable
-// base URL, passed straight through to oauth.NewServer for its metadata.
-func NewServer(store catalog.Store, credStore credentials.Store, flowStore flowstore.Store, token, issuer string) *Server {
+// credentials through credStore, persists named flows through flowStore, and
+// records every run through runStore. flowStore is the RAW store (no gate):
+// NewServer wraps it in a *flowstore.GatedStore itself, wiring the gate's
+// BuildRegistry to this server's own buildRegistry — so /flows (save)
+// validates a flow against the exact same piece registry /flows/run and
+// every other route assembles, without duplicating that assembly in
+// cmd/server/main.go. credStore is never asked to decrypt over HTTP — only
+// Save/List/Delete are exposed; Get is for trusted Go callers. runStore may
+// be nil (recording disabled — see flowstore.RunWithHistory), though
+// cmd/server always supplies a real one, the same as it does for credStore
+// and flowStore. issuer is this server's externally-reachable base URL,
+// passed straight through to oauth.NewServer for its metadata.
+func NewServer(store catalog.Store, credStore credentials.Store, flowStore flowstore.Store, runStore runstore.Store, token, issuer string) *Server {
 	s := &Server{
-		store: store, credStore: credStore, token: token,
+		store: store, credStore: credStore, runStore: runStore, token: token,
 		expectedBearer: []byte("Bearer " + token),
 		oauthSrv:       oauth.NewServer(token, issuer),
 	}
@@ -89,13 +96,18 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /flows/{name}/run", s.auth(http.HandlerFunc(s.handleFlowRun)))
 	mux.Handle("/credentials", s.auth(http.HandlerFunc(s.handleCredentials)))
 	mux.Handle("DELETE /credentials/{name}", s.auth(http.HandlerFunc(s.handleCredentialDelete)))
+	// /runs exposes the run history flowstore.RunWithHistory records for
+	// every flow run — GET /runs lists metadata only (a run's full State can
+	// be large), GET /runs/{id} returns one full runstore.Record.
+	mux.Handle("GET /runs", s.auth(http.HandlerFunc(s.handleRunsList)))
+	mux.Handle("GET /runs/{id}", s.auth(http.HandlerFunc(s.handleRunGet)))
 	// /mcp exposes the saved flows as MCP tools (JSON-RPC 2.0 over a single
 	// POST), behind the same auth as every other route (static token OR a
 	// live OAuth access token — see auth). authMCP additionally advertises
 	// where to find this resource's OAuth metadata on a 401, so a
 	// spec-compliant client discovers the flow below instead of just
 	// retrying the same bare token forever.
-	mux.Handle("POST /mcp", s.authMCP(mcpapi.NewHandler(s.flowStore, s.buildRegistry, s.credStore)))
+	mux.Handle("POST /mcp", s.authMCP(mcpapi.NewHandler(s.flowStore, s.buildRegistry, s.credStore, s.runStore)))
 
 	// OAuth 2.1 endpoints (pkg/oauth) — deliberately NOT behind s.auth: they
 	// ARE the mechanism a client without a token yet uses to get one. See
@@ -185,21 +197,22 @@ func (s *Server) handleFlowsRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	s.runFlowVersion(w, &req.Flow, req.Trigger, req.ExecuteTrigger)
+	s.runFlowVersion(w, &req.Flow, "", req.Trigger, req.ExecuteTrigger)
 }
 
 // runFlowVersion is the shared run path for both POST /flows/run (an ad-hoc
-// FlowVersion in the body) and POST /flows/{name}/run (a FlowVersion fetched
-// from the store by name). The validate-then-execute logic itself lives in
-// flowstore.Run (shared with the MCP tools/call path); this method only
-// translates Run's three return values into the HTTP response shape the two
-// routes have always had: 400 {"error":...} on a registry failure, 400
-// {"errors":[...]} on a validation failure, and the bare *model.ExecutionState
-// as the whole 200 body on success (never wrapped — matching the ad-hoc
-// route's original shape, so the existing /flows/run and /flows/{name}/run
-// tests pass unchanged).
-func (s *Server) runFlowVersion(w http.ResponseWriter, fv *model.FlowVersion, trigger any, executeTrigger bool) {
-	state, validationErrs, err := flowstore.RunWithCredentials(fv, s.buildRegistry, s.credStore, trigger, executeTrigger)
+// FlowVersion in the body — flowName "") and POST /flows/{name}/run (a
+// FlowVersion fetched from the store by name — flowName is that name,
+// recorded alongside the run in history). The validate-then-execute logic
+// itself lives in flowstore.RunWithHistory (shared with the MCP tools/call
+// path); this method only translates its three return values into the HTTP
+// response shape the two routes have always had: 400 {"error":...} on a
+// registry failure, 400 {"errors":[...]} on a validation failure, and the
+// bare *model.ExecutionState as the whole 200 body on success (never
+// wrapped — matching the ad-hoc route's original shape, so the existing
+// /flows/run and /flows/{name}/run tests pass unchanged).
+func (s *Server) runFlowVersion(w http.ResponseWriter, fv *model.FlowVersion, flowName string, trigger any, executeTrigger bool) {
+	state, validationErrs, err := flowstore.RunWithHistory(fv, s.buildRegistry, s.credStore, s.runStore, flowName, trigger, executeTrigger)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -338,7 +351,7 @@ func (s *Server) handleFlowRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.runFlowVersion(w, &def.Flow, req.Trigger, req.ExecuteTrigger)
+	s.runFlowVersion(w, &def.Flow, name, req.Trigger, req.ExecuteTrigger)
 }
 
 // credRequest is the body POST /credentials expects. Value is any JSON — a
@@ -405,6 +418,38 @@ func (s *Server) handleCredentialDelete(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "name": name})
+}
+
+// handleRunsList handles GET /runs — every recorded run, metadata only
+// (runstore.Summary), newest first. s.runStore is never nil in production
+// (cmd/server always wires a real one, the same as credStore/flowStore); a
+// nil runStore here (only reachable from a test that deliberately omits it)
+// would panic, the same way handleCredentials would if credStore were nil —
+// consistent with how every other required Store in this Server behaves.
+func (s *Server) handleRunsList(w http.ResponseWriter, r *http.Request) {
+	summaries, err := s.runStore.List()
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runs": summaries})
+}
+
+// handleRunGet handles GET /runs/{id} — the full runstore.Record, including
+// the run's complete ExecutionState. A missing id is 404, matching the
+// store's (zero, false, nil) contract.
+func (s *Server) handleRunGet(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	rec, ok, err := s.runStore.Get(id)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
 }
 
 // --- middleware -------------------------------------------------------------
