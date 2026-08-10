@@ -63,6 +63,22 @@ type ActionDefinition struct {
 	// from its Source via jspiece.NewDropdown in ToPiece. Optional; most
 	// actions have none.
 	Dropdowns map[string]DropdownDefinition
+
+	// RequiresAuth, if non-empty, describes the credential this action's
+	// "auth" Input key (piece.AuthInputKey, surfaced to the action's own
+	// Source as ctx.auth / ActionContext.Auth) needs to actually work —
+	// e.g. "Slack Bot Token (string, starts with xoxb-)". Free text, same
+	// "not a formal schema" reasoning as InputSchema above: ActionContext.
+	// Auth is `any` with no engine-enforced shape (see AuthInputKey's own
+	// doc comment), so there is nothing to validate this against — it
+	// exists purely so an agent reading this Definition (via
+	// goflow_describe_catalog's text or a raw goflow_export_catalog/GET
+	// /pieces/export dump) learns BEFORE authoring a flow around this
+	// piece that it will need to goflow_save_credential something
+	// matching this description, instead of only finding out from a
+	// failed run. Optional; an action needing no credential leaves it
+	// empty, same as most actions leave Dropdowns empty.
+	RequiresAuth string
 }
 
 // DropdownDefinition is one JS-authored dynamically-loaded property on an

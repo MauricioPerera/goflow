@@ -1016,6 +1016,42 @@ func TestExportCatalog_ReturnsFullDefinitionIncludingSourceAndExamples(t *testin
 	}
 }
 
+func TestExportCatalog_IncludesRequiresAuthSetViaSavePiece(t *testing.T) {
+	h, _ := newHandlerWithFlowsAndCatalog(t)
+	saveResult := callTool(t, h, toolSavePiece, map[string]any{
+		"name": "slack_poster", "displayName": "Slack Poster",
+		"actions": []any{
+			map[string]any{
+				"name": "post", "displayName": "Post",
+				"source":       "(ctx) => ({ ok: true })",
+				"requiresAuth": "Slack Bot Token (string, starts with xoxb-)",
+				"examples": []any{
+					map[string]any{"description": "posts ok", "input": map[string]any{}, "checkOutput": true, "wantOutput": map[string]any{"ok": true}},
+				},
+			},
+		},
+	})
+	if saveResult["isError"] != false {
+		t.Fatalf("save_piece isError = %v, want false: %v", saveResult["isError"], saveResult)
+	}
+
+	result := callTool(t, h, toolExportCatalog, nil)
+	var body struct {
+		Pieces []catalog.Definition `json:"pieces"`
+	}
+	toolText(t, result, &body)
+	if len(body.Pieces) != 1 || body.Pieces[0].Actions[0].RequiresAuth != "Slack Bot Token (string, starts with xoxb-)" {
+		t.Fatalf("pieces = %+v, want RequiresAuth to round-trip from goflow_save_piece through goflow_export_catalog", body.Pieces)
+	}
+
+	descResult := callTool(t, h, toolDescribeCatalog, nil)
+	item, _ := descResult["content"].([]any)[0].(map[string]any)
+	text, _ := item["text"].(string)
+	if !strings.Contains(text, "requires auth: Slack Bot Token (string, starts with xoxb-)") {
+		t.Fatalf("describe_catalog text missing requires auth line: %s", text)
+	}
+}
+
 func TestExportCatalog_EmptyCatalog_ReturnsEmptyArray(t *testing.T) {
 	h, _ := newHandlerWithFlowsAndCatalog(t)
 	result := callTool(t, h, toolExportCatalog, nil)

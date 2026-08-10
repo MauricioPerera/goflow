@@ -267,7 +267,7 @@ func metaToolDescriptors() []map[string]any {
 					"description": map[string]any{"type": "string"},
 					"actions": map[string]any{
 						"type":        "array",
-						"description": "each item: {name, displayName, description, inputSchema (free text), source (JS: \"(ctx) => value\"), examples: [{description, input, auth, wantError, checkOutput, wantOutput}], dropdowns}. At least one example per action, required.",
+						"description": "each item: {name, displayName, description, inputSchema (free text), source (JS: \"(ctx) => value\"), examples: [{description, input, auth, wantError, checkOutput, wantOutput}], dropdowns, requiresAuth}. At least one example per action, required. requiresAuth is free text describing the credential this action's ctx.auth needs to work (e.g. \"Slack Bot Token (string, starts with xoxb-)\") — set it whenever the action reads ctx.auth, so goflow_describe_catalog/goflow_export_catalog tell a future caller what to goflow_save_credential BEFORE they hit a runtime failure; leave it unset for an action that needs no credential.",
 						"items":       map[string]any{"type": "object"},
 					},
 					"triggers": map[string]any{

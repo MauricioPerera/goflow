@@ -246,6 +246,35 @@ func TestPiecesExport_ReturnsFullDefinitionIncludingSourceAndExamples(t *testing
 	}
 }
 
+func TestPiecesExport_IncludesRequiresAuth(t *testing.T) {
+	srv := newTestServer(t)
+	def := catalog.Definition{
+		Name: "slack-poster", DisplayName: "Slack Poster",
+		Actions: []catalog.ActionDefinition{{
+			Name: "post", DisplayName: "Post",
+			Source:       "(ctx) => ({ ok: true })",
+			RequiresAuth: "Slack Bot Token (string, starts with xoxb-)",
+			Examples: []catalog.Example{{
+				Input: map[string]any{}, CheckOutput: true, WantOutput: map[string]any{"ok": true},
+			}},
+		}},
+	}
+	if rec := do(t, srv, "POST", "/pieces", def, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save status = %d, want 201", rec.Code)
+	}
+
+	rec := do(t, srv, "GET", "/pieces/export", nil, true)
+	var body struct {
+		Pieces []catalog.Definition `json:"pieces"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, rec.Body.String())
+	}
+	if len(body.Pieces) != 1 || body.Pieces[0].Actions[0].RequiresAuth != "Slack Bot Token (string, starts with xoxb-)" {
+		t.Fatalf("pieces = %+v, want RequiresAuth to round-trip", body.Pieces)
+	}
+}
+
 func TestPiecesExport_EmptyCatalog_ReturnsEmptyArray(t *testing.T) {
 	srv := newTestServer(t)
 	rec := do(t, srv, "GET", "/pieces/export", nil, true)

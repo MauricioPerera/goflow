@@ -46,6 +46,9 @@ func renderDefinitions(defs []Definition) string {
 			if a.InputSchema != "" {
 				fmt.Fprintf(&sb, "    input: %s\n", a.InputSchema)
 			}
+			if a.RequiresAuth != "" {
+				fmt.Fprintf(&sb, "    requires auth: %s\n", a.RequiresAuth)
+			}
 		}
 	}
 	return sb.String()

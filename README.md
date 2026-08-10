@@ -706,6 +706,22 @@ below for what a Go rewrite gets and gives up.
   built-in Go pieces (`pkg/pieces.All()`) are native code, not data, so
   they have no `Definition` and never appear in the export; `GET
   /catalog`'s text still describes them alongside the JS-authored ones.
+- **Declare a piece action's credential need** (`ActionDefinition.
+  RequiresAuth`): sharing a catalog piece (see export above) surfaced a
+  real gap once pieces started moving between agents — an action reading
+  `ctx.auth` (`piece.AuthInputKey`) had no way to say WHAT it needs before
+  a caller hit a runtime failure from a missing/wrong credential.
+  `RequiresAuth` is free text on `ActionDefinition` (same "not a formal
+  schema" reasoning as `InputSchema` — `ActionContext.Auth` is `any` with
+  no engine-enforced shape, so there's nothing to validate this against),
+  e.g. `"Slack Bot Token (string, starts with xoxb-)"`. It needed no new
+  route: it rides along automatically wherever a `Definition` already
+  does (`GET /pieces/export`, `goflow_export_catalog`, `POST /pieces`,
+  `goflow_save_piece`) and now also renders as a `requires auth:` line in
+  `catalog.DescribeCombined`'s text (`GET /catalog`,
+  `goflow_describe_catalog`) — the tool an agent is already told to call
+  FIRST before authoring a flow around a piece, so the credential need
+  surfaces at the earliest possible read, not after a failed run.
 
 ## Explicitly NOT in v1
 

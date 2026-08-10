@@ -48,3 +48,37 @@ func TestDescribe_ListsNameDescriptionAndActions(t *testing.T) {
 		t.Fatalf("text = %q, want entries sorted by name", text)
 	}
 }
+
+func TestDescribe_ShowsRequiresAuthWhenSet(t *testing.T) {
+	store := catalog.NewMemoryStore()
+	store.Save(catalog.Definition{
+		Name: "slack", DisplayName: "Slack", Description: "posts to slack",
+		Actions: []catalog.ActionDefinition{
+			{
+				Name: "post", DisplayName: "Post", Description: "posts a message",
+				Source:       `(ctx) => ({ ok: true })`,
+				RequiresAuth: "Slack Bot Token (string, starts with xoxb-)",
+			},
+		},
+	})
+
+	text, err := catalog.Describe(store)
+	if err != nil {
+		t.Fatalf("Describe() error = %v", err)
+	}
+	if !strings.Contains(text, "requires auth: Slack Bot Token (string, starts with xoxb-)") {
+		t.Fatalf("text = %q, want it to show the action's RequiresAuth", text)
+	}
+}
+
+func TestDescribe_OmitsRequiresAuthLineWhenUnset(t *testing.T) {
+	store := catalog.NewMemoryStore()
+	store.Save(sampleDefinition("risk_score")) // RequiresAuth left empty
+	text, err := catalog.Describe(store)
+	if err != nil {
+		t.Fatalf("Describe() error = %v", err)
+	}
+	if strings.Contains(text, "requires auth") {
+		t.Fatalf("text = %q, want no \"requires auth\" line for an action that doesn't set it", text)
+	}
+}
