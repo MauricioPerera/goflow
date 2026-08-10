@@ -160,7 +160,7 @@ myPiece := piece.Piece{
                 }
                 city, _ := ctx.Input["city"].(string)
                 if city == "" {
-                    return nil, fmt.Errorf("missing required input: city")
+                    return nil, fmt.Errorf("missing required input: city (string)")
                 }
                 // ... call the real API here ...
                 return map[string]any{"city": city, "tempC": 21}, nil
