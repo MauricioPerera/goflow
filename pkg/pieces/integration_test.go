@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"goflow/pkg/engine"
+	"goflow/pkg/flowvalidate"
 	"goflow/pkg/jspiece"
 	"goflow/pkg/model"
 	"goflow/pkg/piece"
@@ -961,23 +962,24 @@ func TestCatalog_JSTriggerComposesWithRealCatalog(t *testing.T) {
 	}
 }
 
-// TestCatalog_JSDropdownComposesWithRealCatalog proves a JS-authored
-// Dropdown (jspiece.NewDropdown) resolves through the real engine's
-// public LoadOptions API — the same call path a real editor UI would use
-// to populate a dropdown, not just piece.DropdownProperty.LoadOptions
-// called directly — registered alongside the full Go catalog.
-func TestCatalog_JSDropdownComposesWithRealCatalog(t *testing.T) {
-	registry := piece.NewRegistry()
-	if err := pieces.RegisterAll(registry); err != nil {
-		t.Fatalf("RegisterAll: %v", err)
-	}
-
-	region := piece.Piece{
+// regionPickerPiece is a JS-authored piece with one Dropdown ("region")
+// offering two valid values, and one action ("deploy") that validates its
+// "region" Input against that same list itself — the engine has no
+// concept of a Dropdown's options being enforced at runtime, so a piece
+// that cares has to check its own Input, same as any other validation.
+func regionPickerPiece() piece.Piece {
+	return piece.Piece{
 		Name: "region_picker", DisplayName: "Region Picker",
 		Actions: map[string]piece.Action{
 			"deploy": jspiece.NewAction(jspiece.ActionSource{
 				Name: "deploy", DisplayName: "Deploy",
-				Source: `(ctx) => ({ deployedTo: ctx.input.region })`,
+				Source: `(ctx) => {
+					const valid = ["us-east-1", "eu-west-1"];
+					if (valid.indexOf(ctx.input.region) === -1) {
+						throw new Error("invalid region: " + ctx.input.region);
+					}
+					return { deployedTo: ctx.input.region, status: "deployed" };
+				}`,
 				Dropdowns: map[string]jspiece.DropdownSource{
 					"region": {
 						Source: `(propsValue, ctx) => ({
@@ -991,7 +993,19 @@ func TestCatalog_JSDropdownComposesWithRealCatalog(t *testing.T) {
 			}),
 		},
 	}
-	if err := registry.RegisterValidated(region); err != nil {
+}
+
+// TestCatalog_JSDropdownComposesWithRealCatalog proves a JS-authored
+// Dropdown (jspiece.NewDropdown) resolves through the real engine's
+// public LoadOptions API — the same call path a real editor UI would use
+// to populate a dropdown, not just piece.DropdownProperty.LoadOptions
+// called directly — registered alongside the full Go catalog.
+func TestCatalog_JSDropdownComposesWithRealCatalog(t *testing.T) {
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+	if err := registry.RegisterValidated(regionPickerPiece()); err != nil {
 		t.Fatalf("RegisterValidated: %v", err)
 	}
 
@@ -1003,5 +1017,108 @@ func TestCatalog_JSDropdownComposesWithRealCatalog(t *testing.T) {
 	}
 	if len(state.Options) != 2 || state.Options[0].Value != "us-east-1" || state.Options[1].Value != "eu-west-1" {
 		t.Fatalf("state.Options = %+v", state.Options)
+	}
+}
+
+// TestFlow_UsesValueSelectedFromJSDropdown simulates the real editor
+// workflow end to end: call LoadOptions to discover what values are
+// valid, pick one from what came back (not hardcoded), bake that exact
+// value into a flow's Input (JSON, same as any Phase-1 flow), validate
+// the flow structurally, then actually run it — proving a value a
+// Dropdown offered really does work when used for real.
+func TestFlow_UsesValueSelectedFromJSDropdown(t *testing.T) {
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+	if err := registry.RegisterValidated(regionPickerPiece()); err != nil {
+		t.Fatalf("RegisterValidated: %v", err)
+	}
+
+	e := engine.New(registry)
+	state, err := e.LoadOptions(engine.LoadOptionsInput{
+		PieceName: "region_picker", ActionName: "deploy", PropertyName: "region",
+	})
+	if err != nil {
+		t.Fatalf("LoadOptions() error = %v", err)
+	}
+	if len(state.Options) != 2 {
+		t.Fatalf("state.Options = %+v, want 2", state.Options)
+	}
+	selected := state.Options[1].Value.(string) // "eu-west-1" — picked from the dropdown's own data, not hardcoded
+
+	flowJSON := fmt.Sprintf(`{
+		"id": "fv-dropdown-selected-region",
+		"trigger": {
+			"name": "trigger_1",
+			"displayName": "Trigger",
+			"type": "EMPTY",
+			"nextAction": {
+				"name": "deploy",
+				"displayName": "Deploy",
+				"type": "PIECE",
+				"piece": {
+					"pieceName": "region_picker",
+					"actionName": "deploy",
+					"input": { "region": %q }
+				}
+			}
+		}
+	}`, selected)
+
+	fv, err := model.ParseFlowVersion([]byte(flowJSON))
+	if err != nil {
+		t.Fatalf("ParseFlowVersion: %v", err)
+	}
+	if errs := flowvalidate.Validate(fv, registry); len(errs) != 0 {
+		t.Fatalf("Validate() = %+v, want no errors", errs)
+	}
+
+	result := e.ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+	if result.Verdict.Status != model.FlowRunSucceeded {
+		t.Fatalf("verdict = %+v", result.Verdict)
+	}
+	out := result.Steps["deploy"].Output.(map[string]any)
+	if out["deployedTo"] != selected || out["status"] != "deployed" {
+		t.Fatalf("out = %+v, want deployedTo=%q", out, selected)
+	}
+}
+
+// TestFlow_RegionOutsideDropdownFailsClearly confirms, directly rather
+// than assuming, that goflow's Dropdowns are advisory metadata only — the
+// engine never checks a PIECE action's Input against what a Dropdown's
+// LoadOptions offers. A value never returned by the dropdown still
+// reaches the action's Run unchanged; only regionPickerPiece's OWN
+// validation (thrown from JS) is what rejects it here.
+func TestFlow_RegionOutsideDropdownFailsClearly(t *testing.T) {
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+	if err := registry.RegisterValidated(regionPickerPiece()); err != nil {
+		t.Fatalf("RegisterValidated: %v", err)
+	}
+
+	deployStep := &model.FlowAction{
+		Name: "deploy", DisplayName: "Deploy", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "region_picker", ActionName: "deploy", Input: map[string]any{
+			"region": "ap-south-1", // never offered by the dropdown
+		}},
+	}
+	fv := &model.FlowVersion{ID: "fv-region-outside-dropdown", Trigger: &model.FlowTrigger{
+		Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+		NextAction: deployStep,
+	}}
+
+	// flowvalidate has no way to know "ap-south-1" is invalid either — it
+	// only checks structure/syntax, confirming this really is purely the
+	// piece's own runtime concern.
+	if errs := flowvalidate.Validate(fv, registry); len(errs) != 0 {
+		t.Fatalf("Validate() = %+v, want no errors — an out-of-dropdown value is not a structural problem", errs)
+	}
+
+	state := engine.New(registry).ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+	if state.Verdict.Status != model.FlowRunFailed {
+		t.Fatalf("verdict = %+v, want FAILED — region_picker.deploy rejects any region outside its own valid list", state.Verdict)
 	}
 }

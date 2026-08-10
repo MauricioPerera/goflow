@@ -1092,3 +1092,23 @@ go run ./examples
   `DropdownProperty.LoadOptions` called directly) — the same public API
   path a real editor UI would call, registered alongside the full Go
   catalog.
+- **Tested a flow actually USING a value a JS Dropdown offered, not just
+  resolving the dropdown in isolation — and confirmed a fact worth
+  stating plainly: Dropdowns are advisory metadata only, the engine never
+  enforces them.** `TestFlow_UsesValueSelectedFromJSDropdown`
+  (`pkg/pieces/integration_test.go`) simulates the real editor workflow
+  end to end: call `Engine.LoadOptions` to discover valid values, pick one
+  from what actually came back (`state.Options[1].Value`, not
+  hardcoded), bake that exact value into a flow's JSON `Input` (Phase 1
+  style), `flowvalidate.Validate` it, then run it for real — the action
+  receives and correctly uses the dropdown-sourced value.
+  `TestFlow_RegionOutsideDropdownFailsClearly` is the other half: a value
+  the dropdown never offered (`"ap-south-1"`) still reaches the action's
+  `Run` completely unchanged — neither `Engine.ExecuteBegin` nor
+  `flowvalidate.Validate` know or care what a `Dropdown`'s `Options` are.
+  The only reason that flow fails is `regionPickerPiece`'s own JS
+  throwing on an unrecognized region — exactly the same "the engine
+  doesn't enforce a schema, the piece validates its own Input if it
+  cares" philosophy already true for every other Input field in this
+  project, now confirmed to hold for Dropdown-backed ones too rather than
+  assumed by analogy.
