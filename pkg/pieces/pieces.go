@@ -31,10 +31,10 @@ import (
 
 // All returns a fresh instance of every catalog piece. Fresh each call,
 // deliberately — a Piece's Actions/Triggers maps hold closures, and none of
-// the catalog pieces need to share state across Registry instances (a
-// piece that DOES need shared state, e.g. a rate limiter, builds that into
-// its own New() — see the delay/http/json/webhook packages for the pattern
-// to follow).
+// the catalog pieces need to share state across Registry instances. A piece
+// that DOES need shared state (e.g. a rate limiter) would build that into
+// its own New(); none of today's pieces need it, so there's no existing
+// example of the pattern to point to yet.
 func All() []piece.Piece {
 	return []piece.Piece{
 		httppiece.New(),
