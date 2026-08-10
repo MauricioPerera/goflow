@@ -223,7 +223,7 @@ below for what a Go rewrite gets and gives up.
   and every pitfall in this list, meant to be loaded before writing a new
   `piece.Piece{...}` literal at all — catching a mistake before it's typed
   beats catching it after.
-- **A small piece catalog** (`pkg/pieces`): thirteen independently-tested,
+- **A small piece catalog** (`pkg/pieces`): sixteen independently-tested,
   ready-to-use pieces — `http` (a real `net/http` request, auth sent as an
   `Authorization` header — a plain string verbatim, or a `*piece.OAuth2Auth`
   formatted as `Bearer <AccessToken>` — a timeout so a hung server can't hang a
@@ -252,10 +252,15 @@ below for what a Go rewrite gets and gives up.
   RFC3339 timestamps), `hash` (md5/sha1/sha256/sha512 digests plus HMAC,
   key via `ctx.Auth` — for verifying an incoming webhook's signature),
   `regex` (match/find_all/replace/extract_groups — "no match" is a valid
-  result, not an error, same philosophy as `failOnErrorStatus`), and `csv`
+  result, not an error, same philosophy as `failOnErrorStatus`), `csv`
   (parse/stringify, `hasHeader` toggles row shape between `[][]string` and
-  `[]map[string]any`). `pieces.RegisterAll(registry)` registers all
-  thirteen in one call; `pieces.All()` if you want to filter
+  `[]map[string]any`), `uuid` (RFC 4122 v4 generation, `crypto/rand` +
+  `encoding/hex`, no third-party UUID library), `base64` (encode/decode
+  text via `encoding/base64`), and `email` (send via `net/smtp.SendMail`,
+  `smtp.PlainAuth` when `ctx.Auth` is a `"user:password"` string,
+  unauthenticated otherwise — tested against a hand-rolled, stdlib-only
+  fake SMTP server). `pieces.RegisterAll(registry)` registers all
+  sixteen in one call; `pieces.All()` if you want to filter
   first. No dynamic discovery, no marketplace, no versioning — add a piece
   by importing its package and listing it in `pieces.go`, same as any other
   Go dependency. Every catalog piece calls `piece.MustValidate` on itself in
