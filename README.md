@@ -71,8 +71,9 @@ below for what a Go rewrite gets and gives up.
   through `Engine.LoadOptions` exactly like any Go piece's dropdown — same
   call path a real editor UI would use. Persistence — where a JS piece's
   source lives and how it survives a restart — is `pkg/catalog` (below),
-  not this package, and only covers actions so far (`catalog.Definition`
-  has no trigger or Dropdown equivalent yet).
+  not this package, and now covers actions (`catalog.Definition`),
+  triggers (`catalog.TriggerDefinition`), and dropdowns
+  (`catalog.DropdownDefinition`).
 - **Piece catalog persistence & discovery** (`pkg/catalog`): Phase 3 of the
   "AI-first" direction, closing the gap Phase 2 explicitly left open —
   `jspiece.New` builds a piece purely in memory, so a piece an agent
@@ -83,18 +84,29 @@ below for what a Go rewrite gets and gives up.
   action: description, a free-text `InputSchema`, and its JS source) is
   what a `Store` persists; `Definition.ToPiece()` turns it into a real
   `piece.Piece` via `jspiece.New`, and `RegisterFromStore` loads every
-  Definition in a Store straight into an `Engine`'s registry. Two `Store`
+  Definition in a Store straight into an `Engine`'s registry.
+  `catalog.TriggerDefinition` and `catalog.DropdownDefinition` are the
+  symmetric persisted forms for JS-authored triggers and dropdowns —
+  same `Store` interface, loaded back into an `Engine` alongside the
+  actions, so a trigger or dropdown an agent authors survives a restart
+  the same way an action does. Two `Store`
   implementations, same "simple in-memory default, real persistence is
   the caller's choice" convention as `piece.Store`/`FileWriter`:
   `MemoryStore` (dies with the process, mainly for tests) and `FileStore`
   (one JSON file per piece in a directory — real, actual disk persistence
-  across restarts, zero new dependencies). `catalog.Describe(store)`
+  across restarts, zero new dependencies; a save is atomic — encode into
+  a temp file in the same directory, then `os.Rename` it into place, so a
+  crash mid-save never leaves a half-written piece file). `catalog.Describe(store)`
   renders every piece's name/description/actions/input-schema as plain
   text meant to be handed directly to an agent's context before it
   decides whether to reuse something instead of authoring a piece again —
   deliberately plain text for a language model to read, not a search
   index or embedding lookup; a program that needs the data structurally
-  should call `store.List()` directly. A quality gate now covers whether a
+  should call `store.List()` directly. `catalog.DescribeCombined(store,
+  goCatalog)` renders the Go-native catalog and the persisted JS catalog
+  side by side in one plain-text block, so an agent sees both in a single
+  context instead of having to be told the Go catalog exists separately.
+  A quality gate now covers whether a
   Definition actually works (below); a *flow* that references a cataloged
   piece is checked before running by `pkg/flowvalidate` (below), the last
   of the four AI-first gaps.
@@ -1177,3 +1189,29 @@ go run ./examples
   against the real implementation. Worth recording plainly: the
   delegation tooling is real and was used in good faith, not skipped —
   this is what happened when it was actually tried.
+- **`pkg/catalog` grew trigger and dropdown persistence, an atomic
+  `FileStore` save, and a combined Go+JS discovery view in one tanda —
+  all implemented by a delegated model (glm-5.2) under human/other-agent
+  verification, not hand-written here.** Four concrete additions, each
+  with its own test rather than assumed: `catalog.TriggerDefinition` and
+  `catalog.DropdownDefinition` are the symmetric persisted forms for
+  JS-authored triggers and dropdowns (the gap the jspiece package comment
+  above used to call out as "not yet" — it now is), proven to survive a
+  process restart and fire/resolve through a real `Engine` by
+  `TestTrigger_PersistedAcrossProcessesAndFiresThroughRealEngine` and
+  `TestDropdown_PersistedAcrossProcessesAndResolvesThroughRealEngine`
+  (`pkg/catalog/trigger_test.go`, `dropdown_test.go`); `FileStore.Save`
+  is now atomic — encode into a temp file in the store directory, then
+  `os.Rename` into place, so a crash mid-save leaves no half-written
+  piece file — covered by `TestFileStore_SaveLeavesNoTempFiles` and
+  `TestFileStore_SaveOverwritesWithoutOrphans` (`file_store_test.go`);
+  and `catalog.DescribeCombined(store, goCatalog)` renders the Go-native
+  catalog and the persisted JS catalog as one plain-text block, so an
+  agent's context sees both without a second call, covered by
+  `TestDescribeCombined_BothPopulated` and
+  `TestDescribeCombined_StableAcrossCalls` (`merged_describe.go`,
+  `merged_describe_test.go`). Stated plainly on authorship: the code was
+  written by glm-5.2 working against a signed task contract through this
+  project's CCDD delegation tooling, then verified here — `go build`,
+  `go vet`, and the full `go test ./...` suite were run after the fact to
+  confirm nothing regressed, not assumed from the model's own report.

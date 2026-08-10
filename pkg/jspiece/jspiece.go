@@ -10,8 +10,9 @@
 //
 // Scope, deliberately: this package does not solve where the JS source
 // text comes from or how it survives a process restart (no persistence —
-// see pkg/catalog, which does, though only for actions so far;
-// catalog.Definition has no trigger or Dropdown equivalent yet). What's
+// see pkg/catalog, which does: catalog.Definition persists actions, and
+// catalog.TriggerDefinition and catalog.DropdownDefinition do the same
+// for triggers and dropdowns). What's
 // proven here is narrower and load-bearing: given JS source text from
 // anywhere, the engine can run it as a first-class piece.
 package jspiece
