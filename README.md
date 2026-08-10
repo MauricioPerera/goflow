@@ -321,19 +321,99 @@ below for what a Go rewrite gets and gives up.
   shared `Engine.Files` has no access control of its own.
 - `examples/main.go`: a runnable end-to-end flow (trigger → PIECE → CODE,
   cross-referencing outputs through templating), printing the result as JSON.
+- **HTTP API server** (`pkg/httpapi` + `cmd/server`): the first process
+  wrapped around the library — `net/http` + `crypto/subtle`, no new
+  dependency. `GET /health` (unauthenticated liveness), `GET /catalog`
+  (`catalog.DescribeCombined`), `POST /pieces` (saves through the same
+  `GatedStore` quality gate), `POST /flows/run` (ad-hoc: a
+  `model.FlowVersion` in the request body, validated then executed, the
+  full `*model.ExecutionState` as the response) — all gated by a single
+  shared bearer token (`GOFLOW_API_TOKEN`, compared via
+  `crypto/subtle.ConstantTimeCompare`) except `/health`. `cmd/server/main.go`
+  refuses to start without the token configured — never boots an
+  unauthenticated code-execution endpoint by accident. Deployed as a
+  systemd service on a real VPS (binary cross-compiled
+  `GOOS=linux GOARCH=amd64`, bound to `127.0.0.1` only, never exposed past
+  loopback).
+- **Encrypted credential store** (`pkg/credentials`): built for a case this
+  project didn't have an answer for — an *agent*, not a human, needs to
+  supply a piece's `ctx.Auth` without that secret ever traveling or resting
+  in plaintext. AES-256-GCM, one `.enc` file per credential (fresh random
+  nonce per save, atomic write — same `CreateTemp`+`Rename` pattern as
+  `catalog.FileStore`), key from `GOFLOW_CREDENTIALS_KEY` (32 bytes, hex,
+  mandatory — same fail-closed startup as the API token).
+  `POST`/`GET`/`DELETE /credentials` only ever handle names — there is no
+  HTTP route that returns a decrypted value, by design; `Store.Get` is for
+  trusted Go callers only. Wiring a stored credential into an actual flow
+  run (a flow referencing one by name instead of carrying the value itself)
+  is not done yet — this is the store, not the reference mechanism.
+- **Named flow persistence** (`pkg/flowstore`): closes the gap between "run
+  a flow once, ad-hoc" (`POST /flows/run`) and "a flow is a reusable,
+  discoverable thing" — the prerequisite for exposing flows as MCP tools
+  below. `FileStore` mirrors `catalog.FileStore`'s pattern exactly;
+  `GatedStore` runs `flowvalidate.Validate` against a freshly-built piece
+  registry before every save (never cached — a flow must validate against
+  the catalog *as it is now*, including JS pieces registered after the
+  process started), rejecting a flow that references a missing piece before
+  it ever reaches disk. `POST`/`GET /flows`, `GET`/`DELETE /flows/{name}`,
+  and `POST /flows/{name}/run` share the same execution path as the ad-hoc
+  route (`flowstore.Run`, extracted once a third caller — MCP, below —
+  needed it too, so the three transports can't drift apart in what "run a
+  flow" means).
+- **Flows as MCP tools** (`pkg/mcpapi`): a hand-written JSON-RPC 2.0
+  transport — no SDK, no streaming SSE, no sessions — mounted at
+  `POST /mcp` under the same bearer auth as everything else. Implements the
+  four methods needed for an LLM client to discover and call goflow's saved
+  flows as tools: `initialize`, `notifications/initialized`, `tools/list`
+  (one tool per saved flow; `inputSchema` is a deliberately permissive
+  `{type: object, additionalProperties: true}` carrying
+  `FlowDefinition.InputSchema`'s free text as its `description`, since that
+  field isn't a formal JSON Schema), and `tools/call` (the call's
+  `arguments` become the flow's trigger payload). An unknown tool name is a
+  JSON-RPC protocol error (`-32602`); a *known* flow that fails validation
+  or execution comes back as a normal tool result with `isError: true` —
+  the two are kept distinct on purpose, since only the first is a client
+  mistake. Verified against a real client, not just hand-built JSON-RPC
+  requests: the official `@modelcontextprotocol/inspector` CLI, run on the
+  same VPS against the deployed server, completed a real
+  `initialize`/`tools/list`/`tools/call` sequence and correctly surfaced an
+  unknown-tool error. One real, load-bearing limitation found this way and
+  not fixed: auth is still the same plain bearer token as every other
+  route, not the OAuth 2.1 flow the MCP spec defines for remote HTTP
+  servers — a real MCP client that only speaks that flow gets stuck
+  retrying OAuth discovery on a 401 instead of realizing a static header
+  would work; only a client configured with an explicit header (`--header`
+  on the Inspector, or an equivalent in a real client's config) can connect
+  today.
 
 ## Explicitly NOT in v1
 
-No server/API, no auth, no UI, no piece marketplace, no streaming progress,
-no distributed workers. This is a library + example, the same scope as the
-activepieces TS extraction's `example-standalone.ts` — a proof the mechanism
-works, not a deployable product. One nuance on "no persistence": it is no
-longer true in general. `pkg/catalog` adds real, cross-restart persistence
-via its `FileStore` (one JSON file per piece on disk) — but it is scoped to
-*piece definitions* only (name, description, per-action description,
-`InputSchema`, JS source, examples). It does not record flow execution
-history, run state, or anything resembling a general-purpose database; the
-rest of the list above still holds.
+No UI, no piece marketplace, no streaming progress, no distributed workers.
+This started as a library + example, the same scope as the activepieces TS
+extraction's `example-standalone.ts` — a proof the mechanism works, not a
+deployable product — but two things originally listed here as absent no
+longer are, and should be stated plainly rather than left stale:
+
+- **"No server/API" is no longer true.** `pkg/httpapi` + `cmd/server` is a
+  real HTTP server (`/health`, `/catalog`, `/pieces`, `/flows*`,
+  `/credentials*`, `/mcp` — see "What's here" above), deployed and running
+  on a real VPS as a systemd service. "No auth" is also no longer true, but
+  stays narrow: every non-`/health` route requires a single shared bearer
+  token, constant-time compared — there is no per-user auth, no accounts,
+  and no OAuth (including for MCP: this server does not implement the
+  OAuth 2.1 flow the MCP spec defines for remote servers, see the `pkg/mcpapi`
+  entry above).
+- **"No persistence" is no longer true in general.** `pkg/catalog` persists
+  piece definitions, `pkg/credentials` persists secrets encrypted at rest,
+  and `pkg/flowstore` persists named flows — all real, cross-restart disk
+  persistence. None of them is a general-purpose database: no flow
+  execution history or run log is recorded anywhere — a `Verdict`/`Steps`
+  map exists only for the duration of one `ExecuteBegin`/`ExecuteActionRun`
+  call and is returned to the caller, never stored.
+
+Still true: no UI, no piece marketplace, no streaming progress (a request
+gets one JSON response at the end, not incremental updates), no distributed
+workers (`cmd/server` is one process; scaling it is the caller's problem).
 
 ## Run it
 
@@ -1215,3 +1295,40 @@ go run ./examples
   project's CCDD delegation tooling, then verified here — `go build`,
   `go vet`, and the full `go test ./...` suite were run after the fact to
   confirm nothing regressed, not assumed from the model's own report.
+- **The `email` piece needed one decision before it could even be
+  delegated: how to test an SMTP send without a real mail server, since
+  the stdlib has no `httptest.Server` equivalent for SMTP.** `TICKETS.md`
+  had deferred the piece for exactly this reason. Decided to keep the same
+  "test against a real protocol server, never a mocked interface" stance
+  as `http`'s `httptest.Server` tests: `pkg/pieces/email/email_test.go`
+  hand-rolls a minimal SMTP server (`net`+`bufio` only) speaking just
+  enough of RFC 5321 — `EHLO`/`AUTH PLAIN`/`MAIL FROM`/`RCPT TO`/`DATA`/
+  `QUIT` — for `net/smtp.SendMail` (the real client, stdlib, already
+  implements the full protocol) to complete a send against it. One real
+  `net/smtp` gotcha worth recording: `smtp.PlainAuth` refuses to send
+  credentials over a non-TLS connection unless the server is
+  `127.0.0.1`/`localhost` — since the fake test server always binds there,
+  this resolves itself, but would otherwise look like a mysterious auth
+  failure. Implemented by glm-5.2 under delegation, verified here before
+  commit.
+- **`pkg/httpapi`, `pkg/credentials`, `pkg/flowstore`, and `pkg/mcpapi`
+  were built and verified in the same session, each a separate delegated
+  task, each independently checked before the next one started** (`go
+  build`/`go vet`/`go test -race`/a `GOOS=linux GOARCH=amd64` cross build/
+  direct code reading — never trusting the delegate's own "done" report)
+  **before being committed and deployed.** Deployment itself is real, not
+  simulated: the cross-compiled binary runs as a systemd service
+  (`goflow.service`) on a VPS, bound to `127.0.0.1` only. Every layer was
+  exercised against the live deployment, not just `go test`: a JS piece
+  registered and immediately used in a flow over `POST /pieces` +
+  `POST /flows/run`; a credential saved, listed, and deleted over
+  `POST`/`GET`/`DELETE /credentials`, with the raw `.enc` file read
+  directly off disk to confirm the plaintext secret never appears in it; a
+  flow saved by name and run by name over `POST /flows` +
+  `POST /flows/{name}/run`; and the MCP layer's
+  `initialize`/`tools/list`/`tools/call` sequence run through the real
+  `@modelcontextprotocol/inspector` CLI (installed via `npx` on the VPS),
+  not hand-built JSON-RPC — including confirming what a real client does
+  on a 401 that hand-built requests couldn't have shown: it attempts OAuth
+  discovery rather than just failing, the concrete shape of the auth
+  limitation noted above.
