@@ -347,12 +347,13 @@ order**; delimiter-length validation error; empty-text edge case for
 
 ## Not included (deliberately, for now)
 
-- **`email` (SMTP send)** — considered and dropped from this batch. Testing
-  it properly needs a fake SMTP server; there's no stdlib equivalent to
-  `httptest.Server` for SMTP, and every other catalog piece so far tests
-  against a real (if fake) protocol server with zero extra dependencies.
-  Revisit as its own ticket later, scoped explicitly to include a decision
-  on how to mock SMTP for the test suite.
+- ~~**`email` (SMTP send)** — considered and dropped from this batch.~~
+  Done (`pkg/pieces/email`): sends via `net/smtp.SendMail`, `smtp.PlainAuth`
+  when `ctx.Auth` is a `"user:password"` string, unauthenticated otherwise.
+  The blocker noted here — no stdlib equivalent to `httptest.Server` for
+  SMTP — was resolved with a hand-rolled, stdlib-only fake SMTP server in
+  `email_test.go`, keeping the same "real I/O against a real (if fake)
+  protocol server" stance as every other catalog piece.
 - **A `Store`-using action piece** — not possible today: `ActionContext`
   has no `Store` field at all (only `TriggerContext` does). Not a catalog
   gap to close with a piece; if this turns out to matter, it's an engine
