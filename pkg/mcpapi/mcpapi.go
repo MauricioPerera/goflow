@@ -7,20 +7,26 @@
 // path POST /flows/run and POST /flows/{name}/run use, so a tool call and an
 // HTTP run execute identically and are recorded identically.
 //
-// Beyond one tool per saved flow, tools/list also always advertises a fixed,
-// small set of read-only "meta" tools (see reservedToolNames) — a client
-// that only speaks MCP was previously locked out of everything this
-// project's "AI-first" design otherwise enables an agent to do for itself:
-// see the piece catalog, browse saved flows, or inspect run history all
-// required falling back to raw HTTP with the bearer token, even though an
-// MCP-authenticated caller (static token or an OAuth access token) already
-// has that same access on every httpapi route today — there is no
-// scopes/permissions concept anywhere in this project to make MCP
-// meaningfully narrower. This first tier is read-only by design; a second
-// tier (author a piece, save/delete a flow, manage credentials) is
-// deliberately left for later, kept separate specifically so mutating
-// power doesn't ship bundled with what's otherwise a pure discoverability
-// improvement.
+// Beyond one tool per saved flow, tools/list also always advertises a fixed
+// set of "meta" tools (see reservedToolNames) — a client that only speaks
+// MCP was previously locked out of everything this project's "AI-first"
+// design otherwise enables an agent to do for itself: see the piece
+// catalog, browse saved flows, or inspect run history all required falling
+// back to raw HTTP with the bearer token, even though an MCP-authenticated
+// caller (static token or an OAuth access token) already has that same
+// access on every httpapi route today — there is no scopes/permissions
+// concept anywhere in this project to make MCP meaningfully narrower, so
+// none of this is a new privilege, only new reachability. Shipped in two
+// tiers on purpose, so mutating power didn't land bundled with what was
+// initially a pure discoverability improvement: goflow_describe_catalog,
+// goflow_list_flows, goflow_get_flow, goflow_list_runs, and
+// goflow_get_run are read-only; goflow_save_flow, goflow_delete_flow,
+// goflow_save_piece, goflow_list_credentials, goflow_save_credential, and
+// goflow_delete_credential mutate state — the exact same mutations
+// POST/DELETE /flows, POST /pieces, and POST/GET/DELETE /credentials
+// already allow over HTTP, through the exact same underlying Store calls
+// (including catalog.GatedStore's and flowstore.GatedStore's validation
+// gates — a tool call can't bypass either), just reachable without HTTP.
 //
 // Everything here is encoding/json + net/http — JSON-RPC 2.0 is simple enough
 // that pulling in a library would add a dependency for nothing, matching the
@@ -98,6 +104,13 @@ const (
 	toolGetFlow         = "goflow_get_flow"
 	toolListRuns        = "goflow_list_runs"
 	toolGetRun          = "goflow_get_run"
+
+	toolSaveFlow         = "goflow_save_flow"
+	toolDeleteFlow       = "goflow_delete_flow"
+	toolSavePiece        = "goflow_save_piece"
+	toolListCredentials  = "goflow_list_credentials"
+	toolSaveCredential   = "goflow_save_credential"
+	toolDeleteCredential = "goflow_delete_credential"
 )
 
 var reservedToolNames = map[string]bool{
@@ -106,12 +119,28 @@ var reservedToolNames = map[string]bool{
 	toolGetFlow:         true,
 	toolListRuns:        true,
 	toolGetRun:          true,
+
+	toolSaveFlow:         true,
+	toolDeleteFlow:       true,
+	toolSavePiece:        true,
+	toolListCredentials:  true,
+	toolSaveCredential:   true,
+	toolDeleteCredential: true,
 }
 
-// metaToolDescriptors is the tools/list entry for each reserved name above —
-// real, precise JSON Schemas (unlike a per-flow tool's deliberately
-// permissive one): every meta tool's input shape is a well-defined Go type,
-// not an untyped flow trigger payload.
+// metaToolDescriptors is the tools/list entry for each reserved name above.
+// Every top-level field has a real, precise type (unlike a per-flow tool's
+// deliberately permissive schema for an untyped trigger payload) — EXCEPT
+// goflow_save_flow's "flow" and goflow_save_piece's "actions"/"triggers",
+// which stay loosely `{type: "object"}`/`{type: "array", items: object}`
+// on purpose: they're recursive, variant-typed Go structures
+// (model.FlowVersion's action tree; catalog.ActionDefinition/
+// TriggerDefinition's Examples), the exact same "not a formal JSON Schema
+// for v1" territory FlowDefinition.InputSchema and ActionDefinition.
+// InputSchema already occupy elsewhere in this project, for the same
+// reason: encoding it fully would mean authoring (and keeping in sync) a
+// second, separate machine-checked contract for data this project's own
+// engine already treats as untyped — real added scope, not free.
 func metaToolDescriptors() []map[string]any {
 	emptySchema := map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}
 	return []map[string]any{
@@ -146,6 +175,81 @@ func metaToolDescriptors() []map[string]any {
 				"type":       "object",
 				"properties": map[string]any{"id": map[string]any{"type": "string", "description": "the run's id, e.g. from goflow_list_runs"}},
 				"required":   []string{"id"},
+			},
+		},
+		{
+			"name":        toolSaveFlow,
+			"description": "Save (create, or overwrite if the name already exists) a named flow. Validated against the CURRENT piece registry before being persisted — a flow referencing a piece that doesn't exist is rejected, never partially saved. The \"flow\" argument's shape is not constrained by this schema (it's a recursive, variant-typed trigger/action graph — see goflow_get_flow on an existing flow, or goflow_describe_catalog for the piece names/actions it can reference, for the exact JSON shape).",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name":                    map[string]any{"type": "string", "description": "the flow's name — also its identifier for goflow_get_flow, goflow_delete_flow, POST /flows/{name}/run, and POST /webhooks/{name}"},
+					"displayName":             map[string]any{"type": "string"},
+					"description":             map[string]any{"type": "string"},
+					"inputSchema":             map[string]any{"type": "string", "description": "free-text description of the trigger payload this flow expects"},
+					"webhookEnabled":          map[string]any{"type": "boolean", "description": "opt this flow into POST /webhooks/{name}, an unauthenticated ingress route — off by default"},
+					"webhookSecretCredential": map[string]any{"type": "string", "description": "name of a credential (see goflow_save_credential) whose value POST /webhooks/{name} then requires as the X-Webhook-Secret header; omit for no secret check"},
+					"flow":                    map[string]any{"type": "object", "description": "the trigger + action graph itself — see this tool's own description for where to find the exact shape"},
+				},
+				"required": []string{"name", "flow"},
+			},
+		},
+		{
+			"name":        toolDeleteFlow,
+			"description": "Delete a saved flow by name. Irreversible; the flow's own past runs in goflow_list_runs/goflow_get_run are NOT deleted.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"name": map[string]any{"type": "string"}},
+				"required":   []string{"name"},
+			},
+		},
+		{
+			"name":        toolSavePiece,
+			"description": "Author (create, or overwrite if the name already exists) a JS-authored catalog piece. Every action, trigger, and dropdown MUST include at least one worked example — the server actually RUNS each example against the piece before persisting it, and rejects the WHOLE piece if any example fails; this is what stands in for type-checking a piece with no compiler. Call goflow_describe_catalog first to check a similar piece doesn't already exist before authoring a near-duplicate.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name":        map[string]any{"type": "string"},
+					"displayName": map[string]any{"type": "string"},
+					"description": map[string]any{"type": "string"},
+					"actions": map[string]any{
+						"type":        "array",
+						"description": "each item: {name, displayName, description, inputSchema (free text), source (JS: \"(ctx) => value\"), examples: [{description, input, auth, wantError, checkOutput, wantOutput}], dropdowns}. At least one example per action, required.",
+						"items":       map[string]any{"type": "object"},
+					},
+					"triggers": map[string]any{
+						"type":        "array",
+						"description": "each item: {name, displayName, description, source (JS: \"(ctx) => value\", MUST return an array), examples: [{description, payload, input, wantError, checkOutput, wantItems}]}. At least one example per trigger, required.",
+						"items":       map[string]any{"type": "object"},
+					},
+				},
+				"required": []string{"name"},
+			},
+		},
+		{
+			"name":        toolListCredentials,
+			"description": "List the names of every saved credential — never their decrypted values, which are never exposed over MCP or HTTP.",
+			"inputSchema": emptySchema,
+		},
+		{
+			"name":        toolSaveCredential,
+			"description": "Save (create, or overwrite if the name already exists) an encrypted-at-rest credential. The value is never echoed back in the result, matching POST /credentials.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name":  map[string]any{"type": "string", "description": "the credential's name — referenced from a flow's Input via {\"$credential\": \"<name>\"}, or from goflow_save_flow's webhookSecretCredential"},
+					"value": map[string]any{"description": "the secret value to seal — any JSON value, typically a string"},
+				},
+				"required": []string{"name", "value"},
+			},
+		},
+		{
+			"name":        toolDeleteCredential,
+			"description": "Delete a saved credential by name. Irreversible — a flow still referencing it via $credential will fail to run afterward.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"name": map[string]any{"type": "string"}},
+				"required":   []string{"name"},
 			},
 		},
 	}
@@ -265,6 +369,152 @@ func (h *Handler) callGetRun(w http.ResponseWriter, req rawRequest, args map[str
 		return
 	}
 	writeToolText(w, req.ID, false, rec)
+}
+
+// --- write meta tools -----------------------------------------------------
+
+// decodeArgs re-marshals the already-decoded arguments map back to JSON and
+// unmarshals it into target — the standard way to turn a tools/call
+// "arguments" map[string]any into a concrete Go type (flowstore.
+// FlowDefinition, catalog.Definition) without hand-copying every field.
+// args being nil is not an error here (json.Marshal(nil) round-trips as
+// "null", which json.Unmarshal into a struct leaves at its zero value) —
+// each caller below checks its own required fields afterward instead.
+func decodeArgs(args map[string]any, target any) error {
+	raw, err := json.Marshal(args)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(raw, target)
+}
+
+// callSaveFlow saves (creates or overwrites) a flow through h.FlowStore —
+// in production the exact same *flowstore.GatedStore POST /flows uses, so a
+// flow referencing a piece missing from the current registry is rejected
+// here exactly like it would be over HTTP; a tool call cannot bypass the
+// gate. A validation failure is a tool RESULT with isError:true (the
+// caller-supplied flow is broken, not a server fault) — same category
+// tools/call already uses for a broken flow it's asked to RUN.
+func (h *Handler) callSaveFlow(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	var def flowstore.FlowDefinition
+	if err := decodeArgs(args, &def); err != nil {
+		writeToolText(w, req.ID, true, "invalid arguments: "+err.Error())
+		return
+	}
+	if def.Name == "" {
+		writeToolText(w, req.ID, true, "missing required argument: name")
+		return
+	}
+	if err := h.FlowStore.Save(def); err != nil {
+		writeToolText(w, req.ID, true, err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, map[string]any{"saved": true, "name": def.Name})
+}
+
+// callDeleteFlow deletes a flow by name — flowstore.ErrNotFound becomes a
+// clear "no flow named X" tool result; any other error (a malformed name,
+// same rejection flowstore.FileStore.path already applies) is reported the
+// same way, mirroring how DELETE /flows/{name} treats every non-ErrNotFound
+// failure as a 400, never a 500.
+func (h *Handler) callDeleteFlow(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	name, _ := args["name"].(string)
+	if name == "" {
+		writeToolText(w, req.ID, true, "missing required argument: name")
+		return
+	}
+	if err := h.FlowStore.Delete(name); err != nil {
+		if err == flowstore.ErrNotFound {
+			writeToolText(w, req.ID, true, fmt.Sprintf("no flow named %q", name))
+			return
+		}
+		writeToolText(w, req.ID, true, err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, map[string]any{"deleted": true, "name": name})
+}
+
+// callSavePiece authors (creates or overwrites) a JS-authored piece through
+// h.CatalogStore — in production the same *catalog.GatedStore POST /pieces
+// uses, so every action/trigger/dropdown's Examples are actually RUN before
+// the piece is persisted; a piece that fails even one comes back as a tool
+// RESULT with isError:true and catalog.FormatValidationErrors' message
+// (embedded in the Save error), never silently partially saved.
+func (h *Handler) callSavePiece(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	var def catalog.Definition
+	if err := decodeArgs(args, &def); err != nil {
+		writeToolText(w, req.ID, true, "invalid arguments: "+err.Error())
+		return
+	}
+	if def.Name == "" {
+		writeToolText(w, req.ID, true, "missing required argument: name")
+		return
+	}
+	if err := h.CatalogStore.Save(def); err != nil {
+		writeToolText(w, req.ID, true, err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, map[string]any{"saved": true, "name": def.Name})
+}
+
+func (h *Handler) callListCredentials(w http.ResponseWriter, req rawRequest) {
+	if h.CredStore == nil {
+		writeToolText(w, req.ID, true, "credential management is not configured on this server")
+		return
+	}
+	names, err := h.CredStore.List()
+	if err != nil {
+		writeError(w, req.ID, -32603, "internal error: "+err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, map[string]any{"credentials": names})
+}
+
+// callSaveCredential seals name/value through h.CredStore — the value is
+// NEVER echoed back in the result, matching POST /credentials exactly;
+// Store.Get (the only thing that ever returns a decrypted value) is for
+// trusted Go callers only, never wired to any transport, MCP included.
+func (h *Handler) callSaveCredential(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	if h.CredStore == nil {
+		writeToolText(w, req.ID, true, "credential management is not configured on this server")
+		return
+	}
+	name, _ := args["name"].(string)
+	if name == "" {
+		writeToolText(w, req.ID, true, "missing required argument: name")
+		return
+	}
+	value, ok := args["value"]
+	if !ok || value == nil {
+		writeToolText(w, req.ID, true, "missing required argument: value")
+		return
+	}
+	if err := h.CredStore.Save(name, value); err != nil {
+		writeToolText(w, req.ID, true, err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, map[string]any{"saved": true, "name": name})
+}
+
+func (h *Handler) callDeleteCredential(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	if h.CredStore == nil {
+		writeToolText(w, req.ID, true, "credential management is not configured on this server")
+		return
+	}
+	name, _ := args["name"].(string)
+	if name == "" {
+		writeToolText(w, req.ID, true, "missing required argument: name")
+		return
+	}
+	if err := h.CredStore.Delete(name); err != nil {
+		if err == credentials.ErrNotFound {
+			writeToolText(w, req.ID, true, fmt.Sprintf("no credential named %q", name))
+			return
+		}
+		writeToolText(w, req.ID, true, err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, map[string]any{"deleted": true, "name": name})
 }
 
 // nullID is the JSON-RPC id used when no id could be read from the request
@@ -477,6 +727,24 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 		return
 	case toolGetRun:
 		h.callGetRun(w, req, params.Arguments)
+		return
+	case toolSaveFlow:
+		h.callSaveFlow(w, req, params.Arguments)
+		return
+	case toolDeleteFlow:
+		h.callDeleteFlow(w, req, params.Arguments)
+		return
+	case toolSavePiece:
+		h.callSavePiece(w, req, params.Arguments)
+		return
+	case toolListCredentials:
+		h.callListCredentials(w, req)
+		return
+	case toolSaveCredential:
+		h.callSaveCredential(w, req, params.Arguments)
+		return
+	case toolDeleteCredential:
+		h.callDeleteCredential(w, req, params.Arguments)
 		return
 	}
 

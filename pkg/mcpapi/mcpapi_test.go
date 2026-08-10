@@ -3,6 +3,7 @@ package mcpapi
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,18 +29,46 @@ func emptyRegistryBuilder() (*piece.Registry, error) {
 	return piece.NewRegistry(), nil
 }
 
-// newHandlerWithFlows builds a Handler backed by a real flowstore.FileStore in
-// a temp dir, saves the given flows directly (no gate needed: FileStore.Save
-// does not validate, and these flows are valid anyway), and returns the
-// handler plus the store dir. A real credentials.FileStore is wired too; nil
-// would be valid only if no flow references a credential, but a real store is
-// harmless and keeps the handler exercised the way production wires it.
-func newHandlerWithFlows(t *testing.T, defs ...flowstore.FlowDefinition) *Handler {
+// gatedTestFlowStore wraps a fresh flowstore.FileStore in a
+// *flowstore.GatedStore against emptyRegistryBuilder — the exact same
+// wrapping httpapi.NewServer applies in production (there, BuildRegistry is
+// the server's own buildRegistry; here it's the same empty-registry builder
+// every other test helper already uses). Handler.FlowStore in every helper
+// below is set to this gated store, not the raw FileStore, so a
+// goflow_save_flow call in a test is rejected by the real quality gate
+// exactly like POST /flows would be — the raw *flowstore.FileStore is
+// still returned so a helper's own seeding loop can bypass the gate for
+// known-good fixture flows.
+func gatedTestFlowStore(t *testing.T) (*flowstore.FileStore, *flowstore.GatedStore) {
 	t.Helper()
 	fs, err := flowstore.NewFileStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewFileStore: %v", err)
 	}
+	return fs, &flowstore.GatedStore{Underlying: fs, BuildRegistry: emptyRegistryBuilder}
+}
+
+// gatedTestCatalogStore is gatedTestFlowStore's counterpart for
+// catalog.Store — a *catalog.GatedStore wrapping a fresh MemoryStore, the
+// same wrapping cmd/server applies before ever handing a catalog.Store to
+// httpapi.NewServer, so a goflow_save_piece call in a test is rejected by
+// the real quality gate (every example actually run) exactly like
+// POST /pieces would be.
+func gatedTestCatalogStore() *catalog.GatedStore {
+	return &catalog.GatedStore{Underlying: catalog.NewMemoryStore()}
+}
+
+// newHandlerWithFlows builds a Handler backed by a real, GATED
+// flowstore.FileStore in a temp dir (see gatedTestFlowStore), seeds the
+// given flows directly against the raw store (bypassing the gate — these
+// fixture flows are already known-valid, and seeding is setup, not the
+// thing under test), and returns the handler. A real credentials.FileStore
+// is wired too; nil would be valid only if no flow references a credential,
+// but a real store is harmless and keeps the handler exercised the way
+// production wires it.
+func newHandlerWithFlows(t *testing.T, defs ...flowstore.FlowDefinition) *Handler {
+	t.Helper()
+	fs, gated := gatedTestFlowStore(t)
 	credStore, err := credentials.NewFileStore(t.TempDir(), testCredKey)
 	if err != nil {
 		t.Fatalf("credentials.NewFileStore: %v", err)
@@ -49,7 +78,7 @@ func newHandlerWithFlows(t *testing.T, defs ...flowstore.FlowDefinition) *Handle
 			t.Fatalf("Save %q: %v", def.Name, err)
 		}
 	}
-	return NewHandler(fs, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), catalog.NewMemoryStore())
+	return NewHandler(gated, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), gatedTestCatalogStore())
 }
 
 // newHandlerWithFlowsAndCreds is newHandlerWithFlows but also returns the
@@ -57,10 +86,7 @@ func newHandlerWithFlows(t *testing.T, defs ...flowstore.FlowDefinition) *Handle
 // end-to-end run.
 func newHandlerWithFlowsAndCreds(t *testing.T, defs ...flowstore.FlowDefinition) (*Handler, *credentials.FileStore) {
 	t.Helper()
-	fs, err := flowstore.NewFileStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("NewFileStore: %v", err)
-	}
+	fs, gated := gatedTestFlowStore(t)
 	credStore, err := credentials.NewFileStore(t.TempDir(), testCredKey)
 	if err != nil {
 		t.Fatalf("credentials.NewFileStore: %v", err)
@@ -70,17 +96,14 @@ func newHandlerWithFlowsAndCreds(t *testing.T, defs ...flowstore.FlowDefinition)
 			t.Fatalf("Save %q: %v", def.Name, err)
 		}
 	}
-	return NewHandler(fs, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), catalog.NewMemoryStore()), credStore
+	return NewHandler(gated, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), gatedTestCatalogStore()), credStore
 }
 
 // newHandlerWithFlowsAndHistory is newHandlerWithFlows but also returns the
 // runstore.Store, so a test can confirm a tools/call was actually recorded.
 func newHandlerWithFlowsAndHistory(t *testing.T, defs ...flowstore.FlowDefinition) (*Handler, runstore.Store) {
 	t.Helper()
-	fs, err := flowstore.NewFileStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("NewFileStore: %v", err)
-	}
+	fs, gated := gatedTestFlowStore(t)
 	credStore, err := credentials.NewFileStore(t.TempDir(), testCredKey)
 	if err != nil {
 		t.Fatalf("credentials.NewFileStore: %v", err)
@@ -91,18 +114,16 @@ func newHandlerWithFlowsAndHistory(t *testing.T, defs ...flowstore.FlowDefinitio
 		}
 	}
 	historyStore := runstore.NewMemoryStore()
-	return NewHandler(fs, emptyRegistryBuilder, credStore, historyStore, catalog.NewMemoryStore()), historyStore
+	return NewHandler(gated, emptyRegistryBuilder, credStore, historyStore, gatedTestCatalogStore()), historyStore
 }
 
 // newHandlerWithFlowsAndCatalog is newHandlerWithFlows but also returns the
-// catalog.Store, so a test can seed a JS-authored piece and confirm
-// goflow_describe_catalog actually surfaces it.
+// (gated) catalog.Store, so a test can seed/save a JS-authored piece and
+// confirm goflow_describe_catalog actually surfaces it, or confirm the gate
+// rejects a broken one.
 func newHandlerWithFlowsAndCatalog(t *testing.T, defs ...flowstore.FlowDefinition) (*Handler, catalog.Store) {
 	t.Helper()
-	fs, err := flowstore.NewFileStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("NewFileStore: %v", err)
-	}
+	fs, gated := gatedTestFlowStore(t)
 	credStore, err := credentials.NewFileStore(t.TempDir(), testCredKey)
 	if err != nil {
 		t.Fatalf("credentials.NewFileStore: %v", err)
@@ -112,8 +133,8 @@ func newHandlerWithFlowsAndCatalog(t *testing.T, defs ...flowstore.FlowDefinitio
 			t.Fatalf("Save %q: %v", def.Name, err)
 		}
 	}
-	catalogStore := catalog.NewMemoryStore()
-	return NewHandler(fs, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), catalogStore), catalogStore
+	catalogStore := gatedTestCatalogStore()
+	return NewHandler(gated, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), catalogStore), catalogStore
 }
 
 // doublesArgFlow is a "double it" flow that reads n from the TRIGGER payload
@@ -636,6 +657,9 @@ func TestDescribeCatalog_SurfacesBuiltinAndJSPieces(t *testing.T) {
 			Name: "run", DisplayName: "Run", Description: "runs it",
 			InputSchema: "x (number, required)",
 			Source:      `(ctx) => ({ doubled: Number(ctx.input.x) * 2 })`,
+			Examples: []catalog.Example{
+				{Description: "doubles 5", Input: map[string]any{"x": 5}, CheckOutput: true, WantOutput: map[string]any{"doubled": float64(10)}},
+			},
 		}},
 	}); err != nil {
 		t.Fatalf("catStore.Save: %v", err)
@@ -800,5 +824,249 @@ func TestReservedFlowName_ExcludedFromListButStillResolvesToMetaTool(t *testing.
 	toolText(t, callResult, &body)
 	if body.Flows == nil {
 		t.Fatalf("tools/call %q returned something other than a list_flows result: %+v", toolListFlows, callResult)
+	}
+}
+
+// --- write meta tools -----------------------------------------------------
+
+// flowVersionJSON is a minimal, valid CODE-only flow body (as the raw JSON
+// shape goflow_save_flow's "flow" argument expects — see model/json.go's
+// json tags) that doubles n from the trigger payload, mirroring
+// doublesArgFlow's shape but as a map ready to embed in tools/call
+// arguments.
+func flowVersionJSON() map[string]any {
+	return map[string]any{
+		"id": "fv-mcp-saved",
+		"trigger": map[string]any{
+			"name": "trigger_1", "displayName": "Trigger", "type": "EMPTY",
+			"nextAction": map[string]any{
+				"name": "double", "displayName": "Double", "type": "CODE",
+				"code": map[string]any{
+					"input":  map[string]any{"n": "{{ trigger_1.output.n }}"},
+					"source": "(params) => ({ doubled: params.n * 2 })",
+				},
+			},
+		},
+	}
+}
+
+func TestSaveFlow_ThenGetFlowAndRunnable(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolSaveFlow, map[string]any{
+		"name": "mcp-saved", "displayName": "MCP Saved", "flow": flowVersionJSON(),
+	})
+	if result["isError"] != false {
+		t.Fatalf("save_flow isError = %v, want false: %v", result["isError"], result)
+	}
+	var saved struct {
+		Saved bool   `json:"saved"`
+		Name  string `json:"name"`
+	}
+	toolText(t, result, &saved)
+	if !saved.Saved || saved.Name != "mcp-saved" {
+		t.Fatalf("save_flow result = %+v, want {saved:true, name:mcp-saved}", saved)
+	}
+
+	// Now runnable as an ordinary per-flow tool, not just retrievable.
+	runResult := callTool(t, h, "mcp-saved", map[string]any{"n": 6})
+	if runResult["isError"] != false {
+		t.Fatalf("running the saved flow: isError = %v, want false: %v", runResult["isError"], runResult)
+	}
+	var state map[string]any
+	toolText(t, runResult, &state)
+	steps, _ := state["Steps"].(map[string]any)
+	double, _ := steps["double"].(map[string]any)
+	output, _ := double["Output"].(map[string]any)
+	if output["doubled"] != float64(12) {
+		t.Fatalf("saved flow's run output = %v, want doubled:12", output)
+	}
+}
+
+func TestSaveFlow_OverwritesExisting(t *testing.T) {
+	h := newHandlerWithFlows(t, doublesArgFlow()) // "double-it" already exists
+	result := callTool(t, h, toolSaveFlow, map[string]any{
+		"name": "double-it", "displayName": "Replaced", "flow": flowVersionJSON(),
+	})
+	if result["isError"] != false {
+		t.Fatalf("save_flow (overwrite) isError = %v, want false: %v", result["isError"], result)
+	}
+	getResult := callTool(t, h, toolGetFlow, map[string]any{"name": "double-it"})
+	var def flowstore.FlowDefinition
+	toolText(t, getResult, &def)
+	if def.DisplayName != "Replaced" {
+		t.Fatalf("DisplayName = %q, want %q — save_flow must overwrite, not error or duplicate", def.DisplayName, "Replaced")
+	}
+}
+
+func TestSaveFlow_ReferencesMissingPiece_IsErrorTrueNotPersisted(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	badFlow := map[string]any{
+		"id": "fv-bad",
+		"trigger": map[string]any{
+			"name": "trigger_1", "displayName": "Trigger", "type": "EMPTY",
+			"nextAction": map[string]any{
+				"name": "badstep", "displayName": "Bad", "type": "PIECE",
+				"piece": map[string]any{"pieceName": "no_such_piece", "actionName": "no_such_action"},
+			},
+		},
+	}
+	result := callTool(t, h, toolSaveFlow, map[string]any{"name": "broken", "flow": badFlow})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true — the gate must reject a flow referencing a missing piece", result["isError"])
+	}
+
+	// And it must not have been persisted despite the attempt.
+	getResult := callTool(t, h, toolGetFlow, map[string]any{"name": "broken"})
+	if getResult["isError"] != true {
+		t.Fatalf("goflow_get_flow(broken) isError = %v, want true — a gate-rejected flow must never be persisted", getResult["isError"])
+	}
+}
+
+func TestSaveFlow_MissingName_IsErrorTrue(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolSaveFlow, map[string]any{"flow": flowVersionJSON()})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true when name is missing", result["isError"])
+	}
+}
+
+func TestDeleteFlow_ExistingThenGone(t *testing.T) {
+	h := newHandlerWithFlows(t, doublesArgFlow())
+	result := callTool(t, h, toolDeleteFlow, map[string]any{"name": "double-it"})
+	if result["isError"] != false {
+		t.Fatalf("delete_flow isError = %v, want false: %v", result["isError"], result)
+	}
+	getResult := callTool(t, h, toolGetFlow, map[string]any{"name": "double-it"})
+	if getResult["isError"] != true {
+		t.Fatalf("get_flow after delete: isError = %v, want true (gone)", getResult["isError"])
+	}
+}
+
+func TestDeleteFlow_UnknownName_IsErrorTrue(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolDeleteFlow, map[string]any{"name": "never-existed"})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true for an unknown flow name", result["isError"])
+	}
+}
+
+func TestSavePiece_ValidExample_PersistedAndDescribed(t *testing.T) {
+	h, _ := newHandlerWithFlowsAndCatalog(t)
+	result := callTool(t, h, toolSavePiece, map[string]any{
+		"name": "risk_score", "displayName": "Risk Score", "description": "classifies risk",
+		"actions": []any{
+			map[string]any{
+				"name": "run", "displayName": "Run", "description": "runs it",
+				"inputSchema": "x (number, required)",
+				"source":      "(ctx) => ({ doubled: Number(ctx.input.x) * 2 })",
+				"examples": []any{
+					map[string]any{"description": "doubles 5", "input": map[string]any{"x": 5}, "checkOutput": true, "wantOutput": map[string]any{"doubled": float64(10)}},
+				},
+			},
+		},
+	})
+	if result["isError"] != false {
+		t.Fatalf("save_piece isError = %v, want false: %v", result["isError"], result)
+	}
+
+	descResult := callTool(t, h, toolDescribeCatalog, nil)
+	item, _ := descResult["content"].([]any)[0].(map[string]any)
+	text, _ := item["text"].(string)
+	if !strings.Contains(text, "risk_score") {
+		t.Fatalf("describe_catalog after save_piece missing risk_score: %s", text)
+	}
+}
+
+func TestSavePiece_FailingExample_IsErrorTrueNotPersisted(t *testing.T) {
+	h, catStore := newHandlerWithFlowsAndCatalog(t)
+	result := callTool(t, h, toolSavePiece, map[string]any{
+		"name": "broken_piece",
+		"actions": []any{
+			map[string]any{
+				"name": "run", "displayName": "Run",
+				"source": `(ctx) => { throw new Error("boom"); }`,
+				"examples": []any{
+					map[string]any{"description": "should not throw but does", "input": map[string]any{}},
+				},
+			},
+		},
+	})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true — the example throws unexpectedly (wantError not set)", result["isError"])
+	}
+	if _, ok, _ := catStore.Get("broken_piece"); ok {
+		t.Fatal("broken_piece was persisted despite failing its own example — the quality gate must block this")
+	}
+}
+
+func TestSavePiece_MissingName_IsErrorTrue(t *testing.T) {
+	h, _ := newHandlerWithFlowsAndCatalog(t)
+	result := callTool(t, h, toolSavePiece, map[string]any{"actions": []any{}})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true when name is missing", result["isError"])
+	}
+}
+
+func TestListCredentials_ReturnsNamesOnly(t *testing.T) {
+	h, credStore := newHandlerWithFlowsAndCreds(t)
+	if err := credStore.Save("api-key", "super-secret-value"); err != nil {
+		t.Fatalf("credStore.Save: %v", err)
+	}
+	result := callTool(t, h, toolListCredentials, nil)
+	var body struct {
+		Credentials []string `json:"credentials"`
+	}
+	toolText(t, result, &body)
+	if len(body.Credentials) != 1 || body.Credentials[0] != "api-key" {
+		t.Fatalf("credentials = %v, want exactly [api-key]", body.Credentials)
+	}
+	// The whole point: never the value, anywhere in the result.
+	if strings.Contains(fmt.Sprint(result), "super-secret-value") {
+		t.Fatal("the raw credential value leaked into the tool result")
+	}
+}
+
+func TestSaveCredential_ThenListedValueNeverEchoedOrLeaked(t *testing.T) {
+	h, credStore := newHandlerWithFlowsAndCreds(t)
+	result := callTool(t, h, toolSaveCredential, map[string]any{"name": "db-pass", "value": "hunter2"})
+	if result["isError"] != false {
+		t.Fatalf("save_credential isError = %v, want false: %v", result["isError"], result)
+	}
+	if strings.Contains(fmt.Sprint(result), "hunter2") {
+		t.Fatal("the raw credential value leaked into the save_credential tool result")
+	}
+	val, ok, err := credStore.Get("db-pass")
+	if err != nil || !ok || val != "hunter2" {
+		t.Fatalf("credStore.Get(db-pass) = %v, %v, %v, want (hunter2, true, nil) — the real value must have actually been saved", val, ok, err)
+	}
+}
+
+func TestSaveCredential_MissingValue_IsErrorTrue(t *testing.T) {
+	h, _ := newHandlerWithFlowsAndCreds(t)
+	result := callTool(t, h, toolSaveCredential, map[string]any{"name": "db-pass"})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true when value is missing", result["isError"])
+	}
+}
+
+func TestDeleteCredential_ExistingThenGone(t *testing.T) {
+	h, credStore := newHandlerWithFlowsAndCreds(t)
+	if err := credStore.Save("temp-cred", "value"); err != nil {
+		t.Fatalf("credStore.Save: %v", err)
+	}
+	result := callTool(t, h, toolDeleteCredential, map[string]any{"name": "temp-cred"})
+	if result["isError"] != false {
+		t.Fatalf("delete_credential isError = %v, want false: %v", result["isError"], result)
+	}
+	if _, ok, _ := credStore.Get("temp-cred"); ok {
+		t.Fatal("credential still resolvable after delete_credential")
+	}
+}
+
+func TestDeleteCredential_UnknownName_IsErrorTrue(t *testing.T) {
+	h, _ := newHandlerWithFlowsAndCreds(t)
+	result := callTool(t, h, toolDeleteCredential, map[string]any{"name": "never-existed"})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true for an unknown credential name", result["isError"])
 	}
 }

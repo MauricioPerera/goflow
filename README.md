@@ -516,30 +516,50 @@ below for what a Go rewrite gets and gives up.
   OAuth-issued access token and the static token grant identical access on
   every route (this project has no scopes/permissions concept to narrow
   one against), not just `/mcp`.
-- **Read-only MCP meta tools** (`pkg/mcpapi`): closes a gap specific to a
-  client that only speaks MCP, not HTTP — until now, `tools/list`/
-  `tools/call` could only DISCOVER-and-RUN a flow someone else already
-  built; browsing the piece catalog, listing saved flows, or checking run
-  history all required falling back to raw HTTP with the bearer token, even
-  though an MCP-authenticated caller (static token or an OAuth access
-  token) already has that exact same access on every httpapi route today —
-  there's no scopes/permissions concept anywhere in this project to make
-  MCP meaningfully narrower, so exposing these wasn't a new privilege, only
-  a new reachability. Five fixed tools — `goflow_describe_catalog`,
-  `goflow_list_flows`, `goflow_get_flow`, `goflow_list_runs`,
-  `goflow_get_run` — are always present in `tools/list` alongside the
-  per-flow ones, each with a real, precise `inputSchema` (unlike a
-  per-flow tool's deliberately permissive one, since these five have
-  well-defined Go types behind them, not an untyped trigger payload). A
-  saved flow whose name collides with one of the five reserved names is
-  excluded from `tools/list` — not deleted, not un-runnable by name over
-  `POST /flows/{name}/run`, just shadowed in this one listing — and
-  `tools/call` resolves that name to the fixed tool the same way, so the
-  two methods never disagree about what a reserved name means. This tier
-  is deliberately read-only; authoring a piece, saving/deleting a flow, or
-  managing a credential through MCP is left for later on purpose, kept
-  separate so mutating power doesn't ship bundled with what's otherwise a
-  pure discoverability improvement.
+- **MCP meta tools — read and write** (`pkg/mcpapi`): closes a gap specific
+  to a client that only speaks MCP, not HTTP — `tools/list`/`tools/call`
+  used to only DISCOVER-and-RUN a flow someone else already built; browsing
+  the piece catalog, listing/saving/deleting flows, authoring a piece, or
+  managing credentials all required falling back to raw HTTP with the
+  bearer token, even though an MCP-authenticated caller (static token or an
+  OAuth access token) already has that exact same access on every httpapi
+  route today — there's no scopes/permissions concept anywhere in this
+  project to make MCP meaningfully narrower, so none of this is a new
+  privilege, only new reachability. Eleven fixed tools are always present
+  in `tools/list` alongside the per-flow ones, each with a real, precise
+  `inputSchema` (unlike a per-flow tool's deliberately permissive one,
+  since these have well-defined Go types behind them, not an untyped
+  trigger payload) — EXCEPT `goflow_save_flow`'s `flow` argument and
+  `goflow_save_piece`'s `actions`/`triggers`, which stay loosely typed on
+  purpose: they're recursive, variant-typed structures, the same "not a
+  formal JSON Schema for v1" territory `FlowDefinition.InputSchema` and
+  `ActionDefinition.InputSchema` already occupy elsewhere in this project,
+  for the same reason. Shipped in two tiers so mutating power didn't land
+  bundled with what was initially a pure discoverability improvement:
+  - Read-only: `goflow_describe_catalog`, `goflow_list_flows`,
+    `goflow_get_flow`, `goflow_list_runs`, `goflow_get_run`.
+  - Write: `goflow_save_flow` and `goflow_delete_flow` (through the exact
+    same `*flowstore.GatedStore` `POST`/`DELETE /flows` use — a flow
+    referencing a missing piece is rejected, never partially saved);
+    `goflow_save_piece` (through the exact same `*catalog.GatedStore`
+    `POST /pieces` uses — every action/trigger/dropdown's examples are
+    actually RUN before the piece is persisted; one failing example
+    rejects the whole piece); `goflow_list_credentials`,
+    `goflow_save_credential`, `goflow_delete_credential` (a credential's
+    value is never echoed back in a tool result, matching
+    `POST /credentials` exactly — `Store.Get`, the only thing that ever
+    returns a decrypted value, is for trusted Go callers only and is never
+    wired to any transport, MCP included).
+
+  A saved flow (or, symmetrically, a credential name) that collides with
+  one of the eleven reserved names is excluded from `tools/list` — not
+  deleted, not un-runnable/un-referenceable by name over HTTP — just
+  shadowed in this one listing, and `tools/call` resolves that name to the
+  fixed tool the same way, so the two methods never disagree about what a
+  reserved name means. A gate-rejected save is a tool RESULT with
+  `isError: true` (the caller-supplied flow/piece is broken, not a server
+  fault) — same category `tools/call` already uses for a broken flow it's
+  asked to *run*.
 - **Schedule trigger + a real scheduler** (`pkg/pieces/schedule`,
   `pkg/scheduler`): closes a gap found while auditing real-world use cases
   against this project's actual catalog — every other piece here is
