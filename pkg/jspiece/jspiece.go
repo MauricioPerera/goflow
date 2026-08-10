@@ -6,14 +6,14 @@
 // build a real piece.Piece/piece.Action that goes through the exact same
 // piece.Validate/RegisterValidated path as any hand-written Go piece — the
 // engine cannot tell the difference. NewTrigger does the same for
-// piece.Trigger.
+// piece.Trigger, and NewDropdown for piece.DropdownProperty.
 //
-// Scope, deliberately: no Dropdowns for JS actions yet, and this package
-// does not solve where the JS source text comes from or how it survives a
-// process restart (no persistence — see pkg/catalog, which does, though
-// only for actions so far; catalog.Definition has no trigger equivalent
-// yet). What's proven here is narrower and load-bearing: given JS source
-// text from anywhere, the engine can run it as a first-class piece.
+// Scope, deliberately: this package does not solve where the JS source
+// text comes from or how it survives a process restart (no persistence —
+// see pkg/catalog, which does, though only for actions so far;
+// catalog.Definition has no trigger or Dropdown equivalent yet). What's
+// proven here is narrower and load-bearing: given JS source text from
+// anywhere, the engine can run it as a first-class piece.
 package jspiece
 
 import (
@@ -72,6 +72,10 @@ type ActionSource struct {
 	// (a real, synchronous HTTP call — the one capability beyond pure
 	// logic and the ActionContext hooks; see this package's doc comment).
 	Source string
+
+	// Dropdowns declares this action's dynamically-loaded properties,
+	// keyed by property name — see DropdownSource.
+	Dropdowns map[string]DropdownSource
 }
 
 // New builds a piece.Piece whose actions are all JS-backed.
@@ -85,12 +89,81 @@ func New(name, displayName string, actions []ActionSource) piece.Piece {
 
 // NewAction builds a single JS-backed piece.Action.
 func NewAction(src ActionSource) piece.Action {
+	var dropdowns map[string]piece.DropdownProperty
+	if len(src.Dropdowns) > 0 {
+		dropdowns = make(map[string]piece.DropdownProperty, len(src.Dropdowns))
+		for name, d := range src.Dropdowns {
+			dropdowns[name] = NewDropdown(d)
+		}
+	}
 	return piece.Action{
 		Name: src.Name, DisplayName: src.DisplayName,
+		Dropdowns: dropdowns,
 		Run: func(ctx piece.ActionContext) (any, error) {
 			return compileAndRun(src.Source, buildContext(ctx))
 		},
 	}
+}
+
+// DropdownSource is one JS-authored dynamically-loaded property —
+// piece.DropdownProperty authored as JS instead of a Go closure.
+type DropdownSource struct {
+	// Refreshers names the sibling input properties this dropdown depends
+	// on — purely documentation, same as piece.DropdownProperty.Refreshers;
+	// nothing enforces it, LoadOptions decides what it actually reads.
+	Refreshers []string
+
+	// Source must evaluate to a JS function `(propsValue, ctx) => value`,
+	// synchronous only, same rule as ActionSource.Source. propsValue is
+	// the sibling input values already resolved (matching Go's own
+	// LoadOptions signature); ctx exposes ctx.searchValue
+	// (piece.PropertyContext.SearchValue). The returned value must be an
+	// object matching piece.DropdownState's shape:
+	// {disabled?, placeholder?, options: [{label, value}, ...]}.
+	Source string
+}
+
+// NewDropdown builds a single JS-backed piece.DropdownProperty.
+func NewDropdown(src DropdownSource) piece.DropdownProperty {
+	return piece.DropdownProperty{
+		Refreshers: src.Refreshers,
+		LoadOptions: func(propsValue map[string]any, ctx piece.PropertyContext) (piece.DropdownState, error) {
+			exported, err := compileAndRun(src.Source, propsValue, map[string]any{"searchValue": ctx.SearchValue})
+			if err != nil {
+				return piece.DropdownState{}, err
+			}
+			return toDropdownState(exported)
+		},
+	}
+}
+
+// toDropdownState converts a JS dropdown function's exported return value
+// into a piece.DropdownState, rejecting anything that doesn't match the
+// expected shape with a clear error rather than silently defaulting.
+func toDropdownState(exported any) (piece.DropdownState, error) {
+	m, ok := exported.(map[string]any)
+	if !ok {
+		return piece.DropdownState{}, fmt.Errorf("jspiece: dropdown must return an object, got %T", exported)
+	}
+	var state piece.DropdownState
+	if v, ok := m["disabled"].(bool); ok {
+		state.Disabled = v
+	}
+	if v, ok := m["placeholder"].(string); ok {
+		state.Placeholder = v
+	}
+	if raw, ok := m["options"].([]any); ok {
+		state.Options = make([]piece.DropdownOption, 0, len(raw))
+		for i, o := range raw {
+			om, ok := o.(map[string]any)
+			if !ok {
+				return piece.DropdownState{}, fmt.Errorf("jspiece: dropdown option[%d] must be an object, got %T", i, o)
+			}
+			label, _ := om["label"].(string)
+			state.Options = append(state.Options, piece.DropdownOption{Label: label, Value: om["value"]})
+		}
+	}
+	return state, nil
 }
 
 // TriggerSource is one JS-authored trigger.
@@ -131,12 +204,13 @@ func NewTrigger(src TriggerSource) piece.Trigger {
 	}
 }
 
-// compileAndRun is the shared core for both NewAction and NewTrigger:
-// parse source as `(source)`, confirm it's a function, invoke it with
-// jsCtx as its sole argument under DefaultTimeout, and return its
-// exported Go value. Callers interpret the returned value differently
-// (an action's is passed through as-is; a trigger's must be a []any).
-func compileAndRun(source string, jsCtx map[string]any) (any, error) {
+// compileAndRun is the shared core for NewAction, NewTrigger, and
+// NewDropdown: parse source as `(source)`, confirm it's a function, invoke
+// it with args under DefaultTimeout, and return its exported Go value.
+// Callers interpret the returned value differently (an action's is passed
+// through as-is; a trigger's must be a []any; a dropdown's must be an
+// object matching piece.DropdownState's shape).
+func compileAndRun(source string, args ...any) (any, error) {
 	vm := goja.New()
 
 	fnValue, err := vm.RunString("(" + source + ")")
@@ -153,7 +227,11 @@ func compileAndRun(source string, jsCtx map[string]any) (any, error) {
 	})
 	defer timer.Stop()
 
-	result, err := fn(goja.Undefined(), vm.ToValue(jsCtx))
+	argValues := make([]goja.Value, len(args))
+	for i, a := range args {
+		argValues[i] = vm.ToValue(a)
+	}
+	result, err := fn(goja.Undefined(), argValues...)
 	if err != nil {
 		if exc, ok := err.(*goja.Exception); ok {
 			return nil, fmt.Errorf("%s", exc.Value().String())

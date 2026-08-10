@@ -61,10 +61,18 @@ below for what a Go rewrite gets and gives up.
   bound to the real `piece.Store` the caller supplied — nil-guarded the
   same way `ctx.files`/`ctx.run` are, since `Engine.ExecuteBegin` never
   actually supplies one (confirmed by reading it, not assumed — see
-  "Design decisions"). No JS `Dropdowns` yet. Persistence — where a JS
-  piece's source lives and how it survives a restart — is
-  `pkg/catalog` (below), not this package, and only covers actions so far
-  (`catalog.Definition` has no trigger equivalent yet).
+  "Design decisions"). `jspiece.NewDropdown` does the same for
+  `piece.DropdownProperty`: `(propsValue, ctx) => value` must return an
+  object matching `piece.DropdownState`'s shape
+  (`{disabled?, placeholder?, options: [{label, value}, ...]}`, rejected
+  clearly otherwise), `ctx` exposes `ctx.searchValue`
+  (`piece.PropertyContext.SearchValue`); wire one into an `ActionSource`
+  via its new `Dropdowns map[string]DropdownSource` field, resolved
+  through `Engine.LoadOptions` exactly like any Go piece's dropdown — same
+  call path a real editor UI would use. Persistence — where a JS piece's
+  source lives and how it survives a restart — is `pkg/catalog` (below),
+  not this package, and only covers actions so far (`catalog.Definition`
+  has no trigger or Dropdown equivalent yet).
 - **Piece catalog persistence & discovery** (`pkg/catalog`): Phase 3 of the
   "AI-first" direction, closing the gap Phase 2 explicitly left open —
   `jspiece.New` builds a piece purely in memory, so a piece an agent
@@ -1066,3 +1074,21 @@ go run ./examples
   `ExecuteBegin` only ever uses `items[0]` of what a PIECE trigger
   returns — a second/third item in the array is never seen by that flow
   run, matching what reading `engine.go` already showed.
+- **JS Dropdowns (`jspiece.NewDropdown`) needed a two-argument JS function
+  (`(propsValue, ctx) => value`), unlike actions/triggers' single `ctx`
+  argument — `compileAndRun` was generalized from a fixed one-argument
+  signature to variadic (`args ...any`) rather than adding a
+  dropdown-specific parallel code path.** Small, mechanical change (call
+  sites passing one argument keep working unchanged, since a lone `any`
+  argument to a variadic parameter is just a one-element slice); worth
+  noting because it's the kind of shared-core refactor this project
+  prefers over duplicating the compile/timeout/error-handling boilerplate
+  a third time. The returned value is validated strictly against
+  `piece.DropdownState`'s shape — a non-object return, or a non-object
+  entry inside `options`, fails clearly (`TestJSDropdown_NonObjectReturnFailsClearly`,
+  `TestJSDropdown_NonObjectOptionFailsClearly`) rather than silently
+  producing an empty/wrong dropdown. `TestCatalog_JSDropdownComposesWithRealCatalog`
+  resolves a JS dropdown through `Engine.LoadOptions` specifically (not
+  `DropdownProperty.LoadOptions` called directly) — the same public API
+  path a real editor UI would call, registered alongside the full Go
+  catalog.

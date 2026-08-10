@@ -960,3 +960,48 @@ func TestCatalog_JSTriggerComposesWithRealCatalog(t *testing.T) {
 		t.Fatalf("report text = %q", reportText)
 	}
 }
+
+// TestCatalog_JSDropdownComposesWithRealCatalog proves a JS-authored
+// Dropdown (jspiece.NewDropdown) resolves through the real engine's
+// public LoadOptions API — the same call path a real editor UI would use
+// to populate a dropdown, not just piece.DropdownProperty.LoadOptions
+// called directly — registered alongside the full Go catalog.
+func TestCatalog_JSDropdownComposesWithRealCatalog(t *testing.T) {
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+
+	region := piece.Piece{
+		Name: "region_picker", DisplayName: "Region Picker",
+		Actions: map[string]piece.Action{
+			"deploy": jspiece.NewAction(jspiece.ActionSource{
+				Name: "deploy", DisplayName: "Deploy",
+				Source: `(ctx) => ({ deployedTo: ctx.input.region })`,
+				Dropdowns: map[string]jspiece.DropdownSource{
+					"region": {
+						Source: `(propsValue, ctx) => ({
+							options: [
+								{ label: "US East", value: "us-east-1" },
+								{ label: "EU West", value: "eu-west-1" },
+							]
+						})`,
+					},
+				},
+			}),
+		},
+	}
+	if err := registry.RegisterValidated(region); err != nil {
+		t.Fatalf("RegisterValidated: %v", err)
+	}
+
+	state, err := engine.New(registry).LoadOptions(engine.LoadOptionsInput{
+		PieceName: "region_picker", ActionName: "deploy", PropertyName: "region",
+	})
+	if err != nil {
+		t.Fatalf("LoadOptions() error = %v", err)
+	}
+	if len(state.Options) != 2 || state.Options[0].Value != "us-east-1" || state.Options[1].Value != "eu-west-1" {
+		t.Fatalf("state.Options = %+v", state.Options)
+	}
+}
