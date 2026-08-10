@@ -65,7 +65,7 @@ func formatAction() piece.Action {
 	return piece.Action{
 		Name: "format", DisplayName: "Format",
 		Run: func(ctx piece.ActionContext) (any, error) {
-			t, err := parseISO(ctx.Input["iso"])
+			t, err := parseISO("iso", ctx.Input["iso"])
 			if err != nil {
 				return nil, err
 			}
@@ -82,7 +82,7 @@ func addAction() piece.Action {
 	return piece.Action{
 		Name: "add", DisplayName: "Add",
 		Run: func(ctx piece.ActionContext) (any, error) {
-			t, err := parseISO(ctx.Input["iso"])
+			t, err := parseISO("iso", ctx.Input["iso"])
 			if err != nil {
 				return nil, err
 			}
@@ -100,27 +100,27 @@ func diffAction() piece.Action {
 	return piece.Action{
 		Name: "diff", DisplayName: "Diff",
 		Run: func(ctx piece.ActionContext) (any, error) {
-			a, err := parseISO(ctx.Input["a"])
+			a, err := parseISO("a", ctx.Input["a"])
 			if err != nil {
-				return nil, fmt.Errorf("input \"a\": %w", err)
+				return nil, err
 			}
-			b, err := parseISO(ctx.Input["b"])
+			b, err := parseISO("b", ctx.Input["b"])
 			if err != nil {
-				return nil, fmt.Errorf("input \"b\": %w", err)
+				return nil, err
 			}
 			return map[string]any{"diffMs": a.Sub(b).Milliseconds()}, nil
 		},
 	}
 }
 
-func parseISO(v any) (time.Time, error) {
+func parseISO(field string, v any) (time.Time, error) {
 	s, ok := v.(string)
 	if !ok || s == "" {
-		return time.Time{}, fmt.Errorf("missing required input: a valid RFC3339 timestamp string")
+		return time.Time{}, fmt.Errorf("missing required input: %s (string, RFC3339 timestamp)", field)
 	}
 	t, err := time.Parse(time.RFC3339, s)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("invalid RFC3339 timestamp %q: %w", s, err)
+		return time.Time{}, fmt.Errorf("invalid input: %s (string, RFC3339 timestamp): %w", field, err)
 	}
 	return t, nil
 }

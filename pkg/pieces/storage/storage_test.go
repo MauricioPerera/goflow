@@ -76,6 +76,19 @@ func TestStorage_UnknownFormatFailsClearly(t *testing.T) {
 	}
 }
 
+func TestStorage_MissingFormatFailsClearly(t *testing.T) {
+	p := storagepiece.New()
+	act := p.Actions["write"]
+
+	_, err := act.Run(piece.ActionContext{
+		Input: map[string]any{"fileName": "x", "content": "y"},
+		Files: piece.NewMemoryFileWriter(),
+	})
+	if err == nil {
+		t.Fatal("Run() error = nil, want a missing-format error")
+	}
+}
+
 func TestStorage_MissingFileNameFailsClearly(t *testing.T) {
 	p := storagepiece.New()
 	act := p.Actions["write"]

@@ -46,7 +46,10 @@ func writeAction() piece.Action {
 			if !ok || content == "" {
 				return nil, fmt.Errorf("missing required input: content (string)")
 			}
-			format, _ := ctx.Input["format"].(string)
+			format, ok := ctx.Input["format"].(string)
+			if !ok || format == "" {
+				return nil, fmt.Errorf("missing required input: format (string)")
+			}
 
 			var data []byte
 			switch format {

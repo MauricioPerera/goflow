@@ -109,7 +109,7 @@ func stringifyAction() piece.Action {
 				}
 				rowsRaw, ok := ctx.Input["rows"].([]any)
 				if !ok {
-					return nil, fmt.Errorf("missing required input: rows ([]any of maps, since headers was provided)")
+					return nil, fmt.Errorf("missing required input: rows ([]map[string]any)")
 				}
 				records = append(records, headers)
 				for _, rowRaw := range rowsRaw {
@@ -128,7 +128,7 @@ func stringifyAction() piece.Action {
 			} else {
 				rowsRaw, ok := ctx.Input["rows"].([]any)
 				if !ok {
-					return nil, fmt.Errorf("missing required input: rows ([]any of []any)")
+					return nil, fmt.Errorf("missing required input: rows ([][]any)")
 				}
 				for _, rowRaw := range rowsRaw {
 					cells, ok := rowRaw.([]any)
