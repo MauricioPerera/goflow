@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"goflow/pkg/catalog"
 	"goflow/pkg/credentials"
 	"goflow/pkg/flowstore"
 	"goflow/pkg/model"
@@ -48,7 +49,7 @@ func newHandlerWithFlows(t *testing.T, defs ...flowstore.FlowDefinition) *Handle
 			t.Fatalf("Save %q: %v", def.Name, err)
 		}
 	}
-	return NewHandler(fs, emptyRegistryBuilder, credStore, runstore.NewMemoryStore())
+	return NewHandler(fs, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), catalog.NewMemoryStore())
 }
 
 // newHandlerWithFlowsAndCreds is newHandlerWithFlows but also returns the
@@ -69,7 +70,7 @@ func newHandlerWithFlowsAndCreds(t *testing.T, defs ...flowstore.FlowDefinition)
 			t.Fatalf("Save %q: %v", def.Name, err)
 		}
 	}
-	return NewHandler(fs, emptyRegistryBuilder, credStore, runstore.NewMemoryStore()), credStore
+	return NewHandler(fs, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), catalog.NewMemoryStore()), credStore
 }
 
 // newHandlerWithFlowsAndHistory is newHandlerWithFlows but also returns the
@@ -90,7 +91,29 @@ func newHandlerWithFlowsAndHistory(t *testing.T, defs ...flowstore.FlowDefinitio
 		}
 	}
 	historyStore := runstore.NewMemoryStore()
-	return NewHandler(fs, emptyRegistryBuilder, credStore, historyStore), historyStore
+	return NewHandler(fs, emptyRegistryBuilder, credStore, historyStore, catalog.NewMemoryStore()), historyStore
+}
+
+// newHandlerWithFlowsAndCatalog is newHandlerWithFlows but also returns the
+// catalog.Store, so a test can seed a JS-authored piece and confirm
+// goflow_describe_catalog actually surfaces it.
+func newHandlerWithFlowsAndCatalog(t *testing.T, defs ...flowstore.FlowDefinition) (*Handler, catalog.Store) {
+	t.Helper()
+	fs, err := flowstore.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	credStore, err := credentials.NewFileStore(t.TempDir(), testCredKey)
+	if err != nil {
+		t.Fatalf("credentials.NewFileStore: %v", err)
+	}
+	for _, def := range defs {
+		if err := fs.Save(def); err != nil {
+			t.Fatalf("Save %q: %v", def.Name, err)
+		}
+	}
+	catalogStore := catalog.NewMemoryStore()
+	return NewHandler(fs, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), catalogStore), catalogStore
 }
 
 // doublesArgFlow is a "double it" flow that reads n from the TRIGGER payload
@@ -261,14 +284,19 @@ func TestToolsList_TwoFlowsWithSchema(t *testing.T) {
 	if !ok {
 		t.Fatalf("result.tools = %v, want an array", result["tools"])
 	}
-	if len(tools) != 2 {
-		t.Fatalf("len(tools) = %d, want 2", len(tools))
+	// len(reservedToolNames) fixed meta tools (goflow_describe_catalog etc. —
+	// always present, see handleToolsList) plus one per saved flow.
+	if want := len(reservedToolNames) + 2; len(tools) != want {
+		t.Fatalf("len(tools) = %d, want %d (meta tools + 2 flows)", len(tools), want)
 	}
+	names := map[string]bool{}
 	for _, ti := range tools {
 		tl, _ := ti.(map[string]any)
-		if tl["name"] == nil {
+		name, _ := tl["name"].(string)
+		if name == "" {
 			t.Fatalf("tool missing name: %v", tl)
 		}
+		names[name] = true
 		if tl["description"] == nil {
 			t.Fatalf("tool %v missing description", tl["name"])
 		}
@@ -276,6 +304,14 @@ func TestToolsList_TwoFlowsWithSchema(t *testing.T) {
 		if schema == nil || schema["type"] != "object" {
 			t.Fatalf("tool %v inputSchema.type = %v, want object", tl["name"], schema)
 		}
+	}
+	for reserved := range reservedToolNames {
+		if !names[reserved] {
+			t.Fatalf("tools/list is missing the fixed meta tool %q", reserved)
+		}
+	}
+	if !names["double-it"] || !names["throws"] {
+		t.Fatalf("tools/list is missing a per-flow tool: %v", names)
 	}
 }
 
@@ -545,5 +581,224 @@ func TestToolsCall_RecordedInHistory(t *testing.T) {
 	}
 	if summaries[0].Status != model.FlowRunSucceeded {
 		t.Fatalf("recorded Status = %v, want SUCCEEDED", summaries[0].Status)
+	}
+}
+
+// --- read-only meta tools -----------------------------------------------
+
+func callTool(t *testing.T, h *Handler, name string, args map[string]any) map[string]any {
+	t.Helper()
+	params := map[string]any{"name": name}
+	if args != nil {
+		params["arguments"] = args
+	}
+	rec := call(t, h, map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tools/call %s: status = %d, want 200; body=%s", name, rec.Code, rec.Body.String())
+	}
+	resp := decodeResponse(t, rec)
+	if errObj, isErr := resp["error"]; isErr {
+		t.Fatalf("tools/call %s returned a JSON-RPC protocol error, want a tool result: %v", name, errObj)
+	}
+	result, ok := resp["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("tools/call %s: result = %v, want an object", name, resp["result"])
+	}
+	return result
+}
+
+// toolText extracts the single text content item every meta tool's result
+// carries and decodes it as JSON into v.
+func toolText(t *testing.T, result map[string]any, v any) {
+	t.Helper()
+	content, ok := result["content"].([]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("content = %v, want a one-element array", result["content"])
+	}
+	item, _ := content[0].(map[string]any)
+	text, _ := item["text"].(string)
+	if text == "" {
+		t.Fatalf("content[0].text is empty: %v", item)
+	}
+	if v == nil {
+		return
+	}
+	if err := json.Unmarshal([]byte(text), v); err != nil {
+		t.Fatalf("content text is not JSON: %v; text=%s", err, text)
+	}
+}
+
+func TestDescribeCatalog_SurfacesBuiltinAndJSPieces(t *testing.T) {
+	h, catStore := newHandlerWithFlowsAndCatalog(t)
+	if err := catStore.Save(catalog.Definition{
+		Name: "risk_score", DisplayName: "Risk Score", Description: "classifies risk",
+		Actions: []catalog.ActionDefinition{{
+			Name: "run", DisplayName: "Run", Description: "runs it",
+			InputSchema: "x (number, required)",
+			Source:      `(ctx) => ({ doubled: Number(ctx.input.x) * 2 })`,
+		}},
+	}); err != nil {
+		t.Fatalf("catStore.Save: %v", err)
+	}
+
+	result := callTool(t, h, toolDescribeCatalog, nil)
+	if result["isError"] != false {
+		t.Fatalf("isError = %v, want false", result["isError"])
+	}
+	content, _ := result["content"].([]any)
+	item, _ := content[0].(map[string]any)
+	text, _ := item["text"].(string)
+	if !strings.Contains(text, "risk_score") {
+		t.Fatalf("describe_catalog text missing the JS-authored piece: %s", text)
+	}
+	if !strings.Contains(text, "http") { // a built-in Go piece
+		t.Fatalf("describe_catalog text missing a built-in Go piece: %s", text)
+	}
+}
+
+func TestListFlows_ReturnsMetadataForEveryFlowExceptReservedNames(t *testing.T) {
+	h := newHandlerWithFlows(t, doublesArgFlow(), throwsFlow())
+	result := callTool(t, h, toolListFlows, nil)
+	var body struct {
+		Flows []struct {
+			Name           string `json:"name"`
+			DisplayName    string `json:"displayName"`
+			WebhookEnabled bool   `json:"webhookEnabled"`
+		} `json:"flows"`
+	}
+	toolText(t, result, &body)
+	if len(body.Flows) != 2 {
+		t.Fatalf("flows = %+v, want exactly 2", body.Flows)
+	}
+	byName := map[string]bool{}
+	for _, f := range body.Flows {
+		byName[f.Name] = true
+	}
+	if !byName["double-it"] || !byName["throws"] {
+		t.Fatalf("flows = %+v, missing an expected flow", body.Flows)
+	}
+}
+
+func TestGetFlow_ReturnsFullDefinition(t *testing.T) {
+	h := newHandlerWithFlows(t, doublesArgFlow())
+	result := callTool(t, h, toolGetFlow, map[string]any{"name": "double-it"})
+	if result["isError"] != false {
+		t.Fatalf("isError = %v, want false", result["isError"])
+	}
+	var def flowstore.FlowDefinition
+	toolText(t, result, &def)
+	if def.Name != "double-it" || def.Flow.Trigger == nil {
+		t.Fatalf("get_flow result = %+v, want the full FlowDefinition with its Flow", def)
+	}
+}
+
+func TestGetFlow_UnknownName_IsErrorTrueNotProtocolError(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolGetFlow, map[string]any{"name": "never-saved"})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true for an unknown flow name", result["isError"])
+	}
+}
+
+func TestGetFlow_MissingNameArgument_IsErrorTrue(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolGetFlow, map[string]any{})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true when the name argument is missing", result["isError"])
+	}
+}
+
+func TestListRunsAndGetRun_RoundTripThroughToolsCall(t *testing.T) {
+	h, _ := newHandlerWithFlowsAndHistory(t, doublesArgFlow())
+	if rec := call(t, h, map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{"name": "double-it", "arguments": map[string]any{"n": 7}},
+	}); rec.Code != http.StatusOK {
+		t.Fatalf("seeding run: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	listResult := callTool(t, h, toolListRuns, nil)
+	var listBody struct {
+		Runs []struct {
+			ID       string `json:"ID"`
+			FlowName string `json:"FlowName"`
+			Status   string `json:"Status"`
+		} `json:"runs"`
+	}
+	toolText(t, listResult, &listBody)
+	if len(listBody.Runs) != 1 || listBody.Runs[0].FlowName != "double-it" {
+		t.Fatalf("list_runs = %+v, want exactly 1 run for double-it", listBody.Runs)
+	}
+
+	getResult := callTool(t, h, toolGetRun, map[string]any{"id": listBody.Runs[0].ID})
+	if getResult["isError"] != false {
+		t.Fatalf("get_run isError = %v, want false", getResult["isError"])
+	}
+	var rec runstore.Record
+	toolText(t, getResult, &rec)
+	if rec.FlowName != "double-it" || rec.State == nil {
+		t.Fatalf("get_run result = %+v, want the full Record with its State", rec)
+	}
+}
+
+func TestGetRun_UnknownID_IsErrorTrue(t *testing.T) {
+	h, _ := newHandlerWithFlowsAndHistory(t)
+	result := callTool(t, h, toolGetRun, map[string]any{"id": "never-existed"})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true for an unknown run id", result["isError"])
+	}
+}
+
+func TestListRuns_HistoryStoreNil_IsErrorTrueNotPanic(t *testing.T) {
+	// Built directly (not via newHandlerWithFlows, which always wires a real
+	// MemoryStore) specifically to leave HistoryStore nil — the
+	// nil-means-off case callListRuns/callGetRun must handle without a panic.
+	fs, err := flowstore.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	h := &Handler{
+		FlowStore:     fs,
+		BuildRegistry: emptyRegistryBuilder,
+		CatalogStore:  catalog.NewMemoryStore(),
+	}
+	result := callTool(t, h, toolListRuns, nil)
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true when HistoryStore is nil", result["isError"])
+	}
+}
+
+func TestReservedFlowName_ExcludedFromListButStillResolvesToMetaTool(t *testing.T) {
+	// A flow that happens to be named exactly like a reserved meta tool —
+	// still saved and runnable by name over HTTP, but tools/list must not
+	// advertise it as a distinct tool, and tools/call on that name must still
+	// resolve to the FIXED tool, not the flow.
+	shadowFlow := doublesArgFlow()
+	shadowFlow.Name = toolListFlows
+	h := newHandlerWithFlows(t, shadowFlow, doublesArgFlow())
+
+	rec := call(t, h, map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+	result, _ := decodeResponse(t, rec)["result"].(map[string]any)
+	tools, _ := result["tools"].([]any)
+	count := 0
+	for _, ti := range tools {
+		tl, _ := ti.(map[string]any)
+		if tl["name"] == toolListFlows {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("tools/list has %d entries named %q, want exactly 1 (the fixed meta tool, not the shadowed flow)", count, toolListFlows)
+	}
+
+	// tools/call on that name must run the META TOOL (a list-flows result),
+	// not the shadowed flow (which would return an ExecutionState instead).
+	callResult := callTool(t, h, toolListFlows, nil)
+	var body struct {
+		Flows []map[string]any `json:"flows"`
+	}
+	toolText(t, callResult, &body)
+	if body.Flows == nil {
+		t.Fatalf("tools/call %q returned something other than a list_flows result: %+v", toolListFlows, callResult)
 	}
 }

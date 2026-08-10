@@ -7,6 +7,21 @@
 // path POST /flows/run and POST /flows/{name}/run use, so a tool call and an
 // HTTP run execute identically and are recorded identically.
 //
+// Beyond one tool per saved flow, tools/list also always advertises a fixed,
+// small set of read-only "meta" tools (see reservedToolNames) — a client
+// that only speaks MCP was previously locked out of everything this
+// project's "AI-first" design otherwise enables an agent to do for itself:
+// see the piece catalog, browse saved flows, or inspect run history all
+// required falling back to raw HTTP with the bearer token, even though an
+// MCP-authenticated caller (static token or an OAuth access token) already
+// has that same access on every httpapi route today — there is no
+// scopes/permissions concept anywhere in this project to make MCP
+// meaningfully narrower. This first tier is read-only by design; a second
+// tier (author a piece, save/delete a flow, manage credentials) is
+// deliberately left for later, kept separate specifically so mutating
+// power doesn't ship bundled with what's otherwise a pure discoverability
+// improvement.
+//
 // Everything here is encoding/json + net/http — JSON-RPC 2.0 is simple enough
 // that pulling in a library would add a dependency for nothing, matching the
 // rest of this project's stdlib-only stance.
@@ -18,10 +33,12 @@ import (
 	"io"
 	"net/http"
 
+	"goflow/pkg/catalog"
 	"goflow/pkg/credentials"
 	"goflow/pkg/flowstore"
 	"goflow/pkg/model"
 	"goflow/pkg/piece"
+	"goflow/pkg/pieces"
 	"goflow/pkg/runstore"
 )
 
@@ -42,18 +59,212 @@ type Handler struct {
 	// HistoryStore records every tools/call run — the same run-history
 	// mechanism POST /flows/run and POST /flows/{name}/run use, via
 	// flowstore.RunWithHistory, so a tool call recorded in GET /runs looks
-	// identical to an HTTP-triggered run. May be nil (recording disabled),
-	// matching CredStore's nil-means-off convention.
+	// identical to an HTTP-triggered run. Also backs the goflow_list_runs/
+	// goflow_get_run meta tools directly (see reservedToolNames). May be nil
+	// (recording disabled and those two meta tools report it), matching
+	// CredStore's nil-means-off convention.
 	HistoryStore runstore.Store
+	// CatalogStore backs the goflow_describe_catalog meta tool — the same
+	// Store httpapi.Server's GET /catalog reads via catalog.DescribeCombined.
+	// Required, not nil-tolerant, matching how pkg/httpapi never treats its
+	// own catalog store as optional either.
+	CatalogStore catalog.Store
 }
 
 // NewHandler returns a Handler wired to flowStore, buildRegistry, credStore,
-// and historyStore. It is the caller's job to gate it with auth
+// historyStore, and catalogStore. It is the caller's job to gate it with auth
 // (httpapi.Server mounts it behind its bearer-token middleware, same as
 // every other route); this package does not know about auth on purpose —
 // pkg/httpapi owns that concern.
-func NewHandler(flowStore flowstore.Store, buildRegistry func() (*piece.Registry, error), credStore credentials.Store, historyStore runstore.Store) *Handler {
-	return &Handler{FlowStore: flowStore, BuildRegistry: buildRegistry, CredStore: credStore, HistoryStore: historyStore}
+func NewHandler(flowStore flowstore.Store, buildRegistry func() (*piece.Registry, error), credStore credentials.Store, historyStore runstore.Store, catalogStore catalog.Store) *Handler {
+	return &Handler{
+		FlowStore: flowStore, BuildRegistry: buildRegistry, CredStore: credStore,
+		HistoryStore: historyStore, CatalogStore: catalogStore,
+	}
+}
+
+// --- read-only meta tools -----------------------------------------------
+
+// Fixed tool names tools/list always advertises alongside one tool per saved
+// flow, and tools/call always resolves to their own handler below — never to
+// a same-named flow. reservedToolNames is what handleToolsList checks to
+// EXCLUDE a same-named flow from the per-flow tool list (the flow itself is
+// untouched and still runnable by name via POST /flows/{name}/run; only its
+// MCP tool-name slot is shadowed), keeping tools/list and tools/call
+// consistent about what a reserved name resolves to.
+const (
+	toolDescribeCatalog = "goflow_describe_catalog"
+	toolListFlows       = "goflow_list_flows"
+	toolGetFlow         = "goflow_get_flow"
+	toolListRuns        = "goflow_list_runs"
+	toolGetRun          = "goflow_get_run"
+)
+
+var reservedToolNames = map[string]bool{
+	toolDescribeCatalog: true,
+	toolListFlows:       true,
+	toolGetFlow:         true,
+	toolListRuns:        true,
+	toolGetRun:          true,
+}
+
+// metaToolDescriptors is the tools/list entry for each reserved name above —
+// real, precise JSON Schemas (unlike a per-flow tool's deliberately
+// permissive one): every meta tool's input shape is a well-defined Go type,
+// not an untyped flow trigger payload.
+func metaToolDescriptors() []map[string]any {
+	emptySchema := map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}
+	return []map[string]any{
+		{
+			"name":        toolDescribeCatalog,
+			"description": "Describe every available piece — built-in Go pieces and persisted JS-authored pieces — with their actions, descriptions, and input schemas, as plain text meant to be read directly before authoring a flow or a new piece.",
+			"inputSchema": emptySchema,
+		},
+		{
+			"name":        toolListFlows,
+			"description": "List every saved flow's metadata (name, display name, description, whether it accepts webhook triggers) without each one's full definition.",
+			"inputSchema": emptySchema,
+		},
+		{
+			"name":        toolGetFlow,
+			"description": "Get one saved flow's full definition by name, including its complete trigger/action graph.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"name": map[string]any{"type": "string", "description": "the flow's name"}},
+				"required":   []string{"name"},
+			},
+		},
+		{
+			"name":        toolListRuns,
+			"description": "List every recorded flow run's metadata (id, flow name, status, start/finish time), newest first, across every trigger source — HTTP, webhook, scheduler, and MCP tool calls alike.",
+			"inputSchema": emptySchema,
+		},
+		{
+			"name":        toolGetRun,
+			"description": "Get one recorded run's full detail by id, including every step's resolved input and output.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"id": map[string]any{"type": "string", "description": "the run's id, e.g. from goflow_list_runs"}},
+				"required":   []string{"id"},
+			},
+		},
+	}
+}
+
+// goCatalogMap builds the name -> DisplayName map catalog.DescribeCombined
+// expects for the built-in Go-pieces section — the exact same tiny helper
+// pkg/httpapi's own goCatalogMap builds, duplicated here rather than
+// exported/shared across packages since it's four lines with no state of
+// its own.
+func goCatalogMap() map[string]string {
+	m := make(map[string]string, len(pieces.All()))
+	for _, p := range pieces.All() {
+		m[p.Name] = p.DisplayName
+	}
+	return m
+}
+
+// writeToolText wraps payload as an MCP tool RESULT — the same
+// content/isError shape handleToolsCall's flow-run path already uses for an
+// *model.ExecutionState, reused here for the meta tools' plain-text or
+// JSON-encoded results. A string payload is sent verbatim (catalog.
+// DescribeCombined already returns human-readable text); anything else is
+// JSON-encoded.
+func writeToolText(w http.ResponseWriter, id *json.RawMessage, isError bool, payload any) {
+	text, ok := payload.(string)
+	if !ok {
+		b, err := json.MarshalIndent(payload, "", "  ")
+		if err != nil {
+			writeError(w, id, -32603, "internal error: "+err.Error())
+			return
+		}
+		text = string(b)
+	}
+	writeResult(w, id, map[string]any{
+		"content": []map[string]any{{"type": "text", "text": text}},
+		"isError": isError,
+	})
+}
+
+func (h *Handler) callDescribeCatalog(w http.ResponseWriter, req rawRequest) {
+	text, err := catalog.DescribeCombined(h.CatalogStore, goCatalogMap())
+	if err != nil {
+		writeError(w, req.ID, -32603, "internal error: "+err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, text)
+}
+
+// flowSummary mirrors pkg/httpapi's own flowSummary — metadata only, never
+// the full FlowVersion, kept as a local unexported type rather than an
+// import since pkg/httpapi cannot be imported here (it already imports
+// pkg/mcpapi, and Go forbids the cycle).
+type flowSummary struct {
+	Name           string `json:"name"`
+	DisplayName    string `json:"displayName"`
+	Description    string `json:"description"`
+	WebhookEnabled bool   `json:"webhookEnabled"`
+}
+
+func (h *Handler) callListFlows(w http.ResponseWriter, req rawRequest) {
+	defs, err := h.FlowStore.List()
+	if err != nil {
+		writeError(w, req.ID, -32603, "internal error: "+err.Error())
+		return
+	}
+	summaries := make([]flowSummary, 0, len(defs))
+	for _, d := range defs {
+		summaries = append(summaries, flowSummary{
+			Name: d.Name, DisplayName: d.DisplayName, Description: d.Description,
+			WebhookEnabled: d.WebhookEnabled,
+		})
+	}
+	writeToolText(w, req.ID, false, map[string]any{"flows": summaries})
+}
+
+func (h *Handler) callGetFlow(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	name, _ := args["name"].(string)
+	if name == "" {
+		writeToolText(w, req.ID, true, "missing required argument: name")
+		return
+	}
+	def, ok, err := h.FlowStore.Get(name)
+	if err != nil || !ok {
+		writeToolText(w, req.ID, true, fmt.Sprintf("no flow named %q", name))
+		return
+	}
+	writeToolText(w, req.ID, false, def)
+}
+
+func (h *Handler) callListRuns(w http.ResponseWriter, req rawRequest) {
+	if h.HistoryStore == nil {
+		writeToolText(w, req.ID, true, "run history is not configured on this server")
+		return
+	}
+	summaries, err := h.HistoryStore.List()
+	if err != nil {
+		writeError(w, req.ID, -32603, "internal error: "+err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, map[string]any{"runs": summaries})
+}
+
+func (h *Handler) callGetRun(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	if h.HistoryStore == nil {
+		writeToolText(w, req.ID, true, "run history is not configured on this server")
+		return
+	}
+	id, _ := args["id"].(string)
+	if id == "" {
+		writeToolText(w, req.ID, true, "missing required argument: id")
+		return
+	}
+	rec, ok, err := h.HistoryStore.Get(id)
+	if err != nil || !ok {
+		writeToolText(w, req.ID, true, fmt.Sprintf("no run with id %q", id))
+		return
+	}
+	writeToolText(w, req.ID, false, rec)
 }
 
 // nullID is the JSON-RPC id used when no id could be read from the request
@@ -173,21 +384,31 @@ func (h *Handler) handleInitialize(w http.ResponseWriter, req rawRequest) {
 	})
 }
 
-// handleToolsList surfaces every saved flow as one tool. The description falls
-// back through Description -> DisplayName -> Name so a caller always sees
-// something useful. inputSchema is deliberately permissive (an object that
-// accepts any properties): a flow's trigger payload is free-text-described
-// (FlowDefinition.InputSchema), not a formal JSON Schema, so the description
-// carries the real contract and additionalProperties:true lets any arguments
-// through to flowstore.Run.
+// handleToolsList surfaces the fixed meta tools (metaToolDescriptors, always
+// present) plus one tool per saved flow. A flow whose name collides with a
+// reserved meta tool name is skipped here — not deleted, not un-runnable by
+// name over HTTP, just excluded from THIS list, since its MCP tool-name slot
+// is shadowed by the fixed tool (see reservedToolNames and handleToolsCall,
+// which resolves the same name the same way).
+//
+// Per-flow tool description falls back through Description -> DisplayName ->
+// Name so a caller always sees something useful. inputSchema is deliberately
+// permissive (an object that accepts any properties): a flow's trigger
+// payload is free-text-described (FlowDefinition.InputSchema), not a formal
+// JSON Schema, so the description carries the real contract and
+// additionalProperties:true lets any arguments through to flowstore.Run.
 func (h *Handler) handleToolsList(w http.ResponseWriter, req rawRequest) {
 	defs, err := h.FlowStore.List()
 	if err != nil {
 		writeError(w, req.ID, -32603, "internal error: "+err.Error())
 		return
 	}
-	tools := make([]map[string]any, 0, len(defs))
+	tools := make([]map[string]any, 0, len(defs)+len(reservedToolNames))
+	tools = append(tools, metaToolDescriptors()...)
 	for _, def := range defs {
+		if reservedToolNames[def.Name] {
+			continue
+		}
 		desc := def.Description
 		if desc == "" {
 			desc = def.DisplayName
@@ -208,9 +429,13 @@ func (h *Handler) handleToolsList(w http.ResponseWriter, req rawRequest) {
 	writeResult(w, req.ID, map[string]any{"tools": tools})
 }
 
-// handleToolsCall runs a saved flow by name. arguments is the trigger payload;
-// executeTrigger is always false (the same default the rest of the API uses).
-// The three Run outcomes map to three distinct wire shapes:
+// handleToolsCall dispatches to a fixed meta tool (reservedToolNames) if
+// params.Name matches one, before ever looking it up as a flow — the same
+// precedence handleToolsList gives them, so a reserved name always means the
+// same thing on both methods. Otherwise it runs a saved flow by name.
+// arguments is the trigger payload; executeTrigger is always false (the same
+// default the rest of the API uses). The three Run outcomes map to three
+// distinct wire shapes:
 //   - runErr != nil (buildRegistry failed): a JSON-RPC -32603 internal error —
 //     a server fault, not a tool failure.
 //   - validationErrs non-empty: a tool RESULT with isError:true — the tool
@@ -234,6 +459,24 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 	}
 	if params.Name == "" {
 		writeError(w, req.ID, -32602, "invalid params: name is required")
+		return
+	}
+
+	switch params.Name {
+	case toolDescribeCatalog:
+		h.callDescribeCatalog(w, req)
+		return
+	case toolListFlows:
+		h.callListFlows(w, req)
+		return
+	case toolGetFlow:
+		h.callGetFlow(w, req, params.Arguments)
+		return
+	case toolListRuns:
+		h.callListRuns(w, req)
+		return
+	case toolGetRun:
+		h.callGetRun(w, req, params.Arguments)
 		return
 	}
 

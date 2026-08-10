@@ -516,6 +516,30 @@ below for what a Go rewrite gets and gives up.
   OAuth-issued access token and the static token grant identical access on
   every route (this project has no scopes/permissions concept to narrow
   one against), not just `/mcp`.
+- **Read-only MCP meta tools** (`pkg/mcpapi`): closes a gap specific to a
+  client that only speaks MCP, not HTTP — until now, `tools/list`/
+  `tools/call` could only DISCOVER-and-RUN a flow someone else already
+  built; browsing the piece catalog, listing saved flows, or checking run
+  history all required falling back to raw HTTP with the bearer token, even
+  though an MCP-authenticated caller (static token or an OAuth access
+  token) already has that exact same access on every httpapi route today —
+  there's no scopes/permissions concept anywhere in this project to make
+  MCP meaningfully narrower, so exposing these wasn't a new privilege, only
+  a new reachability. Five fixed tools — `goflow_describe_catalog`,
+  `goflow_list_flows`, `goflow_get_flow`, `goflow_list_runs`,
+  `goflow_get_run` — are always present in `tools/list` alongside the
+  per-flow ones, each with a real, precise `inputSchema` (unlike a
+  per-flow tool's deliberately permissive one, since these five have
+  well-defined Go types behind them, not an untyped trigger payload). A
+  saved flow whose name collides with one of the five reserved names is
+  excluded from `tools/list` — not deleted, not un-runnable by name over
+  `POST /flows/{name}/run`, just shadowed in this one listing — and
+  `tools/call` resolves that name to the fixed tool the same way, so the
+  two methods never disagree about what a reserved name means. This tier
+  is deliberately read-only; authoring a piece, saving/deleting a flow, or
+  managing a credential through MCP is left for later on purpose, kept
+  separate so mutating power doesn't ship bundled with what's otherwise a
+  pure discoverability improvement.
 - **Schedule trigger + a real scheduler** (`pkg/pieces/schedule`,
   `pkg/scheduler`): closes a gap found while auditing real-world use cases
   against this project's actual catalog — every other piece here is

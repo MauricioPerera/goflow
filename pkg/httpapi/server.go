@@ -110,7 +110,7 @@ func (s *Server) Handler() http.Handler {
 	// where to find this resource's OAuth metadata on a 401, so a
 	// spec-compliant client discovers the flow below instead of just
 	// retrying the same bare token forever.
-	mux.Handle("POST /mcp", s.authMCP(mcpapi.NewHandler(s.flowStore, s.buildRegistry, s.credStore, s.runStore)))
+	mux.Handle("POST /mcp", s.authMCP(mcpapi.NewHandler(s.flowStore, s.buildRegistry, s.credStore, s.runStore, s.store)))
 
 	// OAuth 2.1 endpoints (pkg/oauth) — deliberately NOT behind s.auth: they
 	// ARE the mechanism a client without a token yet uses to get one. See
