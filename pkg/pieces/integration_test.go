@@ -1122,3 +1122,233 @@ func TestFlow_RegionOutsideDropdownFailsClearly(t *testing.T) {
 		t.Fatalf("verdict = %+v, want FAILED — region_picker.deploy rejects any region outside its own valid list", state.Verdict)
 	}
 }
+
+// zonesByRegion is the shared source of truth both the "zone" dropdown and
+// the "deploy" action's own validation read from — kept in one Go map so
+// the JS embedded below and this test's own assertions can't drift apart.
+var zonesByRegion = map[string][]string{
+	"us-east-1": {"us-east-1a", "us-east-1b"},
+	"eu-west-1": {"eu-west-1a", "eu-west-1b"},
+}
+
+// cloudDeployPiece has two chained Dropdowns: "region" is independent,
+// "zone" declares Refreshers: ["region"] and returns a DIFFERENT option
+// set depending on propsValue.region — Refreshers itself is purely
+// documentation (see piece.DropdownProperty's doc comment: "nothing
+// enforces it"); the actual chaining is entirely LoadOptions reading
+// propsValue itself, same as any other Dropdown. Its "deploy" action
+// validates region+zone belong together, the same "engine doesn't
+// enforce Dropdowns, the piece validates its own Input" pattern
+// TestFlow_RegionOutsideDropdownFailsClearly already established.
+func cloudDeployPiece() piece.Piece {
+	return piece.Piece{
+		Name: "cloud_deploy", DisplayName: "Cloud Deploy",
+		Actions: map[string]piece.Action{
+			"deploy": jspiece.NewAction(jspiece.ActionSource{
+				Name: "deploy", DisplayName: "Deploy",
+				Source: `(ctx) => {
+					const zonesByRegion = {
+						"us-east-1": ["us-east-1a", "us-east-1b"],
+						"eu-west-1": ["eu-west-1a", "eu-west-1b"]
+					};
+					const region = ctx.input.region;
+					const zone = ctx.input.zone;
+					const validZones = zonesByRegion[region];
+					if (!validZones || validZones.indexOf(zone) === -1) {
+						throw new Error("invalid zone " + zone + " for region " + region);
+					}
+					return { deployedTo: zone, region: region, status: "deployed" };
+				}`,
+				Dropdowns: map[string]jspiece.DropdownSource{
+					"region": {
+						Source: `(propsValue, ctx) => ({
+							options: [
+								{ label: "US East", value: "us-east-1" },
+								{ label: "EU West", value: "eu-west-1" },
+							]
+						})`,
+					},
+					"zone": {
+						Refreshers: []string{"region"},
+						Source: `(propsValue, ctx) => {
+							const zonesByRegion = {
+								"us-east-1": ["us-east-1a", "us-east-1b"],
+								"eu-west-1": ["eu-west-1a", "eu-west-1b"]
+							};
+							const region = propsValue.region;
+							const zones = zonesByRegion[region];
+							if (!zones) {
+								return { disabled: true, placeholder: "select a region first", options: [] };
+							}
+							return { options: zones.map(z => ({ label: z, value: z })) };
+						}`,
+					},
+				},
+			}),
+		},
+	}
+}
+
+// TestJSDropdown_RefreshersDeclarationIsPreserved confirms Refreshers
+// round-trips through NewDropdown into the real piece.DropdownProperty —
+// it's documentation only (nothing reads it to auto-trigger a reload),
+// but a piece author or an editor UI still needs it to actually be there.
+func TestJSDropdown_RefreshersDeclarationIsPreserved(t *testing.T) {
+	p := cloudDeployPiece()
+	dd := p.Actions["deploy"].Dropdowns["zone"]
+	if len(dd.Refreshers) != 1 || dd.Refreshers[0] != "region" {
+		t.Fatalf("Refreshers = %+v, want [\"region\"]", dd.Refreshers)
+	}
+}
+
+// TestJSDropdown_ChainedOptionsDependOnSiblingPropsValue is the core proof
+// for chained dropdowns: calling LoadOptions for "zone" with a DIFFERENT
+// propsValue.region each time returns genuinely different option sets —
+// not a static list ignoring its input.
+func TestJSDropdown_ChainedOptionsDependOnSiblingPropsValue(t *testing.T) {
+	dd := cloudDeployPiece().Actions["deploy"].Dropdowns["zone"]
+
+	usEast, err := dd.LoadOptions(map[string]any{"region": "us-east-1"}, piece.PropertyContext{})
+	if err != nil {
+		t.Fatalf("LoadOptions(us-east-1) error = %v", err)
+	}
+	if len(usEast.Options) != 2 || usEast.Options[0].Value != "us-east-1a" {
+		t.Fatalf("us-east-1 options = %+v", usEast.Options)
+	}
+
+	euWest, err := dd.LoadOptions(map[string]any{"region": "eu-west-1"}, piece.PropertyContext{})
+	if err != nil {
+		t.Fatalf("LoadOptions(eu-west-1) error = %v", err)
+	}
+	if len(euWest.Options) != 2 || euWest.Options[0].Value != "eu-west-1a" {
+		t.Fatalf("eu-west-1 options = %+v", euWest.Options)
+	}
+}
+
+// TestJSDropdown_ChainedDropdownDisabledWithoutParentSelected covers the
+// realistic UX case: before "region" has been picked at all, "zone"
+// should come back disabled with a helpful placeholder instead of an
+// empty (and unexplained) options list.
+func TestJSDropdown_ChainedDropdownDisabledWithoutParentSelected(t *testing.T) {
+	dd := cloudDeployPiece().Actions["deploy"].Dropdowns["zone"]
+
+	state, err := dd.LoadOptions(map[string]any{}, piece.PropertyContext{})
+	if err != nil {
+		t.Fatalf("LoadOptions() error = %v", err)
+	}
+	if !state.Disabled || state.Placeholder == "" {
+		t.Fatalf("state = %+v, want Disabled=true with a placeholder", state)
+	}
+	if len(state.Options) != 0 {
+		t.Fatalf("state.Options = %+v, want empty", state.Options)
+	}
+}
+
+// TestFlow_UsesChainedDropdownSelections simulates the full real editor
+// sequence for chained dropdowns: load "region" options, pick one, load
+// "zone" options WITH that region in propsValue (what Refreshers tells a
+// real UI to do), pick one of THOSE, then actually run a flow built from
+// both selections — registered alongside the full Go catalog.
+func TestFlow_UsesChainedDropdownSelections(t *testing.T) {
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+	if err := registry.RegisterValidated(cloudDeployPiece()); err != nil {
+		t.Fatalf("RegisterValidated: %v", err)
+	}
+	e := engine.New(registry)
+
+	regionState, err := e.LoadOptions(engine.LoadOptionsInput{
+		PieceName: "cloud_deploy", ActionName: "deploy", PropertyName: "region",
+	})
+	if err != nil {
+		t.Fatalf("LoadOptions(region) error = %v", err)
+	}
+	selectedRegion := regionState.Options[1].Value.(string) // "eu-west-1"
+
+	zoneState, err := e.LoadOptions(engine.LoadOptionsInput{
+		PieceName: "cloud_deploy", ActionName: "deploy", PropertyName: "zone",
+		Input: map[string]any{"region": selectedRegion},
+	})
+	if err != nil {
+		t.Fatalf("LoadOptions(zone) error = %v", err)
+	}
+	if len(zoneState.Options) != len(zonesByRegion[selectedRegion]) {
+		t.Fatalf("zoneState.Options = %+v, want %d options for %s", zoneState.Options, len(zonesByRegion[selectedRegion]), selectedRegion)
+	}
+	selectedZone := zoneState.Options[0].Value.(string) // "eu-west-1a"
+
+	flowJSON := fmt.Sprintf(`{
+		"id": "fv-chained-dropdowns",
+		"trigger": {
+			"name": "trigger_1",
+			"displayName": "Trigger",
+			"type": "EMPTY",
+			"nextAction": {
+				"name": "deploy",
+				"displayName": "Deploy",
+				"type": "PIECE",
+				"piece": {
+					"pieceName": "cloud_deploy",
+					"actionName": "deploy",
+					"input": { "region": %q, "zone": %q }
+				}
+			}
+		}
+	}`, selectedRegion, selectedZone)
+
+	fv, err := model.ParseFlowVersion([]byte(flowJSON))
+	if err != nil {
+		t.Fatalf("ParseFlowVersion: %v", err)
+	}
+	if errs := flowvalidate.Validate(fv, registry); len(errs) != 0 {
+		t.Fatalf("Validate() = %+v, want no errors", errs)
+	}
+
+	result := e.ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+	if result.Verdict.Status != model.FlowRunSucceeded {
+		t.Fatalf("verdict = %+v", result.Verdict)
+	}
+	out := result.Steps["deploy"].Output.(map[string]any)
+	if out["deployedTo"] != selectedZone || out["region"] != selectedRegion {
+		t.Fatalf("out = %+v, want deployedTo=%q region=%q", out, selectedZone, selectedRegion)
+	}
+}
+
+// TestFlow_ZoneFromWrongRegionFailsClearly proves the chaining is purely
+// an editor-time convenience — nothing stops a flow's Input from pairing
+// a zone with a DIFFERENT region than the one it actually belongs to
+// (e.g. hand-edited JSON, or a stale value from before the region
+// changed). Same "the piece validates its own Input" story as
+// TestFlow_RegionOutsideDropdownFailsClearly, one level deeper.
+func TestFlow_ZoneFromWrongRegionFailsClearly(t *testing.T) {
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+	if err := registry.RegisterValidated(cloudDeployPiece()); err != nil {
+		t.Fatalf("RegisterValidated: %v", err)
+	}
+
+	deployStep := &model.FlowAction{
+		Name: "deploy", DisplayName: "Deploy", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "cloud_deploy", ActionName: "deploy", Input: map[string]any{
+			"region": "us-east-1",
+			"zone":   "eu-west-1a", // belongs to eu-west-1, not us-east-1
+		}},
+	}
+	fv := &model.FlowVersion{ID: "fv-zone-wrong-region", Trigger: &model.FlowTrigger{
+		Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+		NextAction: deployStep,
+	}}
+
+	if errs := flowvalidate.Validate(fv, registry); len(errs) != 0 {
+		t.Fatalf("Validate() = %+v, want no errors — a mismatched region/zone pair is not a structural problem", errs)
+	}
+
+	state := engine.New(registry).ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+	if state.Verdict.Status != model.FlowRunFailed {
+		t.Fatalf("verdict = %+v, want FAILED — cloud_deploy.deploy rejects a zone that doesn't belong to its region", state.Verdict)
+	}
+}

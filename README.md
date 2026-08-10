@@ -1112,3 +1112,28 @@ go run ./examples
   cares" philosophy already true for every other Input field in this
   project, now confirmed to hold for Dropdown-backed ones too rather than
   assumed by analogy.
+- **Chained/refreshing dropdowns (`cloudDeployPiece`,
+  `pkg/pieces/integration_test.go`) needed zero new mechanism — confirmed
+  by testing it, not assumed from `Refreshers`' own doc comment.**
+  `piece.DropdownProperty.Refreshers` is explicitly documentation-only
+  ("nothing enforces it... `LoadOptions` decides what it actually reads
+  from `propsValue`"); the actual chaining is entirely `LoadOptions`
+  reading whatever's in `propsValue` itself — a `"zone"` dropdown reading
+  `propsValue.region` and returning different options per region is just
+  ordinary JS logic, nothing `jspiece`-specific. `TestJSDropdown_ChainedOptionsDependOnSiblingPropsValue`
+  proves it returns genuinely different option sets for different regions
+  (not a static list ignoring its input);
+  `TestJSDropdown_ChainedDropdownDisabledWithoutParentSelected` covers the
+  realistic UX case (no region picked yet → `Disabled: true` with a
+  placeholder, not an empty unexplained list).
+  `TestFlow_UsesChainedDropdownSelections` runs the full real editor
+  sequence end to end: load `"region"` options, pick one, load `"zone"`
+  options WITH that region in `propsValue` (what `Refreshers` tells a real
+  UI to send), pick one of those, then actually execute a flow built from
+  both selections. `TestFlow_ZoneFromWrongRegionFailsClearly` goes one
+  level past `TestFlow_RegionOutsideDropdownFailsClearly`: nothing stops a
+  flow's `Input` from pairing a zone with a *different* region than the
+  one it actually belongs to (hand-edited JSON, a stale value) — the
+  chaining is purely an editor-time convenience for populating the list,
+  never enforced at run time; only `cloud_deploy.deploy`'s own validation
+  catches the mismatch.
