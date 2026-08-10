@@ -19,9 +19,8 @@ import (
 
 	"goflow/pkg/catalog"
 	"goflow/pkg/credentials"
-	"goflow/pkg/engine"
 	"goflow/pkg/flowstore"
-	"goflow/pkg/flowvalidate"
+	"goflow/pkg/mcpapi"
 	"goflow/pkg/model"
 	"goflow/pkg/piece"
 	"goflow/pkg/pieces"
@@ -73,6 +72,11 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /flows/{name}/run", s.auth(http.HandlerFunc(s.handleFlowRun)))
 	mux.Handle("/credentials", s.auth(http.HandlerFunc(s.handleCredentials)))
 	mux.Handle("DELETE /credentials/{name}", s.auth(http.HandlerFunc(s.handleCredentialDelete)))
+	// /mcp exposes the saved flows as MCP tools (JSON-RPC 2.0 over a single
+	// POST), behind the same bearer-token auth as every other route. The
+	// handler reuses this server's buildRegistry and flowStore, so a tool call
+	// validates and runs a flow against the exact same registry as /flows/run.
+	mux.Handle("POST /mcp", s.auth(mcpapi.NewHandler(s.flowStore, s.buildRegistry)))
 	return s.logging(s.recover(mux))
 }
 
@@ -155,33 +159,28 @@ func (s *Server) handleFlowsRun(w http.ResponseWriter, r *http.Request) {
 
 // runFlowVersion is the shared run path for both POST /flows/run (an ad-hoc
 // FlowVersion in the body) and POST /flows/{name}/run (a FlowVersion fetched
-// from the store by name). It assembles a fresh registry, re-validates the
-// flow against it (a flow saved long ago may reference a piece since removed
-// from the catalog — caught here, not mid-run), and — if it passes — runs it
-// through the engine and writes the *model.ExecutionState as the body. A
-// registry or validation failure is a 400; the ExecutionState is the whole
-// body on success, never wrapped (matching the ad-hoc route's shape).
+// from the store by name). The validate-then-execute logic itself lives in
+// flowstore.Run (shared with the MCP tools/call path); this method only
+// translates Run's three return values into the HTTP response shape the two
+// routes have always had: 400 {"error":...} on a registry failure, 400
+// {"errors":[...]} on a validation failure, and the bare *model.ExecutionState
+// as the whole 200 body on success (never wrapped — matching the ad-hoc
+// route's original shape, so the existing /flows/run and /flows/{name}/run
+// tests pass unchanged).
 func (s *Server) runFlowVersion(w http.ResponseWriter, fv *model.FlowVersion, trigger any, executeTrigger bool) {
-	reg, err := s.buildRegistry()
+	state, validationErrs, err := flowstore.Run(fv, s.buildRegistry, trigger, executeTrigger)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-
-	if vErrs := flowvalidate.Validate(fv, reg); len(vErrs) > 0 {
-		out := make([]map[string]string, len(vErrs))
-		for i, e := range vErrs {
+	if len(validationErrs) > 0 {
+		out := make([]map[string]string, len(validationErrs))
+		for i, e := range validationErrs {
 			out[i] = map[string]string{"path": e.Path, "message": e.Message}
 		}
 		writeJSON(w, http.StatusBadRequest, map[string]any{"errors": out})
 		return
 	}
-
-	eng := engine.New(reg)
-	state := eng.ExecuteBegin(fv, engine.BeginInput{
-		TriggerPayload: trigger,
-		ExecuteTrigger: executeTrigger,
-	})
 
 	// The ExecutionState is the whole body — not wrapped in another object.
 	// Its runtime types have no json tags, so fields marshal as their Go

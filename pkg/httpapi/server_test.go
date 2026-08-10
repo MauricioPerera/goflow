@@ -614,3 +614,54 @@ func TestPostFlowRun_UnknownName_404(t *testing.T) {
 		t.Fatalf("body = %v, want error=not found", m)
 	}
 }
+
+// --- MCP (/mcp) over HTTP ---------------------------------------------------
+
+// TestPostMcp_NoAuth_401 confirms /mcp sits behind the same bearer-token
+// middleware as every other route — an unauthenticated request never reaches
+// the MCP handler.
+func TestPostMcp_NoAuth_401(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "POST", "/mcp", map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "initialize",
+	}, false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	if m["error"] != "unauthorized" {
+		t.Fatalf("body = %v, want error=unauthorized", m)
+	}
+}
+
+// TestPostMcp_WithAuth_Initialize_OK drives the full stack end-to-end — auth
+// middleware, mux routing, and the mounted mcpapi.Handler — with a real
+// initialize request, asserting a valid JSON-RPC success response.
+func TestPostMcp_WithAuth_Initialize_OK(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "POST", "/mcp", map[string]any{
+		"jsonrpc": "2.0", "id": 42, "method": "initialize",
+		"params": map[string]any{"protocolVersion": "2026-06-18"},
+	}, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	if m["jsonrpc"] != "2.0" {
+		t.Fatalf("jsonrpc = %v, want 2.0", m["jsonrpc"])
+	}
+	if m["id"] != float64(42) {
+		t.Fatalf("id = %v, want 42 (echoed)", m["id"])
+	}
+	result, ok := m["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("result = %v, want an object; body=%s", m["result"], rec.Body.String())
+	}
+	if result["protocolVersion"] != "2026-06-18" {
+		t.Fatalf("protocolVersion = %v, want 2026-06-18", result["protocolVersion"])
+	}
+	info, _ := result["serverInfo"].(map[string]any)
+	if info["name"] != "goflow-mcp" {
+		t.Fatalf("serverInfo.name = %v, want goflow-mcp", info["name"])
+	}
+}
