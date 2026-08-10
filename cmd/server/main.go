@@ -11,6 +11,7 @@ import (
 
 	"goflow/pkg/catalog"
 	"goflow/pkg/credentials"
+	"goflow/pkg/flowstore"
 	"goflow/pkg/httpapi"
 )
 
@@ -58,6 +59,11 @@ func main() {
 		credentialsDir = "./data/credentials"
 	}
 
+	flowsDir := os.Getenv("GOFLOW_FLOWS_DIR")
+	if flowsDir == "" {
+		flowsDir = "./data/flows"
+	}
+
 	// NewFileStore creates the directory if missing (os.MkdirAll inside),
 	// so no separate mkdir here.
 	fileStore, err := catalog.NewFileStore(catalogDir)
@@ -71,7 +77,16 @@ func main() {
 		log.Fatalf("opening credentials store at %q: %v", credentialsDir, err)
 	}
 
-	srv := httpapi.NewServer(gated, credStore, token)
-	log.Printf("goflow-server listening on %s (catalog: %s, credentials: %s)", addr, catalogDir, credentialsDir)
+	// flowStore is the RAW store — NewServer wraps it in a GatedStore
+	// internally, wiring the gate's BuildRegistry to the server's own
+	// buildRegistry so /flows validates against the same piece registry every
+	// other route assembles. Pass it raw, same as catalog above.
+	flowStore, err := flowstore.NewFileStore(flowsDir)
+	if err != nil {
+		log.Fatalf("opening flows store at %q: %v", flowsDir, err)
+	}
+
+	srv := httpapi.NewServer(gated, credStore, flowStore, token)
+	log.Printf("goflow-server listening on %s (catalog: %s, credentials: %s, flows: %s)", addr, catalogDir, credentialsDir, flowsDir)
 	log.Fatal(http.ListenAndServe(addr, srv.Handler()))
 }

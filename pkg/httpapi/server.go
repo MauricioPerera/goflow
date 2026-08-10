@@ -20,6 +20,7 @@ import (
 	"goflow/pkg/catalog"
 	"goflow/pkg/credentials"
 	"goflow/pkg/engine"
+	"goflow/pkg/flowstore"
 	"goflow/pkg/flowvalidate"
 	"goflow/pkg/model"
 	"goflow/pkg/piece"
@@ -28,20 +29,32 @@ import (
 
 // Server holds the shared, read-mostly state for every request: the catalog
 // Store (a *catalog.GatedStore wrapping a *catalog.FileStore in practice,
-// but typed as the interface so tests can pass any Store) and the bearer
-// token every non-/health route is gated on.
+// but typed as the interface so tests can pass any Store), the named-flow
+// store (a *flowstore.GatedStore wrapping whatever flowstore.Store the
+// caller passed, built inside NewServer so the gate reuses this server's
+// own buildRegistry), and the bearer token every non-/health route is gated
+// on.
 type Server struct {
 	store     catalog.Store
 	credStore credentials.Store
+	flowStore *flowstore.GatedStore
 	token     string
 }
 
 // NewServer returns a Server that authorizes non-/health routes with token,
-// reads/writes catalog Definitions through store, and manages encrypted
-// credentials through credStore. credStore is never asked to decrypt over
-// HTTP — only Save/List/Delete are exposed; Get is for trusted Go callers.
-func NewServer(store catalog.Store, credStore credentials.Store, token string) *Server {
-	return &Server{store: store, credStore: credStore, token: token}
+// reads/writes catalog Definitions through store, manages encrypted
+// credentials through credStore, and persists named flows through flowStore.
+// flowStore is the RAW store (no gate): NewServer wraps it in a
+// *flowstore.GatedStore itself, wiring the gate's BuildRegistry to this
+// server's own buildRegistry — so /flows (save) validates a flow against the
+// exact same piece registry /flows/run and every other route assembles,
+// without duplicating that assembly in cmd/server/main.go. credStore is
+// never asked to decrypt over HTTP — only Save/List/Delete are exposed; Get
+// is for trusted Go callers.
+func NewServer(store catalog.Store, credStore credentials.Store, flowStore flowstore.Store, token string) *Server {
+	s := &Server{store: store, credStore: credStore, token: token}
+	s.flowStore = &flowstore.GatedStore{Underlying: flowStore, BuildRegistry: s.buildRegistry}
+	return s
 }
 
 // Handler assembles the route table and wraps it with the middleware stack:
@@ -53,7 +66,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.Handle("/catalog", s.auth(http.HandlerFunc(s.handleCatalog)))
 	mux.Handle("/pieces", s.auth(http.HandlerFunc(s.handlePieces)))
-	mux.Handle("/flows/run", s.auth(http.HandlerFunc(s.handleFlowsRun)))
+	mux.Handle("POST /flows/run", s.auth(http.HandlerFunc(s.handleFlowsRun)))
+	mux.Handle("/flows", s.auth(http.HandlerFunc(s.handleFlows)))
+	mux.Handle("GET /flows/{name}", s.auth(http.HandlerFunc(s.handleFlowGet)))
+	mux.Handle("DELETE /flows/{name}", s.auth(http.HandlerFunc(s.handleFlowDelete)))
+	mux.Handle("POST /flows/{name}/run", s.auth(http.HandlerFunc(s.handleFlowRun)))
 	mux.Handle("/credentials", s.auth(http.HandlerFunc(s.handleCredentials)))
 	mux.Handle("DELETE /credentials/{name}", s.auth(http.HandlerFunc(s.handleCredentialDelete)))
 	return s.logging(s.recover(mux))
@@ -133,14 +150,25 @@ func (s *Server) handleFlowsRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	s.runFlowVersion(w, &req.Flow, req.Trigger, req.ExecuteTrigger)
+}
 
+// runFlowVersion is the shared run path for both POST /flows/run (an ad-hoc
+// FlowVersion in the body) and POST /flows/{name}/run (a FlowVersion fetched
+// from the store by name). It assembles a fresh registry, re-validates the
+// flow against it (a flow saved long ago may reference a piece since removed
+// from the catalog — caught here, not mid-run), and — if it passes — runs it
+// through the engine and writes the *model.ExecutionState as the body. A
+// registry or validation failure is a 400; the ExecutionState is the whole
+// body on success, never wrapped (matching the ad-hoc route's shape).
+func (s *Server) runFlowVersion(w http.ResponseWriter, fv *model.FlowVersion, trigger any, executeTrigger bool) {
 	reg, err := s.buildRegistry()
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
-	if vErrs := flowvalidate.Validate(&req.Flow, reg); len(vErrs) > 0 {
+	if vErrs := flowvalidate.Validate(fv, reg); len(vErrs) > 0 {
 		out := make([]map[string]string, len(vErrs))
 		for i, e := range vErrs {
 			out[i] = map[string]string{"path": e.Path, "message": e.Message}
@@ -150,9 +178,9 @@ func (s *Server) handleFlowsRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	eng := engine.New(reg)
-	state := eng.ExecuteBegin(&req.Flow, engine.BeginInput{
-		TriggerPayload: req.Trigger,
-		ExecuteTrigger: req.ExecuteTrigger,
+	state := eng.ExecuteBegin(fv, engine.BeginInput{
+		TriggerPayload: trigger,
+		ExecuteTrigger: executeTrigger,
 	})
 
 	// The ExecutionState is the whole body — not wrapped in another object.
@@ -161,6 +189,126 @@ func (s *Server) handleFlowsRun(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(state)
+}
+
+// flowSummary is the metadata-only projection of a FlowDefinition returned
+// by GET /flows — Name/DisplayName/Description only, never the full
+// FlowVersion. Deliberately light: the listing is meant to be cheap, like a
+// future tools/list of MCP, so a caller can pick a flow without every saved
+// flow's whole definition crossing the wire.
+type flowSummary struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"displayName"`
+	Description string `json:"description"`
+}
+
+// handleFlows routes POST (save a named flow) and GET (list flows,
+// metadata-only) at /flows. POST runs the gate (flowvalidate against the
+// current piece registry) inside flowStore.Save; a validation failure is a
+// 400 with the store's already-descriptive error. GET never returns the
+// FlowVersion — only the three metadata fields.
+func (s *Server) handleFlows(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		var def flowstore.FlowDefinition
+		if err := json.NewDecoder(r.Body).Decode(&def); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		// flowStore is a GatedStore: Save runs flowvalidate.Validate against a
+		// fresh registry and rejects a flow that doesn't pass. Its returned
+		// error is already descriptive — do not rewrite it.
+		if err := s.flowStore.Save(def); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{"saved": true, "name": def.Name})
+
+	case http.MethodGet:
+		defs, err := s.flowStore.List()
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		summaries := make([]flowSummary, 0, len(defs))
+		for _, d := range defs {
+			summaries = append(summaries, flowSummary{
+				Name: d.Name, DisplayName: d.DisplayName, Description: d.Description,
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"flows": summaries})
+
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+	}
+}
+
+// handleFlowGet handles GET /flows/{name} — returns the full FlowDefinition
+// (with the FlowVersion inside). A missing name is 404, matching the
+// store's (zero, false, nil) contract.
+func (s *Server) handleFlowGet(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	def, ok, err := s.flowStore.Get(name)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, def)
+}
+
+// handleFlowDelete handles DELETE /flows/{name}. The store's ErrNotFound maps
+// to 404; any other error to 400. Success returns the name.
+func (s *Server) handleFlowDelete(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if err := s.flowStore.Delete(name); err != nil {
+		if err == flowstore.ErrNotFound {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "name": name})
+}
+
+// flowRunRequest is the body shape POST /flows/{name}/run expects. Both
+// fields are optional: an absent trigger is nil (fine for an EMPTY trigger
+// flow), and an absent executeTrigger defaults to false (pass the payload
+// straight through, matching the ad-hoc route's default).
+type flowRunRequest struct {
+	Trigger        any  `json:"trigger"`
+	ExecuteTrigger bool `json:"executeTrigger"`
+}
+
+// handleFlowRun handles POST /flows/{name}/run — fetch the saved flow by
+// name (404 if missing), then run exactly the same path as POST /flows/run:
+// re-validate against the current registry, and on success execute and
+// return the *model.ExecutionState.
+func (s *Server) handleFlowRun(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	def, ok, err := s.flowStore.Get(name)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	var req flowRunRequest
+	// A missing/empty body is fine — both fields are optional. Only a
+	// malformed JSON body is a 400.
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	s.runFlowVersion(w, &def.Flow, req.Trigger, req.ExecuteTrigger)
 }
 
 // credRequest is the body POST /credentials expects. Value is any JSON — a

@@ -12,6 +12,7 @@ import (
 
 	"goflow/pkg/catalog"
 	"goflow/pkg/credentials"
+	"goflow/pkg/flowstore"
 	"goflow/pkg/model"
 )
 
@@ -21,7 +22,9 @@ var testCredKey = []byte("0123456789abcdef0123456789abcdef") // 32 bytes
 
 // newTestServer wires a real FileStore in a temp dir (no interface mocks)
 // behind a GatedStore, exactly like cmd/server does in production. It also
-// wires a real credentials.FileStore in its own temp dir.
+// wires a real credentials.FileStore in its own temp dir and a real
+// flowstore.FileStore in its own temp dir (passed raw — NewServer gates it
+// internally, same as cmd/server).
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	fs, err := catalog.NewFileStore(t.TempDir())
@@ -32,7 +35,11 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatalf("credentials.NewFileStore: %v", err)
 	}
-	return NewServer(&catalog.GatedStore{Underlying: fs}, credStore, "secret-token")
+	flowStore, err := flowstore.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("flowstore.NewFileStore: %v", err)
+	}
+	return NewServer(&catalog.GatedStore{Underlying: fs}, credStore, flowStore, "secret-token")
 }
 
 // credDir returns the on-disk directory backing the server's credentials
@@ -420,5 +427,190 @@ func TestPostCredentials_InvalidName_400NothingWritten(t *testing.T) {
 		if strings.HasSuffix(e.Name(), ".enc") {
 			t.Fatalf("unexpected credential file written: %s", e.Name())
 		}
+	}
+}
+
+// --- named flows (pkg/flowstore over HTTP) ---------------------------------
+
+// validFlowDef is a FlowDefinition wrapping the no-piece double-it flow —
+// the same shape POST /flows/run already accepts inline, now with a name.
+func validFlowDef(name string) flowstore.FlowDefinition {
+	return flowstore.FlowDefinition{
+		Name:        name,
+		DisplayName: "Double It",
+		Description: "doubles n",
+		InputSchema: "n (number, required)",
+		Flow: model.FlowVersion{
+			ID: "fv-test",
+			Trigger: &model.FlowTrigger{
+				Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+				NextAction: &model.FlowAction{
+					Name: "double", DisplayName: "Double", Type: model.ActionCode,
+					Code: &model.CodeSettings{
+						Input:  map[string]any{"n": 21},
+						Source: `(params) => ({ doubled: params.n * 2 })`,
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestPostFlows_NoAuth_401(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "POST", "/flows", validFlowDef("x"), false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPostFlows_ReferencesNonexistentPiece_400NotPersisted(t *testing.T) {
+	srv := newTestServer(t)
+	def := flowstore.FlowDefinition{
+		Name: "badflow", DisplayName: "Bad",
+		Flow: model.FlowVersion{
+			ID: "fv-bad",
+			Trigger: &model.FlowTrigger{
+				Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+				NextAction: &model.FlowAction{
+					Name: "badstep", DisplayName: "Bad", Type: model.ActionPiece,
+					Piece: &model.PieceSettings{PieceName: "no_such_piece", ActionName: "no_such_action"},
+				},
+			},
+		},
+	}
+	rec := do(t, srv, "POST", "/flows", def, true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	// The rejection error mentions validation failure.
+	if !strings.Contains(rec.Body.String(), "failed validation") {
+		t.Fatalf("body = %s, want a 'failed validation' error", rec.Body.String())
+	}
+	// Confirm it was NOT persisted: GET /flows/badflow -> 404.
+	rec = do(t, srv, "GET", "/flows/badflow", nil, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET after rejected save: status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPostFlows_Valid_201ListedMetadataOnly_GetFull(t *testing.T) {
+	srv := newTestServer(t)
+	def := validFlowDef("double-it")
+	rec := do(t, srv, "POST", "/flows", def, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	if m["saved"] != true || m["name"] != "double-it" {
+		t.Fatalf("body = %v, want saved=true name=double-it", m)
+	}
+
+	// GET /flows lists it metadata-only: name/displayName/description, and
+	// MUST NOT carry the full FlowVersion (no "Flow", no action name
+	// "double", no "Source").
+	rec = do(t, srv, "GET", "/flows", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list: status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"name":"double-it"`) {
+		t.Fatalf("list body missing name: %s", body)
+	}
+	if !strings.Contains(body, `"displayName":"Double It"`) {
+		t.Fatalf("list body missing displayName: %s", body)
+	}
+	if !strings.Contains(body, `"description":"doubles n"`) {
+		t.Fatalf("list body missing description: %s", body)
+	}
+	for _, leak := range []string{`"Flow"`, `"double"`, `"Source"`, `"doubled"`} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("list body leaks the full FlowVersion (%s): %s", leak, body)
+		}
+	}
+
+	// GET /flows/double-it returns the FULL definition, Flow included.
+	rec = do(t, srv, "GET", "/flows/double-it", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	full := decode(t, rec)
+	flow, ok := full["Flow"].(map[string]any)
+	if !ok {
+		t.Fatalf("get body missing Flow: %v", full)
+	}
+	trigger, _ := flow["trigger"].(map[string]any)
+	if trigger["type"] != string(model.TriggerEmpty) {
+		t.Fatalf("Flow.trigger.type = %v, want EMPTY", trigger["type"])
+	}
+}
+
+func TestDeleteFlow_ExistingThenGone_Missing404(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", validFlowDef("killme"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+	rec := do(t, srv, "DELETE", "/flows/killme", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	if m["deleted"] != true || m["name"] != "killme" {
+		t.Fatalf("body = %v, want deleted=true name=killme", m)
+	}
+	// A subsequent GET is 404.
+	rec = do(t, srv, "GET", "/flows/killme", nil, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("get after delete: status = %d, want 404", rec.Code)
+	}
+	// Deleting a name that was never saved is 404, not 400.
+	rec = do(t, srv, "DELETE", "/flows/nope", nil, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("delete missing: status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+	m = decode(t, rec)
+	if m["error"] != "not found" {
+		t.Fatalf("body = %v, want error=not found", m)
+	}
+}
+
+func TestPostFlowRun_ByName_Succeeds(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", validFlowDef("double-it"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+	rec := do(t, srv, "POST", "/flows/double-it/run", flowRunRequest{}, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var state map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &state); err != nil {
+		t.Fatalf("decode state: %v; body=%s", err, rec.Body.String())
+	}
+	verdict, _ := state["Verdict"].(map[string]any)
+	if verdict["Status"] != string(model.FlowRunSucceeded) {
+		t.Fatalf("Verdict.Status = %v, want SUCCEEDED; body=%s", verdict["Status"], rec.Body.String())
+	}
+	steps, _ := state["Steps"].(map[string]any)
+	double, _ := steps["double"].(map[string]any)
+	if double["Status"] != string(model.StepSucceeded) {
+		t.Fatalf("double step status = %v, want SUCCEEDED", double["Status"])
+	}
+	output, _ := double["Output"].(map[string]any)
+	doubled, _ := output["doubled"].(float64)
+	if doubled != 42 {
+		t.Fatalf("doubled = %v, want 42; output=%#v", output["doubled"], output)
+	}
+}
+
+func TestPostFlowRun_UnknownName_404(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "POST", "/flows/never-saved/run", flowRunRequest{}, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	if m["error"] != "not found" {
+		t.Fatalf("body = %v, want error=not found", m)
 	}
 }
