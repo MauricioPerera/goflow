@@ -652,6 +652,40 @@ below for what a Go rewrite gets and gives up.
   worth checking against a CSP-restricted deployment target); an async
   (Promise-returning) `CODE` step is rejected, matching `pkg/sandbox.Run`'s
   synchronous-only rule exactly.
+- **Run a single fixed flow on AWS Lambda** (`cmd/lambda`): a second,
+  much narrower deployment target than `cmd/server`, built after
+  confirming the *whole server* doesn't actually work on Lambda — its
+  four Store-backed pieces (catalog/flowstore/credentials/runstore) are
+  all local-`FileStore`, which don't survive Lambda's many parallel,
+  ephemeral execution environments; `pkg/oauth`'s state is in-memory only
+  (its own doc comment says so); and `pkg/scheduler` needs a continuously
+  running process, which Lambda's freeze-between-invocations model
+  doesn't give it. `cmd/lambda` sidesteps all four instead of fixing
+  them: the one flow it runs is embedded in the binary at BUILD time
+  (`cmd/lambda/flow.json`, via `go:embed`) rather than loaded from a
+  Store at runtime, so there's no persistence for a cold/parallel
+  instance to ever disagree about, and no runtime flow-authoring surface
+  for OAuth or a scheduler to need to gate or drive. It calls
+  `pkg/engine.ExecuteBegin` directly — no HTTP, no MCP — with the Lambda
+  invocation event decoded as the trigger payload, and returns the full
+  `*model.ExecutionState` as the response, the same "arbitrary JSON in,
+  full ExecutionState out" contract `POST /flows/run` and
+  `goflow_run_flow` already share. Because it runs the real engine (not
+  a re-hosted subset like `pkg/exportjs`), it supports the full action
+  set — `ROUTER`, `LOOP_ON_ITEMS`, real `PIECE` actions — not just a
+  linear `CODE` chain. The registry is built from only `pkg/pieces.All()`
+  (the built-in Go pieces), the same two-line construction
+  `pkg/catalog.BuildRegistry` uses for its own built-in half, just
+  without a Store to layer anything else on top of; a `PIECE` action
+  needing a real secret must have it baked into `flow.json` directly,
+  since `pkg/engine` has no concept of a `$credential` marker at all —
+  that substitution is `pkg/flowstore`'s job, sitting above the engine on
+  every other transport, and there is no `pkg/flowstore` in this path.
+  Deploying a different flow means replacing `flow.json` and rebuilding.
+  This is the one new dependency in the project beyond
+  `github.com/dop251/goja`: `github.com/aws/aws-lambda-go`, to receive
+  invocations the way AWS actually documents and maintains, rather than
+  hand-rolling a client against the Lambda Runtime API.
 
 ## Explicitly NOT in v1
 

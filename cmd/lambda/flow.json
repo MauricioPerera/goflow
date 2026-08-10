@@ -1,0 +1,17 @@
+{
+  "id": "fv-lambda-demo",
+  "trigger": {
+    "name": "trigger_1",
+    "displayName": "Trigger",
+    "type": "EMPTY",
+    "nextAction": {
+      "name": "double",
+      "displayName": "Double",
+      "type": "CODE",
+      "code": {
+        "input": { "n": "{{ trigger_1.output.n }}" },
+        "source": "(params) => ({ doubled: params.n * 2 })"
+      }
+    }
+  }
+}
