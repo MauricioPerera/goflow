@@ -880,3 +880,83 @@ func TestCatalog_JSPieceComposesWithRealCatalog(t *testing.T) {
 		t.Fatalf("stored file = %q, ok=%v, want %q", stored, ok, reportText)
 	}
 }
+
+// TestCatalog_JSTriggerComposesWithRealCatalog proves a JS-authored
+// TRIGGER (jspiece.NewTrigger) works as a real flow's entry point,
+// registered alongside the full Go catalog, feeding real catalog pieces
+// through {{ }} templating exactly like pkg/pieces/webhook's Go trigger
+// does elsewhere in this file.
+//
+// Real, worth-stating limitation confirmed by reading Engine.ExecuteBegin
+// itself: it constructs the trigger's piece.TriggerContext as
+// {Payload, Input} only — Store is never set. A JS trigger's ctx.store is
+// therefore always unavailable when invoked THIS way; the polling-cursor
+// pattern (see pkg/jspiece's own TestJSTrigger_PollingCursorFiltersOnlyNewItems)
+// only works when something else calls trig.Run() directly and reuses one
+// Store across repeated calls itself — matching piece.MemoryStore's own
+// doc comment about simulating a polling scheduler. This trigger is
+// deliberately Store-free to stay within what ExecuteBegin actually
+// supports.
+func TestCatalog_JSTriggerComposesWithRealCatalog(t *testing.T) {
+	registry := piece.NewRegistry()
+	if err := pieces.RegisterAll(registry); err != nil {
+		t.Fatalf("RegisterAll: %v", err)
+	}
+
+	orderTrigger := piece.Piece{
+		Name: "order_trigger", DisplayName: "Order Trigger",
+		Triggers: map[string]piece.Trigger{
+			"new_orders": jspiece.NewTrigger(jspiece.TriggerSource{
+				Name: "new_orders", DisplayName: "New Orders",
+				Source: `(ctx) => ctx.payload.map(item => ({
+					id: item.id, amount: item.amount, source: "js-trigger"
+				}))`,
+			}),
+		},
+	}
+	if err := registry.RegisterValidated(orderTrigger); err != nil {
+		t.Fatalf("RegisterValidated: %v", err)
+	}
+
+	reportStep := &model.FlowAction{
+		Name: "report", DisplayName: "Report", Type: model.ActionPiece,
+		Piece: &model.PieceSettings{PieceName: "json", ActionName: "stringify", Input: map[string]any{
+			"data": map[string]any{
+				"id":     "{{ trigger_1.output.id }}",
+				"source": "{{ trigger_1.output.source }}",
+			},
+		}},
+	}
+	fv := &model.FlowVersion{ID: "fv-catalog-js-trigger", Trigger: &model.FlowTrigger{
+		Name: "trigger_1", DisplayName: "New Orders", Type: model.TriggerPiece,
+		PieceName: "order_trigger", TriggerName: "new_orders", Input: map[string]any{},
+		NextAction: reportStep,
+	}}
+
+	payload := []any{
+		map[string]any{"id": int64(1), "amount": int64(100)},
+		map[string]any{"id": int64(2), "amount": int64(250)},
+	}
+	state := engine.New(registry).ExecuteBegin(fv, engine.BeginInput{
+		TriggerPayload: payload,
+		ExecuteTrigger: true,
+	})
+
+	if state.Verdict.Status != model.FlowRunSucceeded {
+		t.Fatalf("verdict = %+v", state.Verdict)
+	}
+
+	// ExecuteBegin only ever uses items[0] of what a PIECE trigger
+	// returns — confirmed by reading engine.go before relying on it, not
+	// assumed. The second payload item is never seen by this flow run.
+	triggerOut := state.Steps["trigger_1"].Output.(map[string]any)
+	if triggerOut["id"] != int64(1) || triggerOut["source"] != "js-trigger" {
+		t.Fatalf("trigger_1 output = %+v, want the FIRST mapped item", triggerOut)
+	}
+
+	reportOut := state.Steps["report"].Output.(map[string]any)
+	reportText, _ := reportOut["text"].(string)
+	if reportText != `{"id":1,"source":"js-trigger"}` {
+		t.Fatalf("report text = %q", reportText)
+	}
+}

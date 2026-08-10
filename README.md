@@ -54,10 +54,17 @@ below for what a Go rewrite gets and gives up.
   tradeoff). A 5s execution deadline (`goja.Runtime.Interrupt`, via
   `jspiece.DefaultTimeout`) bounds a runaway/infinite-loop action — CODE
   steps have no such limit, but that's human-reviewed code; a JS piece is
-  explicitly meant for code an agent generates with no review gate. Scope
-  is ACTIONS only for now (no JS triggers, no JS `Dropdowns`). Persistence
-  — where a JS piece's source lives and how it survives a restart — is now
-  `pkg/catalog` (below), not this package.
+  explicitly meant for code an agent generates with no review gate.
+  `jspiece.NewTrigger` does the same for `piece.Trigger`: `(ctx) => value`
+  must return an ARRAY (rejected clearly otherwise), `ctx` exposes
+  `ctx.payload`, `ctx.input`, and `ctx.store.get(key)`/`put(key, value)`
+  bound to the real `piece.Store` the caller supplied — nil-guarded the
+  same way `ctx.files`/`ctx.run` are, since `Engine.ExecuteBegin` never
+  actually supplies one (confirmed by reading it, not assumed — see
+  "Design decisions"). No JS `Dropdowns` yet. Persistence — where a JS
+  piece's source lives and how it survives a restart — is
+  `pkg/catalog` (below), not this package, and only covers actions so far
+  (`catalog.Definition` has no trigger equivalent yet).
 - **Piece catalog persistence & discovery** (`pkg/catalog`): Phase 3 of the
   "AI-first" direction, closing the gap Phase 2 explicitly left open —
   `jspiece.New` builds a piece purely in memory, so a piece an agent
@@ -1035,3 +1042,27 @@ go run ./examples
   each one's own "goes through the same path as any other piece/flow" design
   choice is what made this work rather than needing a fifth, glue-specific
   mechanism.
+- **JS triggers (`jspiece.NewTrigger`) found the same class of gap the
+  adversarial battery already found for actions — checked for directly
+  rather than assumed fixed by analogy.** Read `Engine.ExecuteBegin`
+  before writing `buildTriggerContext`: it constructs a PIECE trigger's
+  `piece.TriggerContext` as `{Payload, Input}` only —
+  `Store` is never set, meaning `ctx.store` is always unavailable for a
+  trigger invoked through a real flow run. Guarded `ctx.store.get`/`put`
+  against a nil `Store` the same way `ctx.files`/`ctx.run` already are for
+  actions (same fix, same reasoning — a real trigger built this way could
+  otherwise panic with an uncaught nil-pointer dereference).
+  `TestJSTrigger_StoreUnavailableFailsClearlyNotPanic` covers it directly.
+  The polling-cursor pattern (`ctx.store.get("lastId")`, filter, advance)
+  still works and is genuinely useful — just only when a caller invokes
+  `trig.Run()` directly and reuses one `Store` across repeated calls
+  itself (`TestJSTrigger_PollingCursorFiltersOnlyNewItems`), matching
+  `piece.MemoryStore`'s own doc comment about simulating a polling
+  scheduler — not when driven through `ExecuteBegin`.
+  `TestCatalog_JSTriggerComposesWithRealCatalog`
+  (`pkg/pieces/integration_test.go`) proves a JS trigger works as a real
+  flow's entry point registered alongside the full Go catalog, and
+  confirms (by asserting on it directly, not assuming) that
+  `ExecuteBegin` only ever uses `items[0]` of what a PIECE trigger
+  returns — a second/third item in the array is never seen by that flow
+  run, matching what reading `engine.go` already showed.

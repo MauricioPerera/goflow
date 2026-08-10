@@ -1,19 +1,19 @@
-// Package jspiece lets a piece.Action be authored as JS source instead of
-// Go code — Phase 2 of the "AI-first" direction started by
-// model.ParseFlowVersion (Phase 1: flows as JSON data): the point of this
-// package is that an agent can produce a genuinely new, reusable catalog
-// piece and use it immediately, with no Go recompile. New builds a real
-// piece.Piece that goes through the exact same piece.Validate/
-// RegisterValidated path as any hand-written Go piece — the engine cannot
-// tell the difference.
+// Package jspiece lets a piece.Action or piece.Trigger be authored as JS
+// source instead of Go code — Phase 2 of the "AI-first" direction started
+// by model.ParseFlowVersion (Phase 1: flows as JSON data): the point of
+// this package is that an agent can produce a genuinely new, reusable
+// catalog piece and use it immediately, with no Go recompile. New/NewAction
+// build a real piece.Piece/piece.Action that goes through the exact same
+// piece.Validate/RegisterValidated path as any hand-written Go piece — the
+// engine cannot tell the difference. NewTrigger does the same for
+// piece.Trigger.
 //
-// Scope, deliberately: ACTIONS only (no JS triggers yet — same pattern,
-// not built), no Dropdowns for JS actions yet, and this package does not
-// solve where the JS source text comes from or how it survives a process
-// restart (no persistence, matching this whole project's "no
-// persistence" boundary — see README's "Explicitly NOT in v1"). What's
-// proven here is narrower and load-bearing: given JS source text from
-// anywhere, the engine can run it as a first-class piece.
+// Scope, deliberately: no Dropdowns for JS actions yet, and this package
+// does not solve where the JS source text comes from or how it survives a
+// process restart (no persistence — see pkg/catalog, which does, though
+// only for actions so far; catalog.Definition has no trigger equivalent
+// yet). What's proven here is narrower and load-bearing: given JS source
+// text from anywhere, the engine can run it as a first-class piece.
 package jspiece
 
 import (
@@ -88,12 +88,55 @@ func NewAction(src ActionSource) piece.Action {
 	return piece.Action{
 		Name: src.Name, DisplayName: src.DisplayName,
 		Run: func(ctx piece.ActionContext) (any, error) {
-			return runJS(src.Source, ctx)
+			return compileAndRun(src.Source, buildContext(ctx))
 		},
 	}
 }
 
-func runJS(source string, ctx piece.ActionContext) (any, error) {
+// TriggerSource is one JS-authored trigger.
+type TriggerSource struct {
+	Name, DisplayName string
+
+	// Source must evaluate to a JS function `(ctx) => value` returning an
+	// ARRAY of items — piece.Trigger.Run's []any, exactly as a Go trigger
+	// would return it (e.g. pkg/pieces/webhook's catch_hook returns a
+	// single-element array). Synchronous only, same rule and reason as
+	// ActionSource.Source.
+	//
+	// ctx exposes: ctx.payload (the raw trigger payload), ctx.input (the
+	// trigger's resolved Input map), and ctx.store.get(key)/put(key,
+	// value) bound to the real piece.Store the caller supplied — nil
+	// unless one was, same as piece.TriggerContext.Store itself; a
+	// polling trigger uses this to remember a cursor across separate
+	// invocations, the same job pkg/engine's own hand-rolled polling
+	// trigger tests use a Store for.
+	Source string
+}
+
+// NewTrigger builds a single JS-backed piece.Trigger.
+func NewTrigger(src TriggerSource) piece.Trigger {
+	return piece.Trigger{
+		Name: src.Name, DisplayName: src.DisplayName,
+		Run: func(ctx piece.TriggerContext) ([]any, error) {
+			exported, err := compileAndRun(src.Source, buildTriggerContext(ctx))
+			if err != nil {
+				return nil, err
+			}
+			items, ok := exported.([]any)
+			if !ok {
+				return nil, fmt.Errorf("jspiece: trigger must return an array, got %T", exported)
+			}
+			return items, nil
+		},
+	}
+}
+
+// compileAndRun is the shared core for both NewAction and NewTrigger:
+// parse source as `(source)`, confirm it's a function, invoke it with
+// jsCtx as its sole argument under DefaultTimeout, and return its
+// exported Go value. Callers interpret the returned value differently
+// (an action's is passed through as-is; a trigger's must be a []any).
+func compileAndRun(source string, jsCtx map[string]any) (any, error) {
 	vm := goja.New()
 
 	fnValue, err := vm.RunString("(" + source + ")")
@@ -104,8 +147,6 @@ func runJS(source string, ctx piece.ActionContext) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("jspiece: source must evaluate to a function, got %s", fnValue.ExportType())
 	}
-
-	jsCtx := buildContext(ctx)
 
 	timer := time.AfterFunc(DefaultTimeout, func() {
 		vm.Interrupt("jspiece: execution timed out")
@@ -125,9 +166,34 @@ func runJS(source string, ctx piece.ActionContext) (any, error) {
 
 	exported := result.Export()
 	if _, ok := exported.(*goja.Promise); ok {
-		return nil, fmt.Errorf("jspiece: action returned a Promise — async/await is not supported, return a value synchronously")
+		return nil, fmt.Errorf("jspiece: returned a Promise — async/await is not supported, return a value synchronously")
 	}
 	return exported, nil
+}
+
+// buildTriggerContext assembles the JS-facing ctx object for one trigger
+// Run call — see TriggerSource.Source's doc comment for what it exposes.
+func buildTriggerContext(ctx piece.TriggerContext) map[string]any {
+	return map[string]any{
+		"payload": ctx.Payload,
+		"input":   ctx.Input,
+		"store": map[string]any{
+			"get": func(key string) (any, error) {
+				if ctx.Store == nil {
+					return nil, fmt.Errorf("ctx.store is not available in this execution context")
+				}
+				v, _ := ctx.Store.Get(key)
+				return v, nil
+			},
+			"put": func(key string, value any) error {
+				if ctx.Store == nil {
+					return fmt.Errorf("ctx.store is not available in this execution context")
+				}
+				ctx.Store.Put(key, value)
+				return nil
+			},
+		},
+	}
 }
 
 // buildContext assembles the JS-facing ctx object for one Run call. Bound
