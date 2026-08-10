@@ -526,7 +526,7 @@ below for what a Go rewrite gets and gives up.
   OAuth access token) already has that exact same access on every httpapi
   route today — there's no scopes/permissions concept anywhere in this
   project to make MCP meaningfully narrower, so none of this is a new
-  privilege, only new reachability. Twelve fixed tools are always present
+  privilege, only new reachability. Thirteen fixed tools are always present
   in `tools/list` alongside the per-flow ones, each with a real, precise
   `inputSchema` (unlike a per-flow tool's deliberately permissive one,
   since these have well-defined Go types behind them, not an untyped
@@ -557,9 +557,19 @@ below for what a Go rewrite gets and gives up.
     of this tier live: nothing, on ANY transport, could remove a catalog
     piece before this — `catalog.Store` itself had no `Delete` method at
     all, so `DELETE /pieces/{name}` is new over HTTP too, not just MCP.
+  - Neither, exactly: `goflow_run_flow` is the MCP equivalent of
+    `POST /flows/run` — runs a flow inline WITHOUT saving it, recorded in
+    `goflow_list_runs`/`GET /runs` with an empty flow name like any other
+    ad-hoc run. It has the same real side effects any flow run can (a
+    PIECE action can call a real API, use a credential, ...) but persists
+    nothing of its own, so it doesn't fit either tier above cleanly — it
+    closes the one asymmetry left after the rest of this tier shipped: an
+    MCP-only client could save/delete/run a *named* flow but had no way to
+    try an inline one first, the way an HTTP caller already could before
+    ever committing to `goflow_save_flow`.
 
   A saved flow (or, symmetrically, a credential name) that collides with
-  one of the twelve reserved names is excluded from `tools/list` — not
+  one of the thirteen reserved names is excluded from `tools/list` — not
   deleted, not un-runnable/un-referenceable by name over HTTP — just
   shadowed in this one listing, and `tools/call` resolves that name to the
   fixed tool the same way, so the two methods never disagree about what a

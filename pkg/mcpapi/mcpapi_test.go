@@ -1111,3 +1111,108 @@ func TestDeletePiece_MissingNameArgument_IsErrorTrue(t *testing.T) {
 		t.Fatalf("isError = %v, want true when name is missing", result["isError"])
 	}
 }
+
+// --- goflow_run_flow --------------------------------------------------------
+
+func TestRunFlow_SucceedsWithoutPersisting(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolRunFlow, map[string]any{
+		"flow": flowVersionJSON(), "trigger": map[string]any{"n": 6},
+	})
+	if result["isError"] != false {
+		t.Fatalf("isError = %v, want false: %v", result["isError"], result)
+	}
+	var state map[string]any
+	toolText(t, result, &state)
+	steps, _ := state["Steps"].(map[string]any)
+	double, _ := steps["double"].(map[string]any)
+	output, _ := double["Output"].(map[string]any)
+	if output["doubled"] != float64(12) {
+		t.Fatalf("output = %v, want doubled:12", output)
+	}
+
+	// The whole point: it must NOT show up as a saved flow.
+	listResult := callTool(t, h, toolListFlows, nil)
+	var body struct {
+		Flows []map[string]any `json:"flows"`
+	}
+	toolText(t, listResult, &body)
+	if len(body.Flows) != 0 {
+		t.Fatalf("goflow_list_flows after goflow_run_flow = %+v, want empty — nothing should have been persisted", body.Flows)
+	}
+}
+
+func TestRunFlow_RecordedInHistoryWithEmptyFlowName(t *testing.T) {
+	h, hist := newHandlerWithFlowsAndHistory(t)
+	if result := callTool(t, h, toolRunFlow, map[string]any{"flow": flowVersionJSON(), "trigger": map[string]any{"n": 1}}); result["isError"] != false {
+		t.Fatalf("isError = %v, want false: %v", result["isError"], result)
+	}
+	summaries, err := hist.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("List() = %+v, want exactly 1 recorded run", summaries)
+	}
+	if summaries[0].FlowName != "" {
+		t.Fatalf("recorded FlowName = %q, want \"\" (ad-hoc, same as POST /flows/run)", summaries[0].FlowName)
+	}
+}
+
+func TestRunFlow_ReferencesMissingPiece_IsErrorTrue(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	badFlow := map[string]any{
+		"id": "fv-bad",
+		"trigger": map[string]any{
+			"name": "trigger_1", "displayName": "Trigger", "type": "EMPTY",
+			"nextAction": map[string]any{
+				"name": "badstep", "displayName": "Bad", "type": "PIECE",
+				"piece": map[string]any{"pieceName": "no_such_piece", "actionName": "no_such_action"},
+			},
+		},
+	}
+	result := callTool(t, h, toolRunFlow, map[string]any{"flow": badFlow})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true — the flow references a piece missing from the registry", result["isError"])
+	}
+}
+
+func TestRunFlow_CredentialResolvedAndRedacted(t *testing.T) {
+	h, credStore := newHandlerWithFlowsAndCreds(t)
+	if err := credStore.Save("api-key", "sk-live-secret"); err != nil {
+		t.Fatalf("credStore.Save: %v", err)
+	}
+	credFlow := map[string]any{
+		"id": "fv-cred",
+		"trigger": map[string]any{
+			"name": "trigger_1", "displayName": "Trigger", "type": "EMPTY",
+			"nextAction": map[string]any{
+				"name": "use_cred", "displayName": "Use Cred", "type": "CODE",
+				"code": map[string]any{
+					"input":  map[string]any{"auth": map[string]any{"$credential": "api-key"}},
+					"source": "(params) => ({ authLen: params.auth.length })",
+				},
+			},
+		},
+	}
+	result := callTool(t, h, toolRunFlow, map[string]any{"flow": credFlow})
+	if result["isError"] != false {
+		t.Fatalf("isError = %v, want false: %v", result["isError"], result)
+	}
+	var state map[string]any
+	toolText(t, result, &state)
+	steps, _ := state["Steps"].(map[string]any)
+	step, _ := steps["use_cred"].(map[string]any)
+	input, _ := step["Input"].(map[string]any)
+	if input["auth"] != "<credential:api-key>" {
+		t.Fatalf(`Input["auth"] = %v, want the redaction placeholder — the raw secret must never reach the tool result`, input["auth"])
+	}
+}
+
+func TestRunFlow_InvalidFlowArgument_IsErrorTrue(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolRunFlow, map[string]any{"flow": "not an object"})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true when \"flow\" isn't a valid flow object", result["isError"])
+	}
+}

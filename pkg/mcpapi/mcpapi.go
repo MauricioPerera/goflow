@@ -27,7 +27,14 @@
 // POST/GET/DELETE /credentials already allow over HTTP, through the exact
 // same underlying Store calls (including catalog.GatedStore's and
 // flowstore.GatedStore's validation gates — a tool call can't bypass
-// either), just reachable without HTTP.
+// either), just reachable without HTTP. goflow_run_flow fits neither tier
+// cleanly — it has the same real side effects any flow run can (a PIECE
+// action can call a real API, use a credential, ...) but persists nothing
+// of its own — so it's described on its own terms: the MCP equivalent of
+// POST /flows/run, closing the one asymmetry left after the rest of this
+// tier shipped — an MCP-only client could save/delete/run a NAMED flow but
+// had no way to try an inline one first, the way POST /flows/run already
+// lets an HTTP caller do before ever committing to goflow_save_flow.
 //
 // Everything here is encoding/json + net/http — JSON-RPC 2.0 is simple enough
 // that pulling in a library would add a dependency for nothing, matching the
@@ -43,6 +50,7 @@ import (
 	"goflow/pkg/catalog"
 	"goflow/pkg/credentials"
 	"goflow/pkg/flowstore"
+	"goflow/pkg/flowvalidate"
 	"goflow/pkg/model"
 	"goflow/pkg/piece"
 	"goflow/pkg/pieces"
@@ -108,6 +116,7 @@ const (
 
 	toolSaveFlow         = "goflow_save_flow"
 	toolDeleteFlow       = "goflow_delete_flow"
+	toolRunFlow          = "goflow_run_flow"
 	toolSavePiece        = "goflow_save_piece"
 	toolDeletePiece      = "goflow_delete_piece"
 	toolListCredentials  = "goflow_list_credentials"
@@ -124,6 +133,7 @@ var reservedToolNames = map[string]bool{
 
 	toolSaveFlow:         true,
 	toolDeleteFlow:       true,
+	toolRunFlow:          true,
 	toolSavePiece:        true,
 	toolDeletePiece:      true,
 	toolListCredentials:  true,
@@ -204,6 +214,19 @@ func metaToolDescriptors() []map[string]any {
 				"type":       "object",
 				"properties": map[string]any{"name": map[string]any{"type": "string"}},
 				"required":   []string{"name"},
+			},
+		},
+		{
+			"name":        toolRunFlow,
+			"description": "Run a flow WITHOUT saving it — the MCP equivalent of POST /flows/run. Useful for trying a flow definition before committing to goflow_save_flow (or for a one-off run with no reason to ever be saved). Validated against the current piece registry before running, exactly like any other run, and recorded in goflow_list_runs/goflow_get_run the same way (with an empty flow name, since it was never named). The \"flow\" argument's shape is not constrained by this schema — see goflow_save_flow's own description for where to find it.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"flow":           map[string]any{"type": "object", "description": "the trigger + action graph to run"},
+					"trigger":        map[string]any{"description": "the trigger payload"},
+					"executeTrigger": map[string]any{"type": "boolean", "description": "if true and the flow's trigger is a real (non-EMPTY) piece trigger, actually invoke its Run hook instead of passing \"trigger\" straight through as the trigger step's output — same default (false) as POST /flows/run"},
+				},
+				"required": []string{"flow"},
 			},
 		},
 		{
@@ -767,6 +790,9 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 	case toolDeleteFlow:
 		h.callDeleteFlow(w, req, params.Arguments)
 		return
+	case toolRunFlow:
+		h.callRunFlow(w, req, params.Arguments)
+		return
 	case toolSavePiece:
 		h.callSavePiece(w, req, params.Arguments)
 		return
@@ -795,33 +821,52 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 	}
 
 	state, validationErrs, runErr := flowstore.RunWithHistory(&def.Flow, h.BuildRegistry, h.CredStore, h.HistoryStore, def.Name, params.Arguments, false)
+	writeFlowRunResult(w, req.ID, state, validationErrs, runErr)
+}
+
+// writeFlowRunResult translates flowstore.RunWithHistory's three return
+// values into the tools/call wire shape — shared by running a saved flow by
+// name (above) and running an ad-hoc one (callRunFlow, below), so the two
+// can't drift on what "a flow ran" looks like over MCP, the same "one
+// shared path" reasoning pkg/flowstore itself already applies to
+// RunWithHistory being the single thing every transport calls.
+//   - runErr != nil (buildRegistry failed): a JSON-RPC -32603 internal
+//     error — a server fault, not a tool failure.
+//   - validationErrs non-empty: a tool RESULT with isError:true — the flow
+//     itself is broken, not a protocol error.
+//   - state non-nil: a tool RESULT whose content is the full
+//     ExecutionState as indented JSON, isError set by whether the run
+//     succeeded.
+func writeFlowRunResult(w http.ResponseWriter, id *json.RawMessage, state *model.ExecutionState, validationErrs []flowvalidate.ValidationError, runErr error) {
 	if runErr != nil {
-		writeError(w, req.ID, -32603, "internal error: "+runErr.Error())
+		writeError(w, id, -32603, "internal error: "+runErr.Error())
 		return
 	}
 	if len(validationErrs) > 0 {
-		writeResult(w, req.ID, map[string]any{
-			"content": []map[string]any{{
-				"type": "text",
-				"text": flowstore.FormatValidationErrors(validationErrs),
-			}},
-			"isError": true,
-		})
+		writeToolText(w, id, true, flowstore.FormatValidationErrors(validationErrs))
 		return
 	}
+	writeToolText(w, id, state.Verdict.Status != model.FlowRunSucceeded, state)
+}
 
-	stateJSON, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		writeError(w, req.ID, -32603, "internal error: "+err.Error())
+// callRunFlow runs fv (decoded from args) WITHOUT saving it — the MCP
+// equivalent of POST /flows/run, and the one asymmetry left after the rest
+// of this tier shipped: an MCP-only client could save/delete/run a NAMED
+// flow but had no way to try an inline one first. Recorded in
+// goflow_list_runs/goflow_get_run with an empty flow name, same as
+// POST /flows/run's ad-hoc runs are in GET /runs.
+func (h *Handler) callRunFlow(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	var body struct {
+		Flow           model.FlowVersion `json:"flow"`
+		Trigger        any               `json:"trigger"`
+		ExecuteTrigger bool              `json:"executeTrigger"`
+	}
+	if err := decodeArgs(args, &body); err != nil {
+		writeToolText(w, req.ID, true, "invalid arguments: "+err.Error())
 		return
 	}
-	writeResult(w, req.ID, map[string]any{
-		"content": []map[string]any{{
-			"type": "text",
-			"text": string(stateJSON),
-		}},
-		"isError": state.Verdict.Status != model.FlowRunSucceeded,
-	})
+	state, validationErrs, runErr := flowstore.RunWithHistory(&body.Flow, h.BuildRegistry, h.CredStore, h.HistoryStore, "", body.Trigger, body.ExecuteTrigger)
+	writeFlowRunResult(w, req.ID, state, validationErrs, runErr)
 }
 
 // writeResult sends a JSON-RPC success response: {"jsonrpc":"2.0","id":<id>,
