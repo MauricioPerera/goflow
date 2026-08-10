@@ -194,7 +194,16 @@ below for what a Go rewrite gets and gives up.
   needs to return only new items each time it's invoked. `piece.ScopedStore`
   namespaces a shared backend per flow (`'flow_'+flowID+'/'+key`), so
   multiple flows using the same trigger don't clash over the same cursor
-  key. There's no
+  key. `ActionContext.Store` is the action-side counterpart, added later to
+  close a gap TICKETS.md documented as open ("a `Store`-using action piece"
+  wasn't possible — `ActionContext` had no `Store` field at all): unlike
+  `TriggerContext.Store`, which `Engine.ExecuteBegin` never populates (a
+  trigger's cross-poll memory is an external scheduler's job, outside this
+  project), `*Engine` DOES wire this one in — `Engine.Store`, defaulting to
+  a fresh `MemoryStore` in `New()` — for every PIECE action it runs, through
+  both `ExecuteBegin` and `ExecuteActionRun`, no caller wiring needed. Same
+  "one shared instance, wrap in `ScopedStore` or use one `Engine` per tenant
+  for isolation" convention as `Engine.Files`. There's no
   `TriggerStrategy` concept in the engine itself (see `Trigger`'s doc
   comment) since every strategy shares one `Run` signature and the engine
   never branches on which kind a trigger is. `RunHooks.Stop`/`Respond` let a
@@ -334,7 +343,11 @@ below for what a Go rewrite gets and gives up.
   `model.FlowVersion` in the request body, validated then executed, the
   full `*model.ExecutionState` as the response) — all gated by a single
   shared bearer token (`GOFLOW_API_TOKEN`, compared via
-  `crypto/subtle.ConstantTimeCompare`) except `/health`. `cmd/server/main.go`
+  `crypto/subtle.ConstantTimeCompare`) except `/health` and the
+  unauthenticated-by-necessity OAuth endpoints (`pkg/oauth`, below — they
+  ARE the mechanism a client without a token yet uses to get one). An
+  OAuth-issued access token is accepted everywhere the static token is,
+  through the same check. `cmd/server/main.go`
   refuses to start without the token configured — never boots an
   unauthenticated code-execution endpoint by accident. Deployed as a
   systemd service on a real VPS (binary cross-compiled
@@ -351,8 +364,9 @@ below for what a Go rewrite gets and gives up.
   HTTP route that returns a decrypted value, by design; `Store.Get` is for
   trusted Go callers only.
 - **Credential references inside a flow** (`flowstore.ResolveCredentials`/
-  `RedactCredentials`, wired in as `flowstore.RunWithCredentials`): the
-  reference mechanism the credential store above was missing. Any Input
+  `RedactCredentials`, wired in as `flowstore.RunWithCredentials` — itself
+  now wrapped by `flowstore.RunWithHistory`, see the run-history entry
+  below): the reference mechanism the credential store above was missing. Any Input
   value (trigger, PIECE, or CODE, any key) can be
   `{"$credential": "<name>"}` instead of a literal; `ResolveCredentials`
   substitutes the real decrypted value into a deep-enough COPY of the flow
@@ -364,9 +378,10 @@ below for what a Go rewrite gets and gives up.
   verbatim, and `POST /flows/run`, `POST /flows/{name}/run`, and MCP's
   `tools/call` all serialize that Input straight back in the response —
   without the redaction pass a resolved secret would leak into the
-  HTTP/MCP reply. All three run paths go through `RunWithCredentials` now,
-  not just `flowstore.Run` directly. A flow referencing a credential that
-  isn't stored fails as a validation error (400/`isError`), the same
+  HTTP/MCP reply. All three run paths go through `RunWithCredentials`
+  (via `RunWithHistory`) now, not just `flowstore.Run` directly. A flow
+  referencing a credential that isn't stored fails as a validation error
+  (400/`isError`), the same
   category as referencing a piece that doesn't exist — not a 500.
   Verified end-to-end over real HTTP and MCP with the raw response body
   searched for the literal secret (absent) alongside proof the real value
@@ -469,7 +484,8 @@ longer are, and should be stated plainly rather than left stale:
 
 - **"No server/API" is no longer true.** `pkg/httpapi` + `cmd/server` is a
   real HTTP server (`/health`, `/catalog`, `/pieces`, `/flows*`,
-  `/credentials*`, `/runs*`, `/mcp` — see "What's here" above), deployed and
+  `/credentials*`, `/runs*`, `/mcp`, `/oauth/*`, `/.well-known/oauth-*`
+  — see "What's here" above), deployed and
   running on a real VPS as a systemd service. "No auth" is also no longer true, but
   stays narrow: every non-public route requires either the single shared
   bearer token (constant-time compared) or an access token minted by
