@@ -12,6 +12,7 @@ import (
 
 	"goflow/pkg/piece"
 	"goflow/pkg/pieces/approval"
+	base64piece "goflow/pkg/pieces/base64"
 	cryptopiece "goflow/pkg/pieces/crypto"
 	csvpiece "goflow/pkg/pieces/csv"
 	"goflow/pkg/pieces/datetime"
@@ -22,6 +23,7 @@ import (
 	regexpiece "goflow/pkg/pieces/regex"
 	"goflow/pkg/pieces/storage"
 	"goflow/pkg/pieces/text"
+	"goflow/pkg/pieces/uuid"
 	"goflow/pkg/pieces/webhook"
 	"goflow/pkg/pieces/webhookreply"
 )
@@ -47,6 +49,8 @@ func All() []piece.Piece {
 		hashpiece.New(),
 		regexpiece.New(),
 		csvpiece.New(),
+		uuid.New(),
+		base64piece.New(),
 	}
 }
 

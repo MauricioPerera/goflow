@@ -154,7 +154,15 @@ below for what a Go rewrite gets and gives up.
   direct unit tests (`sandbox_test.go`) — try/catch/finally, nested
   try/catch, rethrow, custom `Error` subclasses — verifying goja's JS
   fidelity for error handling, not just exercised indirectly through
-  `pkg/engine`'s flow tests.
+  `pkg/engine`'s flow tests. A 5s execution deadline
+  (`sandbox.DefaultTimeout`, via the new `InterruptAfter` helper) bounds a
+  runaway/infinite-loop CODE step — added late, closing the same class of
+  gap `pkg/expr` and `pkg/jspiece` already had fixed: a CODE action's
+  `Source` can arrive as agent-authored JSON data (Phase 1) exactly like a
+  JS piece's or a template's, and `pkg/flowvalidate` only checks that it
+  *compiles*, never how it behaves at runtime. Same confirmed limitation
+  as the other two: a native built-in call already in progress isn't
+  preempted by the interrupt.
 - **`{{ }}` templating** (`pkg/expr`): also built on goja — the trimmed
   expression is evaluated as real JS rather than reimplementing a JS-expression
   subset by hand (activepieces itself does the latter, with `jsep`).
@@ -304,10 +312,16 @@ below for what a Go rewrite gets and gives up.
 
 ## Explicitly NOT in v1
 
-No server/API, no persistence, no auth, no UI, no piece marketplace, no
-streaming progress, no distributed workers. This is a library + example, the
-same scope as the activepieces TS extraction's `example-standalone.ts` — a
-proof the mechanism works, not a deployable product.
+No server/API, no auth, no UI, no piece marketplace, no streaming progress,
+no distributed workers. This is a library + example, the same scope as the
+activepieces TS extraction's `example-standalone.ts` — a proof the mechanism
+works, not a deployable product. One nuance on "no persistence": it is no
+longer true in general. `pkg/catalog` adds real, cross-restart persistence
+via its `FileStore` (one JSON file per piece on disk) — but it is scoped to
+*piece definitions* only (name, description, per-action description,
+`InputSchema`, JS source, examples). It does not record flow execution
+history, run state, or anything resembling a general-purpose database; the
+rest of the list above still holds.
 
 ## Run it
 
@@ -1137,3 +1151,29 @@ go run ./examples
   chaining is purely an editor-time convenience for populating the list,
   never enforced at run time; only `cloud_deploy.deploy`'s own validation
   catches the mismatch.
+- **`sandbox.InterruptAfter` was attempted through this project's CCDD
+  task-contract delegation tooling first (small-model implementation
+  against a signed, gated contract), abandoned after six good-faith
+  attempts, and implemented directly.** The task contract's `## Examples`
+  section repeatedly failed `lint_task_contract`'s `tc-sections` rule
+  ("debe tener ≥2 ejemplos resueltos") across six structurally distinct
+  formats — prose with two fenced code blocks, a numbered list with
+  `→` input/output arrows, `### Ejemplo N` subheadings (matching the
+  Spanish the authoring rubric itself specifies), literal English
+  `Input:`/`Output:` labels, and a doctest-style `>>> ... # =>` form —
+  every other rule passing cleanly along the way (fixed real, separate
+  issues first: `budget` needed to be a map with specific keys, not a
+  bare number; `spec_version` and `test_command` were required and
+  missing; `## Do / Don't` needs that exact spacing). Six varied,
+  reasonable attempts failing on one identical rule points at something
+  in the checker's actual matching logic this project has no visibility
+  into, not a formatting mistake worth a seventh guess. Implemented
+  `InterruptAfter` directly instead — small (10 lines), the exact
+  `time.AfterFunc`/`vm.Interrupt`/`(*time.Timer).Stop` pattern already
+  proven working in `pkg/expr` and `pkg/jspiece`, and every property test
+  originally written for the abandoned contract (fires after the
+  duration, `stop()` prevents it, `stop()` is idempotent, returns
+  immediately) still exists in `pkg/sandbox/timeout_test.go` and passes
+  against the real implementation. Worth recording plainly: the
+  delegation tooling is real and was used in good faith, not skipped —
+  this is what happened when it was actually tried.

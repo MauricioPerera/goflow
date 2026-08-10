@@ -153,6 +153,12 @@ func (w *walker) checkAction(path string, action *model.FlowAction) {
 			})
 		}
 		for i, branch := range action.Router.Branches {
+			if branch.Type == model.BranchCondition && len(branch.Conditions) == 0 {
+				w.errs = append(w.errs, ValidationError{
+					Path:    fmt.Sprintf("%s.router.branches[%d]", path, i),
+					Message: fmt.Sprintf("branch %q is type CONDITION but has no Conditions — an empty condition group never matches in the engine (evaluateConditionGroups returns false for no groups), so this branch can never run; use type FALLBACK for a catch-all, or add at least one condition group", branch.Name),
+				})
+			}
 			for g, group := range branch.Conditions {
 				for c, cond := range group {
 					condPath := fmt.Sprintf("%s.router.branches[%d].conditions[%d][%d]", path, i, g, c)

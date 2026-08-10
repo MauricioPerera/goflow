@@ -21,6 +21,7 @@ import (
 	"goflow/pkg/model"
 	"goflow/pkg/piece"
 	"goflow/pkg/pieces"
+	"goflow/pkg/sandbox"
 )
 
 func TestStress_ManyConcurrentFlowsWithRealCatalogPieces(t *testing.T) {
@@ -297,4 +298,30 @@ func (a *accumulator) Value() int64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.sum
+}
+
+// TestStress_RunawayCodeStepIsInterruptedThroughRealFlow proves
+// sandbox.DefaultTimeout actually bounds a CODE step's runaway execution
+// through a real ExecuteBegin call — not just sandbox.Run in isolation
+// (pkg/sandbox's own TestRun_InfiniteLoopIsInterrupted). A flow built
+// from Phase 1's JSON data could contain exactly this: an agent-authored
+// CODE action with a Source that never returns.
+func TestStress_RunawayCodeStepIsInterruptedThroughRealFlow(t *testing.T) {
+	original := sandbox.DefaultTimeout
+	sandbox.DefaultTimeout = 50 * time.Millisecond
+	defer func() { sandbox.DefaultTimeout = original }()
+
+	runaway := codeAction("runaway", `(params) => { while (true) {} }`, map[string]any{})
+	fv := &model.FlowVersion{ID: "fv-runaway-code", Trigger: trigger(runaway)}
+
+	start := time.Now()
+	state := engine.New(piece.NewRegistry()).ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+	elapsed := time.Since(start)
+
+	if state.Verdict.Status != model.FlowRunFailed {
+		t.Fatalf("verdict = %+v, want FAILED — the runaway CODE step must time out, not hang the run forever", state.Verdict)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("ExecuteBegin took %v, want it to return quickly after the 50ms timeout", elapsed)
+	}
 }

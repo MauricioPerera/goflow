@@ -18,11 +18,18 @@ func Describe(store Store) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("catalog: describing store: %w", err)
 	}
-	sort.Slice(defs, func(i, j int) bool { return defs[i].Name < defs[j].Name })
-
 	if len(defs) == 0 {
 		return "(catalog is empty — no pieces saved yet)", nil
 	}
+	return renderDefinitions(defs), nil
+}
+
+// renderDefinitions renders a slice of Definitions as the per-piece blocks
+// Describe emits — sorted by name, with each action listed under its piece.
+// Extracted so DescribeCombined can reuse the exact same JS-store rendering
+// instead of duplicating it. defs is sorted in place.
+func renderDefinitions(defs []Definition) string {
+	sort.Slice(defs, func(i, j int) bool { return defs[i].Name < defs[j].Name })
 
 	var sb strings.Builder
 	for i, def := range defs {
@@ -41,5 +48,5 @@ func Describe(store Store) (string, error) {
 			}
 		}
 	}
-	return sb.String(), nil
+	return sb.String()
 }

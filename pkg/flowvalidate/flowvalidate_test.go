@@ -298,6 +298,59 @@ func TestValidate_ConditionValuesAreChecked(t *testing.T) {
 	}
 }
 
+func TestValidate_RouterConditionBranchWithEmptyConditions(t *testing.T) {
+	cases := []struct {
+		name     string
+		branches []model.RouterBranch
+		wantErrs int
+		wantPath string // empty = don't assert a specific branch path
+	}{
+		{
+			name:     "CONDITION branch with empty Conditions produces the error",
+			branches: []model.RouterBranch{{Name: "a", Type: model.BranchCondition, Conditions: nil}},
+			wantErrs: 1,
+			wantPath: "trigger > route.router.branches[0]",
+		},
+		{
+			name: "CONDITION branch with a condition group does not produce the error",
+			branches: []model.RouterBranch{{
+				Name: "a", Type: model.BranchCondition,
+				Conditions: [][]model.Condition{{
+					{Operator: model.OpTextExactlyMatches, FirstValue: "a", SecondValue: "b"},
+				}},
+			}},
+			wantErrs: 0,
+		},
+		{
+			name:     "FALLBACK branch with empty Conditions is valid and produces no error",
+			branches: []model.RouterBranch{{Name: "a", Type: model.BranchFallback, Conditions: nil}},
+			wantErrs: 0,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			children := make([]*model.FlowAction, len(c.branches))
+			for i := range c.branches {
+				children[i] = codeAction("child_" + string(rune('a'+i)))
+			}
+			router := &model.FlowAction{
+				Name: "route", DisplayName: "Route", Type: model.ActionRouter,
+				Router: &model.RouterSettings{Branches: c.branches, Children: children},
+			}
+			fv := &model.FlowVersion{ID: "fv-1", Trigger: trigger(router)}
+			errs := flowvalidate.Validate(fv, nil)
+			if len(errs) != c.wantErrs {
+				t.Fatalf("errs = %+v, want %d error(s)", errs, c.wantErrs)
+			}
+			if c.wantPath != "" {
+				if errs[0].Path != c.wantPath {
+					t.Fatalf("errs[0].Path = %q, want %q", errs[0].Path, c.wantPath)
+				}
+			}
+		})
+	}
+}
+
 func TestValidate_TriggerInputTemplatesAreChecked(t *testing.T) {
 	fv := &model.FlowVersion{ID: "fv-1", Trigger: &model.FlowTrigger{
 		Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerPiece,

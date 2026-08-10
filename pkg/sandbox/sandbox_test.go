@@ -3,6 +3,7 @@ package sandbox_test
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"goflow/pkg/sandbox"
 )
@@ -163,6 +164,27 @@ func TestRun_PromiseReturnIsRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Promise") {
 		t.Fatalf("err = %v, want it to mention the Promise rejection", err)
+	}
+}
+
+// TestRun_InfiniteLoopIsInterrupted proves DefaultTimeout actually bounds
+// a runaway CODE step through the real Run() entry point — not just
+// InterruptAfter in isolation (see timeout_test.go). Overrides
+// DefaultTimeout so the test doesn't wait the real 5s.
+func TestRun_InfiniteLoopIsInterrupted(t *testing.T) {
+	original := sandbox.DefaultTimeout
+	sandbox.DefaultTimeout = 50 * time.Millisecond
+	defer func() { sandbox.DefaultTimeout = original }()
+
+	start := time.Now()
+	_, err := sandbox.Run(`(params) => { while (true) {} }`, map[string]any{})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Run() error = nil, want a timeout error for an infinite loop")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("Run() took %v, want it to be interrupted quickly after the 50ms timeout", elapsed)
 	}
 }
 
