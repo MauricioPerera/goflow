@@ -2,9 +2,12 @@ package httpapi
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,7 +42,7 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatalf("flowstore.NewFileStore: %v", err)
 	}
-	return NewServer(&catalog.GatedStore{Underlying: fs}, credStore, flowStore, "secret-token")
+	return NewServer(&catalog.GatedStore{Underlying: fs}, credStore, flowStore, "secret-token", "http://testserver")
 }
 
 // credDir returns the on-disk directory backing the server's credentials
@@ -746,5 +749,150 @@ func TestPostMcp_WithAuth_Initialize_OK(t *testing.T) {
 	info, _ := result["serverInfo"].(map[string]any)
 	if info["name"] != "goflow-mcp" {
 		t.Fatalf("serverInfo.name = %v, want goflow-mcp", info["name"])
+	}
+}
+
+// TestPostMcp_NoAuth_401_AdvertisesOAuthResourceMetadata proves the exact
+// gap README.md documented before pkg/oauth existed is now closed at the
+// wire level: a 401 on /mcp specifically (not on routes with no OAuth story
+// of their own) carries a WWW-Authenticate hint pointing a spec-compliant
+// client at this server's protected-resource metadata (RFC 9728), instead of
+// leaving it to retry the same bare token forever.
+func TestPostMcp_NoAuth_401_AdvertisesOAuthResourceMetadata(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "POST", "/mcp", map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize"}, false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	got := rec.Header().Get("WWW-Authenticate")
+	want := `Bearer resource_metadata="http://testserver/.well-known/oauth-protected-resource"`
+	if got != want {
+		t.Fatalf("WWW-Authenticate = %q, want %q", got, want)
+	}
+
+	// A route with no OAuth resource story of its own (/catalog) must NOT
+	// carry the same hint — it's specific to /mcp, the one OAuth-protected
+	// resource this server has.
+	rec2 := do(t, srv, "GET", "/catalog", nil, false)
+	if h := rec2.Header().Get("WWW-Authenticate"); h != "" {
+		t.Fatalf("/catalog's 401 carries WWW-Authenticate = %q, want none", h)
+	}
+}
+
+// TestOAuthWellKnown_ReachableWithoutAuth proves the OAuth discovery/
+// registration surface is reachable by a client that has no token yet — the
+// entire point of implementing OAuth in the first place. If these required
+// auth, a client would be stuck exactly where it started.
+func TestOAuthWellKnown_ReachableWithoutAuth(t *testing.T) {
+	srv := newTestServer(t)
+	for _, path := range []string{
+		"/.well-known/oauth-authorization-server",
+		"/.well-known/oauth-protected-resource",
+	} {
+		rec := do(t, srv, "GET", path, nil, false)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200, body=%s", path, rec.Code, rec.Body.String())
+		}
+	}
+
+	registerBody, _ := json.Marshal(map[string]any{
+		"client_name":   "test client",
+		"redirect_uris": []string{"http://cb.example/callback"},
+	})
+	r := httptest.NewRequest("POST", "/oauth/register", bytes.NewReader(registerBody))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, r)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /oauth/register (no auth): status = %d, want 201, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestOAuthEndToEnd_AccessTokenGrantsTheSameAccessAsStaticToken drives the
+// full OAuth 2.1 dance through the REAL server — registration, authorization
+// (via the Bearer-header path, proving the static token is what backs the
+// whole flow), and a code-for-token exchange — then uses the resulting
+// access token exactly like the static token on two different routes
+// (/catalog and /mcp), proving the auth middleware genuinely accepts either
+// credential form for anything it already gates, not just for /mcp.
+func TestOAuthEndToEnd_AccessTokenGrantsTheSameAccessAsStaticToken(t *testing.T) {
+	srv := newTestServer(t)
+
+	registerBody, _ := json.Marshal(map[string]any{
+		"client_name":   "e2e client",
+		"redirect_uris": []string{"http://cb.example/callback"},
+	})
+	rReg := httptest.NewRequest("POST", "/oauth/register", bytes.NewReader(registerBody))
+	recReg := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(recReg, rReg)
+	if recReg.Code != http.StatusCreated {
+		t.Fatalf("register: status = %d, body=%s", recReg.Code, recReg.Body.String())
+	}
+	clientID := decode(t, recReg)["client_id"].(string)
+
+	verifier := "e2e-test-verifier-0123456789-0123456789"
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	authQ := url.Values{
+		"response_type": {"code"}, "client_id": {clientID},
+		"redirect_uri": {"http://cb.example/callback"}, "state": {"s"},
+		"code_challenge": {challenge}, "code_challenge_method": {"S256"},
+	}
+	rAuth := httptest.NewRequest("GET", "/oauth/authorize?"+authQ.Encode(), nil)
+	rAuth.Header.Set("Authorization", "Bearer secret-token")
+	recAuth := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(recAuth, rAuth)
+	if recAuth.Code != http.StatusFound {
+		t.Fatalf("authorize: status = %d, want 302, body=%s", recAuth.Code, recAuth.Body.String())
+	}
+	loc, err := url.Parse(recAuth.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parsing Location: %v", err)
+	}
+	code := loc.Query().Get("code")
+	if code == "" {
+		t.Fatalf("Location %q carries no code", loc)
+	}
+
+	tokenForm := url.Values{
+		"grant_type": {"authorization_code"}, "code": {code},
+		"redirect_uri": {"http://cb.example/callback"}, "client_id": {clientID},
+		"code_verifier": {verifier},
+	}
+	rTok := httptest.NewRequest("POST", "/oauth/token", strings.NewReader(tokenForm.Encode()))
+	rTok.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	recTok := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(recTok, rTok)
+	if recTok.Code != http.StatusOK {
+		t.Fatalf("token exchange: status = %d, body=%s", recTok.Code, recTok.Body.String())
+	}
+	accessToken := decode(t, recTok)["access_token"].(string)
+	if accessToken == "" {
+		t.Fatal("token exchange returned an empty access_token")
+	}
+	if accessToken == "secret-token" {
+		t.Fatal("access_token must never equal the static token")
+	}
+
+	for _, req := range []struct {
+		method, path string
+		body         any
+	}{
+		{"GET", "/catalog", nil},
+		{"POST", "/mcp", map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize"}},
+	} {
+		var r *http.Request
+		if req.body == nil {
+			r = httptest.NewRequest(req.method, req.path, nil)
+		} else {
+			raw, _ := json.Marshal(req.body)
+			r = httptest.NewRequest(req.method, req.path, bytes.NewReader(raw))
+		}
+		r.Header.Set("Authorization", "Bearer "+accessToken)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, r)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s %s with OAuth access token: status = %d, want 200, body=%s", req.method, req.path, rec.Code, rec.Body.String())
+		}
 	}
 }

@@ -8,20 +8,27 @@
 // pieces are persisted in the catalog Store), runs flowvalidate before
 // touching the engine, and serializes the returned *model.ExecutionState
 // straight to JSON. Auth is a single shared bearer token compared in
-// constant time; a missing/wrong token never reaches the handler.
+// constant time, OR a live access token issued by pkg/oauth's OAuth 2.1
+// authorization server — see auth's doc comment for how the two compose,
+// and pkg/oauth's package doc for why that server is still gated by the
+// same one token underneath. A missing/wrong credential of either form
+// never reaches the handler.
 package httpapi
 
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"strings"
 
 	"goflow/pkg/catalog"
 	"goflow/pkg/credentials"
 	"goflow/pkg/flowstore"
 	"goflow/pkg/mcpapi"
 	"goflow/pkg/model"
+	"goflow/pkg/oauth"
 	"goflow/pkg/piece"
 	"goflow/pkg/pieces"
 )
@@ -31,17 +38,22 @@ import (
 // but typed as the interface so tests can pass any Store), the named-flow
 // store (a *flowstore.GatedStore wrapping whatever flowstore.Store the
 // caller passed, built inside NewServer so the gate reuses this server's
-// own buildRegistry), and the bearer token every non-/health route is gated
-// on.
+// own buildRegistry), the bearer token every non-public route is gated on,
+// and oauthSrv — the OAuth 2.1 authorization server (pkg/oauth) that lets a
+// spec-compliant MCP client authenticate without knowing that static token
+// directly. See auth's doc comment for how the two credential forms compose.
 type Server struct {
-	store     catalog.Store
-	credStore credentials.Store
-	flowStore *flowstore.GatedStore
-	token     string
+	store          catalog.Store
+	credStore      credentials.Store
+	flowStore      *flowstore.GatedStore
+	token          string
+	expectedBearer []byte // "Bearer " + token, precomputed once — see auth
+	oauthSrv       *oauth.Server
 }
 
-// NewServer returns a Server that authorizes non-/health routes with token,
-// reads/writes catalog Definitions through store, manages encrypted
+// NewServer returns a Server that authorizes non-public routes with token
+// (directly, or via an OAuth access token oauthSrv issued for it — see
+// auth), reads/writes catalog Definitions through store, manages encrypted
 // credentials through credStore, and persists named flows through flowStore.
 // flowStore is the RAW store (no gate): NewServer wraps it in a
 // *flowstore.GatedStore itself, wiring the gate's BuildRegistry to this
@@ -49,9 +61,14 @@ type Server struct {
 // exact same piece registry /flows/run and every other route assembles,
 // without duplicating that assembly in cmd/server/main.go. credStore is
 // never asked to decrypt over HTTP — only Save/List/Delete are exposed; Get
-// is for trusted Go callers.
-func NewServer(store catalog.Store, credStore credentials.Store, flowStore flowstore.Store, token string) *Server {
-	s := &Server{store: store, credStore: credStore, token: token}
+// is for trusted Go callers. issuer is this server's externally-reachable
+// base URL, passed straight through to oauth.NewServer for its metadata.
+func NewServer(store catalog.Store, credStore credentials.Store, flowStore flowstore.Store, token, issuer string) *Server {
+	s := &Server{
+		store: store, credStore: credStore, token: token,
+		expectedBearer: []byte("Bearer " + token),
+		oauthSrv:       oauth.NewServer(token, issuer),
+	}
 	s.flowStore = &flowstore.GatedStore{Underlying: flowStore, BuildRegistry: s.buildRegistry}
 	return s
 }
@@ -73,10 +90,24 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/credentials", s.auth(http.HandlerFunc(s.handleCredentials)))
 	mux.Handle("DELETE /credentials/{name}", s.auth(http.HandlerFunc(s.handleCredentialDelete)))
 	// /mcp exposes the saved flows as MCP tools (JSON-RPC 2.0 over a single
-	// POST), behind the same bearer-token auth as every other route. The
-	// handler reuses this server's buildRegistry and flowStore, so a tool call
-	// validates and runs a flow against the exact same registry as /flows/run.
-	mux.Handle("POST /mcp", s.auth(mcpapi.NewHandler(s.flowStore, s.buildRegistry, s.credStore)))
+	// POST), behind the same auth as every other route (static token OR a
+	// live OAuth access token — see auth). authMCP additionally advertises
+	// where to find this resource's OAuth metadata on a 401, so a
+	// spec-compliant client discovers the flow below instead of just
+	// retrying the same bare token forever.
+	mux.Handle("POST /mcp", s.authMCP(mcpapi.NewHandler(s.flowStore, s.buildRegistry, s.credStore)))
+
+	// OAuth 2.1 endpoints (pkg/oauth) — deliberately NOT behind s.auth: they
+	// ARE the mechanism a client without a token yet uses to get one. See
+	// oauth's package doc for why this is still safe (registering a client
+	// grants nothing; /oauth/authorize itself still requires the same
+	// GOFLOW_API_TOKEN before it issues anything).
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.oauthSrv.HandleAuthServerMetadata)
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.oauthSrv.HandleProtectedResourceMetadata)
+	mux.HandleFunc("POST /oauth/register", s.oauthSrv.HandleRegister)
+	mux.HandleFunc("/oauth/authorize", s.oauthSrv.HandleAuthorize)
+	mux.HandleFunc("POST /oauth/token", s.oauthSrv.HandleToken)
+
 	return s.logging(s.recover(mux))
 }
 
@@ -378,15 +409,46 @@ func (s *Server) handleCredentialDelete(w http.ResponseWriter, r *http.Request) 
 
 // --- middleware -------------------------------------------------------------
 
-// auth rejects any request whose Authorization header is not exactly
-// "Bearer <token>", compared in constant time so a timing side channel
-// can't leak how much of the token matched. On mismatch it returns 401 and
-// never calls the wrapped handler.
+// authorized reports whether r carries a valid credential — either exactly
+// "Bearer <token>" (compared in constant time so a timing side channel can't
+// leak how much of the token matched), or "Bearer <access token>" for a live
+// token oauthSrv issued. Either form grants identical access: this project
+// has no scopes/permissions concept, so there is nothing an OAuth-issued
+// token could usefully be limited to that the static token isn't already
+// trusted with.
+func (s *Server) authorized(r *http.Request) bool {
+	got := []byte(r.Header.Get("Authorization"))
+	if subtle.ConstantTimeCompare(got, s.expectedBearer) == 1 {
+		return true
+	}
+	if tok, ok := strings.CutPrefix(string(got), "Bearer "); ok {
+		return s.oauthSrv.ValidateAccessToken(tok)
+	}
+	return false
+}
+
+// auth rejects any request authorized returns false for with a bare 401 —
+// used for every route except the OAuth endpoints themselves and /mcp
+// (which uses authMCP below, the same check plus a WWW-Authenticate hint).
 func (s *Server) auth(next http.Handler) http.Handler {
-	expected := []byte("Bearer " + s.token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got := []byte(r.Header.Get("Authorization"))
-		if subtle.ConstantTimeCompare(got, expected) != 1 {
+		if !s.authorized(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// authMCP is auth, plus a WWW-Authenticate header naming where to find this
+// resource's OAuth metadata (RFC 9728) on a 401 — the discovery hint a
+// spec-compliant MCP client looks for instead of just retrying the same bare
+// token forever, closing the exact gap README.md documented.
+func (s *Server) authMCP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.authorized(r) {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(
+				`Bearer resource_metadata=%q`, s.oauthSrv.Issuer+"/.well-known/oauth-protected-resource"))
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}

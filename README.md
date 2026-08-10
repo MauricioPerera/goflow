@@ -401,14 +401,42 @@ below for what a Go rewrite gets and gives up.
   requests: the official `@modelcontextprotocol/inspector` CLI, run on the
   same VPS against the deployed server, completed a real
   `initialize`/`tools/list`/`tools/call` sequence and correctly surfaced an
-  unknown-tool error. One real, load-bearing limitation found this way and
-  not fixed: auth is still the same plain bearer token as every other
-  route, not the OAuth 2.1 flow the MCP spec defines for remote HTTP
-  servers — a real MCP client that only speaks that flow gets stuck
-  retrying OAuth discovery on a 401 instead of realizing a static header
-  would work; only a client configured with an explicit header (`--header`
-  on the Inspector, or an equivalent in a real client's config) can connect
-  today.
+  unknown-tool error. The real, load-bearing limitation this found — auth
+  was the same plain bearer token as every other route, not the OAuth 2.1
+  flow the MCP spec defines for remote HTTP servers, so a real MCP client
+  that only speaks that flow got stuck retrying OAuth discovery on a
+  401 — is closed now; see `pkg/oauth` below.
+- **OAuth 2.1 for MCP** (`pkg/oauth`): closes the gap the `pkg/mcpapi` entry
+  above used to end on. Deliberately NOT general-purpose multi-user OAuth —
+  goflow still has no concept of accounts (see "Explicitly NOT in v1"
+  below) — there is exactly one principal, whoever knows
+  `GOFLOW_API_TOKEN`, the same secret every other route already trusts.
+  `/oauth/authorize` grants an authorization code to that principal and no
+  one else: it requires the token presented either as a Bearer header (a
+  machine/CLI client that already knows the token, e.g. the MCP Inspector's
+  `--header` flag) or, for a real browser redirect that can't set a header,
+  typed into a one-field HTML form served at the same URL — no separate
+  login/account system behind that form, just the same constant-time
+  compare every other route already does. Auto-approving every
+  `/oauth/authorize` request with no credential check at all was
+  considered and rejected: it would let anyone who can merely reach the
+  server mint a fully valid access token without ever knowing
+  `GOFLOW_API_TOKEN` — strictly weaker than today, not a neutral addition.
+  What IS real, stdlib-only, zero new dependencies: RFC 8414
+  authorization-server metadata and RFC 9728 protected-resource metadata
+  (both served unauthenticated, as they must be), RFC 7591 dynamic client
+  registration (also unauthenticated — registering a client identifies it
+  for redirect_uri matching but grants no access by itself), mandatory PKCE
+  (S256 only — OAuth 2.1 drops "plain") on every authorization code, and
+  short-lived single-use codes exchanged for opaque access/refresh tokens
+  (refresh rotates on every use, old refresh tokens are dead the moment a
+  new pair is issued). `/mcp`'s 401 carries a `WWW-Authenticate: Bearer
+  resource_metadata="..."` header (RFC 9728) pointing a compliant client at
+  the metadata instead of leaving it to retry the same bare token forever
+  — the exact failure mode the `pkg/mcpapi` finding above described. An
+  OAuth-issued access token and the static token grant identical access on
+  every route (this project has no scopes/permissions concept to narrow
+  one against), not just `/mcp`.
 
 ## Explicitly NOT in v1
 
@@ -422,11 +450,12 @@ longer are, and should be stated plainly rather than left stale:
   real HTTP server (`/health`, `/catalog`, `/pieces`, `/flows*`,
   `/credentials*`, `/mcp` — see "What's here" above), deployed and running
   on a real VPS as a systemd service. "No auth" is also no longer true, but
-  stays narrow: every non-`/health` route requires a single shared bearer
-  token, constant-time compared — there is no per-user auth, no accounts,
-  and no OAuth (including for MCP: this server does not implement the
-  OAuth 2.1 flow the MCP spec defines for remote servers, see the `pkg/mcpapi`
-  entry above).
+  stays narrow: every non-public route requires either the single shared
+  bearer token (constant-time compared) or an access token minted by
+  `pkg/oauth`'s single-tenant OAuth 2.1 authorization server (see its "What's
+  here" entry above) — there is still no per-user auth and no accounts;
+  OAuth here authenticates the one existing principal through a
+  spec-compliant flow, it does not add new principals.
 - **"No persistence" is no longer true in general.** `pkg/catalog` persists
   piece definitions, `pkg/credentials` persists secrets encrypted at rest,
   and `pkg/flowstore` persists named flows — all real, cross-restart disk

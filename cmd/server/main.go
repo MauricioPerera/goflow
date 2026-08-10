@@ -64,6 +64,17 @@ func main() {
 		flowsDir = "./data/flows"
 	}
 
+	// GOFLOW_OAUTH_ISSUER is this server's externally-reachable base URL —
+	// required for the OAuth 2.1 metadata pkg/oauth serves to point a client
+	// at URLs it can actually reach (e.g. the real https://host behind a
+	// reverse proxy, not the loopback address this process binds to).
+	// Defaults to a plain http://<addr> for local/direct use (e.g. against
+	// the MCP Inspector on localhost), where that default IS reachable.
+	issuer := os.Getenv("GOFLOW_OAUTH_ISSUER")
+	if issuer == "" {
+		issuer = "http://" + addr
+	}
+
 	// NewFileStore creates the directory if missing (os.MkdirAll inside),
 	// so no separate mkdir here.
 	fileStore, err := catalog.NewFileStore(catalogDir)
@@ -86,7 +97,7 @@ func main() {
 		log.Fatalf("opening flows store at %q: %v", flowsDir, err)
 	}
 
-	srv := httpapi.NewServer(gated, credStore, flowStore, token)
-	log.Printf("goflow-server listening on %s (catalog: %s, credentials: %s, flows: %s)", addr, catalogDir, credentialsDir, flowsDir)
+	srv := httpapi.NewServer(gated, credStore, flowStore, token, issuer)
+	log.Printf("goflow-server listening on %s (catalog: %s, credentials: %s, flows: %s, oauth issuer: %s)", addr, catalogDir, credentialsDir, flowsDir, issuer)
 	log.Fatal(http.ListenAndServe(addr, srv.Handler()))
 }
