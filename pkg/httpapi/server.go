@@ -123,24 +123,12 @@ func (s *Server) Handler() http.Handler {
 	return s.logging(s.recover(mux))
 }
 
-// buildRegistry assembles a fresh *piece.Registry on every call (no caching:
-// a piece saved between two requests must be visible to the second one
-// without a server restart). Built-in Go pieces (pieces.All) are registered
-// first, then every Definition the store returns is converted via ToPiece
-// and registered. A store.List failure is propagated, not silenced.
+// buildRegistry assembles a fresh *piece.Registry on every call — now just
+// catalog.BuildRegistry(s.store), extracted there so pkg/scheduler shares the
+// exact same assembly instead of duplicating it (see that function's doc
+// comment).
 func (s *Server) buildRegistry() (*piece.Registry, error) {
-	reg := piece.NewRegistry()
-	for _, p := range pieces.All() {
-		reg.Register(p)
-	}
-	defs, err := s.store.List()
-	if err != nil {
-		return nil, err
-	}
-	for _, def := range defs {
-		reg.Register(def.ToPiece())
-	}
-	return reg, nil
+	return catalog.BuildRegistry(s.store)
 }
 
 // goCatalogMap builds the name -> DisplayName map DescribeCombined expects

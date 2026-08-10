@@ -473,6 +473,45 @@ below for what a Go rewrite gets and gives up.
   OAuth-issued access token and the static token grant identical access on
   every route (this project has no scopes/permissions concept to narrow
   one against), not just `/mcp`.
+- **Schedule trigger + a real scheduler** (`pkg/pieces/schedule`,
+  `pkg/scheduler`): closes a gap found while auditing real-world use cases
+  against this project's actual catalog — every other piece here is
+  event/on-demand (`webhook`, or an action run manually/via MCP), nothing
+  fires a flow on its own on a timer, and n8n-style incidents from exactly
+  that pattern (hundreds of 1-second schedule triggers erroring in a loop
+  after a dependency vanished) are the direct reason to build this
+  carefully rather than by reflex. `schedule.Run` is a real POLLING-style
+  `piece.Trigger` (see `pkg/piece`'s own doc comment on what that means):
+  it takes `intervalSeconds` from `Input` and a cursor from `Store`, fires
+  (and reseeds the cursor) once the interval has elapsed since it last did,
+  and — like every polling trigger in this project — fires immediately on
+  its very first call for a fresh cursor, the same "existing data counts as
+  new on the first poll" shape `TestPollingTrigger_*` already established.
+  The piece alone is inert, though: `pkg/piece.Trigger`'s doc comment is
+  explicit that calling `Run` on a timer is an external scheduler's job,
+  and before this, nothing in `cmd/server`/`pkg/httpapi` did that —
+  `TestPollingTrigger_*` only ever simulated it inside a test. `pkg/scheduler`
+  is that external scheduler for real: it ticks on its own interval
+  (`GOFLOW_SCHEDULER_TICK`, default 1s — how often it CHECKS, not any one
+  flow's own `intervalSeconds`), lists every saved flow each tick, asks the
+  schedule-triggered ones whether they're due (each against its own
+  `piece.ScopedStore`-namespaced cursor, so two schedule-triggered flows
+  never clash over the same literal cursor key — same reasoning
+  `ScopedStore`'s doc comment already gives for exactly this "multiple
+  flows, one trigger mechanism" shape), and for a due flow runs it through
+  `flowstore.RunWithHistory` — the identical path `POST /flows/{name}/run`
+  and MCP's `tools/call` already share, so a schedule-fired run resolves
+  and redacts credentials and lands in run history exactly like a manually
+  triggered one, not a fourth, subtly different way to run a flow.
+  In-memory cursors only, deliberately (a restart re-fires every
+  schedule-triggered flow once, immediately — the same first-call behavior
+  a brand-new flow already has, not a new failure mode); a per-flow
+  in-flight guard skips a tick for a flow whose previous scheduled run
+  hasn't finished yet, rather than overlapping runs of the same flow.
+  `pkg/catalog/registry.go`'s `BuildRegistry` — extracted from what was
+  inline in `Server.buildRegistry` — is what lets `pkg/scheduler` validate
+  and run a flow against the exact same piece registry every other
+  transport uses, without duplicating that assembly a third time.
 
 ## Explicitly NOT in v1
 
@@ -628,7 +667,11 @@ go run ./examples
   demonstrates the whole shape by simulating the scheduler directly in the
   test, calling `Registry.GetTrigger` + `Trigger.Run` by hand rather than
   through a new `Engine` method that would have had nothing engine-specific
-  to do.
+  to do. That external scheduler this entry describes as missing is no
+  longer just simulated in a test for one specific trigger shape: see the
+  `pkg/scheduler`/`pkg/pieces/schedule` entry above for the real one, still
+  entirely outside `pkg/engine` — the boundary this entry describes didn't
+  move, it just got a real caller on the other side of it.
 - **Sync webhook (`Stop`/`Respond`) checked against `piece-executor.ts`
   before adding anything, same discipline as auth.** Real activepieces gates
   the actual mid-flight HTTP send on `constants.triggerPieceName ===

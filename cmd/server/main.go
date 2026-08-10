@@ -4,16 +4,21 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"time"
 
 	"goflow/pkg/catalog"
 	"goflow/pkg/credentials"
 	"goflow/pkg/flowstore"
 	"goflow/pkg/httpapi"
+	"goflow/pkg/piece"
 	"goflow/pkg/runstore"
+	"goflow/pkg/scheduler"
 )
 
 func main() {
@@ -70,6 +75,25 @@ func main() {
 		runsDir = "./data/runs"
 	}
 
+	// GOFLOW_SCHEDULER_TICK is how often pkg/scheduler checks every saved
+	// flow for a due schedule trigger — NOT any individual flow's own
+	// intervalSeconds (that's per-flow, configured on the flow itself). A
+	// tick longer than some flow's intervalSeconds delays that flow firing
+	// on schedule; see pkg/scheduler's doc comment. Default 1s: fine-grained
+	// enough for a schedule.PieceName flow configured with a 1s interval to
+	// actually fire close to on time, cheap enough (one flowStore.List() per
+	// tick) not to matter at this project's scale.
+	tickStr := os.Getenv("GOFLOW_SCHEDULER_TICK")
+	tick := time.Second
+	if tickStr != "" {
+		secs, err := strconv.Atoi(tickStr)
+		if err != nil || secs <= 0 {
+			log.Printf("GOFLOW_SCHEDULER_TICK=%q is not a positive integer (seconds) — refusing to start", tickStr)
+			os.Exit(1)
+		}
+		tick = time.Duration(secs) * time.Second
+	}
+
 	// GOFLOW_OAUTH_ISSUER is this server's externally-reachable base URL —
 	// required for the OAuth 2.1 metadata pkg/oauth serves to point a client
 	// at URLs it can actually reach (e.g. the real https://host behind a
@@ -109,6 +133,25 @@ func main() {
 	}
 
 	srv := httpapi.NewServer(gated, credStore, flowStore, runStore, token, issuer)
-	log.Printf("goflow-server listening on %s (catalog: %s, credentials: %s, flows: %s, runs: %s, oauth issuer: %s)", addr, catalogDir, credentialsDir, flowsDir, runsDir, issuer)
+
+	// The scheduler needs its own *flowstore.GatedStore over the same
+	// flowsDir httpapi.NewServer just wrapped internally — a second Go
+	// object, but not a second source of truth: both ultimately validate
+	// against catalog.BuildRegistry(gated), the same shared assembly
+	// httpapi.Server.buildRegistry now also just calls (see
+	// pkg/catalog/registry.go), so the two can't drift on what pieces exist.
+	schedFlowStore := &flowstore.GatedStore{
+		Underlying:    flowStore,
+		BuildRegistry: func() (*piece.Registry, error) { return catalog.BuildRegistry(gated) },
+	}
+	sched := scheduler.New(schedFlowStore, schedFlowStore.BuildRegistry, credStore, runStore, tick)
+	// No graceful shutdown here, deliberately matching http.ListenAndServe
+	// below: this process has none today (a kill/systemd-stop ends both
+	// together), so context.Background() rather than a cancellable context
+	// wired to a signal handler doesn't introduce a NEW inconsistency —
+	// it matches the HTTP server's own existing behavior.
+	go sched.Run(context.Background())
+
+	log.Printf("goflow-server listening on %s (catalog: %s, credentials: %s, flows: %s, runs: %s, oauth issuer: %s, scheduler tick: %s)", addr, catalogDir, credentialsDir, flowsDir, runsDir, issuer, tick)
 	log.Fatal(http.ListenAndServe(addr, srv.Handler()))
 }

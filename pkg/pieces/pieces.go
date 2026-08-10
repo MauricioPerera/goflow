@@ -22,6 +22,7 @@ import (
 	httppiece "goflow/pkg/pieces/http"
 	"goflow/pkg/pieces/json"
 	regexpiece "goflow/pkg/pieces/regex"
+	"goflow/pkg/pieces/schedule"
 	"goflow/pkg/pieces/storage"
 	"goflow/pkg/pieces/text"
 	"goflow/pkg/pieces/uuid"
@@ -41,6 +42,7 @@ func All() []piece.Piece {
 		json.New(),
 		delay.New(),
 		webhook.New(),
+		schedule.New(),
 		cryptopiece.New(),
 		storage.New(),
 		approval.New(),

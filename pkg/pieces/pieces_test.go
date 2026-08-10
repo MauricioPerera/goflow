@@ -21,6 +21,7 @@ func TestRegisterAll_EveryCatalogPieceBecomesResolvable(t *testing.T) {
 		{"json", "action", "stringify"},
 		{"delay", "action", "wait"},
 		{"webhook", "trigger", "catch_hook"},
+		{"schedule", "trigger", "interval"},
 		{"crypto", "action", "encrypt"},
 		{"crypto", "action", "decrypt"},
 		{"storage", "action", "write"},
@@ -74,7 +75,7 @@ func TestAll_ReturnsOneEntryPerCatalogPiece(t *testing.T) {
 		seen[p.Name] = true
 	}
 	for _, want := range []string{
-		"http", "json", "delay", "webhook", "crypto",
+		"http", "json", "delay", "webhook", "schedule", "crypto",
 		"storage", "approval", "webhook_reply", "text", "datetime", "hash", "regex", "csv", "uuid", "base64", "email",
 	} {
 		if !seen[want] {
