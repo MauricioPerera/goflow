@@ -344,9 +344,28 @@ below for what a Go rewrite gets and gives up.
   mandatory — same fail-closed startup as the API token).
   `POST`/`GET`/`DELETE /credentials` only ever handle names — there is no
   HTTP route that returns a decrypted value, by design; `Store.Get` is for
-  trusted Go callers only. Wiring a stored credential into an actual flow
-  run (a flow referencing one by name instead of carrying the value itself)
-  is not done yet — this is the store, not the reference mechanism.
+  trusted Go callers only.
+- **Credential references inside a flow** (`flowstore.ResolveCredentials`/
+  `RedactCredentials`, wired in as `flowstore.RunWithCredentials`): the
+  reference mechanism the credential store above was missing. Any Input
+  value (trigger, PIECE, or CODE, any key) can be
+  `{"$credential": "<name>"}` instead of a literal; `ResolveCredentials`
+  substitutes the real decrypted value into a deep-enough COPY of the flow
+  before it runs (the stored/caller-held `*model.FlowVersion` is never
+  mutated), and `RedactCredentials` walks the resulting `ExecutionState`
+  — including every `LOOP_ON_ITEMS` iteration, recursively — replacing each
+  substituted value with `<credential:name>` afterward. Both passes are
+  required together: the engine records each step's already-resolved Input
+  verbatim, and `POST /flows/run`, `POST /flows/{name}/run`, and MCP's
+  `tools/call` all serialize that Input straight back in the response —
+  without the redaction pass a resolved secret would leak into the
+  HTTP/MCP reply. All three run paths go through `RunWithCredentials` now,
+  not just `flowstore.Run` directly. A flow referencing a credential that
+  isn't stored fails as a validation error (400/`isError`), the same
+  category as referencing a piece that doesn't exist — not a 500.
+  Verified end-to-end over real HTTP and MCP with the raw response body
+  searched for the literal secret (absent) alongside proof the real value
+  reached the piece.
 - **Named flow persistence** (`pkg/flowstore`): closes the gap between "run
   a flow once, ad-hoc" (`POST /flows/run`) and "a flow is a reusable,
   discoverable thing" — the prerequisite for exposing flows as MCP tools
