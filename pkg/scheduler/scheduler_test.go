@@ -45,6 +45,40 @@ func scheduledFlow(name string, intervalSeconds int64) model.FlowVersion {
 	}
 }
 
+// failingScheduledFlow is scheduledFlow's shape but its CODE step always
+// throws — used to prove TriggerOnFailure actually fires from inside the
+// scheduler's own per-flow goroutine.
+func failingScheduledFlow(name string, intervalSeconds int64) model.FlowVersion {
+	return model.FlowVersion{
+		ID: "fv-" + name,
+		Trigger: &model.FlowTrigger{
+			Name: "trigger_1", DisplayName: "Schedule", Type: model.TriggerPiece,
+			PieceName: schedule.PieceName, TriggerName: schedule.TriggerName,
+			Input: map[string]any{"intervalSeconds": intervalSeconds},
+			NextAction: &model.FlowAction{
+				Name: "boom", DisplayName: "Boom", Type: model.ActionCode,
+				Code: &model.CodeSettings{Source: `(params) => { throw new Error("boom"); }`},
+			},
+		},
+	}
+}
+
+// notifyFlow is a valid, always-succeeding, EMPTY-trigger CODE flow — the
+// scheduler's own tick loop never picks it up on its own (isScheduleTriggered
+// is false for it), so it should only ever run via TriggerOnFailure.
+func notifyFlow() model.FlowVersion {
+	return model.FlowVersion{
+		ID: "fv-notify",
+		Trigger: &model.FlowTrigger{
+			Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+			NextAction: &model.FlowAction{
+				Name: "ack", DisplayName: "Ack", Type: model.ActionCode,
+				Code: &model.CodeSettings{Source: `(params) => ({ acked: true })`},
+			},
+		},
+	}
+}
+
 func newFlowStore(t *testing.T) *flowstore.GatedStore {
 	t.Helper()
 	fs, err := flowstore.NewFileStore(t.TempDir())
@@ -94,6 +128,32 @@ func TestScheduler_FiresSavedFlowOnItsOwn(t *testing.T) {
 	}
 	if summaries[0].Status != model.FlowRunSucceeded {
 		t.Fatalf("recorded run Status = %v, want SUCCEEDED", summaries[0].Status)
+	}
+}
+
+func TestScheduler_OnFailureConfigured_TriggersNamedFlow_RecordedInHistory(t *testing.T) {
+	fs := newFlowStore(t)
+	if err := fs.Save(flowstore.FlowDefinition{Name: "notify", DisplayName: "Notify", Flow: notifyFlow()}); err != nil {
+		t.Fatalf("Save notify: %v", err)
+	}
+	failer := failingScheduledFlow("failer", 1)
+	if err := fs.Save(flowstore.FlowDefinition{Name: "failer", DisplayName: "Failer", Flow: failer, OnFailureFlow: "notify"}); err != nil {
+		t.Fatalf("Save failer: %v", err)
+	}
+	hist := runstore.NewMemoryStore()
+	sched := scheduler.New(fs, scheduleRegistry, nil, hist, 100*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sched.Run(ctx)
+
+	summaries := waitForRuns(t, hist, 2, 2*time.Second)
+	names := map[string]int{}
+	for _, s := range summaries {
+		names[s.FlowName]++
+	}
+	if names["failer"] != 1 || names["notify"] != 1 {
+		t.Fatalf("recorded runs = %v, want exactly one for \"failer\" and one for \"notify\"", names)
 	}
 }
 

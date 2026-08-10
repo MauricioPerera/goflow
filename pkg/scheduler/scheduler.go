@@ -149,9 +149,18 @@ func (s *Scheduler) maybeRun(def flowstore.FlowDefinition) {
 			s.mu.Unlock()
 		}()
 		for _, item := range items {
-			if _, _, err := flowstore.RunWithHistory(&flow, s.BuildRegistry, s.CredStore, s.HistoryStore, def.Name, item, false); err != nil {
+			state, _, err := flowstore.RunWithHistory(&flow, s.BuildRegistry, s.CredStore, s.HistoryStore, def.Name, item, false)
+			if err != nil {
 				log.Printf("scheduler: flow %q: run failed: %v", def.Name, err)
+				continue
 			}
+			// A scheduled run is the other case with no human watching it
+			// in real time — see flowstore.TriggerOnFailure's own doc
+			// comment. Runs inside this same goroutine, so a slow
+			// on-failure flow delays only this flow's own next tick
+			// eligibility (s.running stays true until it returns), never
+			// the scheduler's overall tick loop.
+			flowstore.TriggerOnFailure(s.FlowStore, def.Name, def.OnFailureFlow, state, s.BuildRegistry, s.CredStore, s.HistoryStore)
 		}
 	}()
 }

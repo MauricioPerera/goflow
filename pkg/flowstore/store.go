@@ -79,6 +79,16 @@ type FlowDefinition struct {
 	// ...) should still verify that signature itself inside the flow, using
 	// the hash piece's HMAC support — see README's webhook-ingress entry.
 	WebhookSecretCredential string
+
+	// OnFailureFlow, if set, names ANOTHER saved flow to run whenever this
+	// one's Verdict.Status ends up FAILED — a webhook- or scheduler-fired
+	// run has no human watching it in real time, so without this the only
+	// way to learn a run failed is polling GET /runs. Empty (the default)
+	// disables it entirely: saving a flow must never silently start firing
+	// another one. See TriggerOnFailure for the exact contract (what the
+	// on-failure flow receives as its trigger payload, and why it can
+	// never chain more than one hop deep).
+	OnFailureFlow string
 }
 
 // Store is the surface a flow store exposes: Save persists a FlowDefinition

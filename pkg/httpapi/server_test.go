@@ -1290,6 +1290,101 @@ func webhookFailFlowDef(name string) flowstore.FlowDefinition {
 	}
 }
 
+// notifyFlowDef is a valid, always-succeeding CODE flow used as the
+// OnFailureFlow target in the tests below — its own success/failure isn't
+// the point, just that it actually RAN and got recorded.
+func notifyFlowDef(name string) flowstore.FlowDefinition {
+	return flowstore.FlowDefinition{
+		Name: name, DisplayName: "Notify",
+		Flow: model.FlowVersion{
+			ID: "fv-notify",
+			Trigger: &model.FlowTrigger{
+				Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+				NextAction: &model.FlowAction{
+					Name: "ack", DisplayName: "Ack", Type: model.ActionCode,
+					Code: &model.CodeSettings{Source: `(params) => ({ acked: true })`},
+				},
+			},
+		},
+	}
+}
+
+func TestWebhook_OnFailure_TriggersNamedFlow_RecordedInHistory(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", notifyFlowDef("notify"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save notify: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	failing := webhookFailFlowDef("failing-webhook")
+	failing.OnFailureFlow = "notify"
+	if rec := do(t, srv, "POST", "/flows", failing, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save failing: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	if rec := postWebhook(srv, "failing-webhook", "", ""); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("webhook: status = %d, want 500 (the flow itself failed); body=%s", rec.Code, rec.Body.String())
+	}
+
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	m := decode(t, listRec)
+	runs, _ := m["runs"].([]any)
+	names := map[string]int{}
+	for _, r := range runs {
+		rm, _ := r.(map[string]any)
+		names[rm["FlowName"].(string)]++
+	}
+	if names["failing-webhook"] != 1 || names["notify"] != 1 {
+		t.Fatalf("recorded runs = %v, want exactly one for \"failing-webhook\" and one for \"notify\"", names)
+	}
+}
+
+func TestFlowRun_OnFailureConfigured_TriggersNamedFlow_RecordedInHistory(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", notifyFlowDef("notify"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save notify: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	failing := webhookFailFlowDef("failing-named")
+	failing.OnFailureFlow = "notify"
+	if rec := do(t, srv, "POST", "/flows", failing, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save failing: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, srv, "POST", "/flows/failing-named/run", nil, true); rec.Code != http.StatusOK {
+		t.Fatalf("run: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	m := decode(t, listRec)
+	runs, _ := m["runs"].([]any)
+	names := map[string]int{}
+	for _, r := range runs {
+		rm, _ := r.(map[string]any)
+		names[rm["FlowName"].(string)]++
+	}
+	if names["failing-named"] != 1 || names["notify"] != 1 {
+		t.Fatalf("recorded runs = %v, want exactly one for \"failing-named\" and one for \"notify\"", names)
+	}
+}
+
+func TestFlowRun_OnFailureNotConfigured_DoesNotTriggerAnything(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", notifyFlowDef("notify"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save notify: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	failing := webhookFailFlowDef("failing-no-hook") // WebhookEnabled true, OnFailureFlow left empty
+	if rec := do(t, srv, "POST", "/flows", failing, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save failing: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, srv, "POST", "/flows/failing-no-hook/run", nil, true); rec.Code != http.StatusOK {
+		t.Fatalf("run: status = %d, want 200 (ExecuteBegin never errors the HTTP call); body=%s", rec.Code, rec.Body.String())
+	}
+
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	m := decode(t, listRec)
+	runs, _ := m["runs"].([]any)
+	if len(runs) != 1 {
+		t.Fatalf("recorded runs = %+v, want exactly one — \"notify\" must not have fired", runs)
+	}
+}
+
 func postWebhook(srv *Server, name, body, secretHeader string) *httptest.ResponseRecorder {
 	var r *http.Request
 	if body == "" {

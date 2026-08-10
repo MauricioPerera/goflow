@@ -428,6 +428,60 @@ func TestToolsCall_Throws_IsErrorTrueInResult(t *testing.T) {
 	}
 }
 
+// notifyFlow is a valid, always-succeeding CODE flow that ignores its
+// trigger payload entirely — used as the OnFailureFlow target below, since
+// TriggerOnFailure's payload (flowName/failedStepName/...) has nothing a
+// flow expecting doublesArgFlow's {{ trigger_1.output.n }} could resolve.
+func notifyFlow() flowstore.FlowDefinition {
+	return flowstore.FlowDefinition{
+		Name: "notify", DisplayName: "Notify",
+		Flow: model.FlowVersion{
+			ID: "fv-notify",
+			Trigger: &model.FlowTrigger{
+				Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+				NextAction: &model.FlowAction{
+					Name: "ack", DisplayName: "Ack", Type: model.ActionCode,
+					Code: &model.CodeSettings{Source: `(params) => ({ acked: true })`},
+				},
+			},
+		},
+	}
+}
+
+func TestToolsCall_OnFailureConfigured_TriggersNamedFlow_RecordedInHistory(t *testing.T) {
+	failing := throwsFlow()
+	failing.OnFailureFlow = "notify"
+	h, hist := newHandlerWithFlowsAndHistory(t, notifyFlow(), failing)
+
+	callTool(t, h, "throws", nil)
+
+	summaries, err := hist.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	names := map[string]int{}
+	for _, s := range summaries {
+		names[s.FlowName]++
+	}
+	if names["throws"] != 1 || names["notify"] != 1 {
+		t.Fatalf("recorded runs = %v, want exactly one for \"throws\" and one for \"notify\"", names)
+	}
+}
+
+func TestToolsCall_OnFailureNotConfigured_DoesNotTriggerAnything(t *testing.T) {
+	h, hist := newHandlerWithFlowsAndHistory(t, notifyFlow(), throwsFlow()) // throwsFlow has no OnFailureFlow set
+
+	callTool(t, h, "throws", nil)
+
+	summaries, err := hist.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("recorded runs = %+v, want exactly one — \"notify\" must not have fired", summaries)
+	}
+}
+
 func TestInvalidJSON_Error32700NullID(t *testing.T) {
 	h := newHandlerWithFlows(t)
 	rec := callRaw(t, h, "this is not json at all")

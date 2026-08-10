@@ -229,6 +229,7 @@ func metaToolDescriptors() []map[string]any {
 					"inputSchema":             map[string]any{"type": "string", "description": "free-text description of the trigger payload this flow expects"},
 					"webhookEnabled":          map[string]any{"type": "boolean", "description": "opt this flow into POST /webhooks/{name}, an unauthenticated ingress route — off by default"},
 					"webhookSecretCredential": map[string]any{"type": "string", "description": "name of a credential (see goflow_save_credential) whose value POST /webhooks/{name} then requires as the X-Webhook-Secret header; omit for no secret check"},
+					"onFailureFlow":           map[string]any{"type": "string", "description": "name of ANOTHER saved flow to run whenever this one's run ends FAILED — its trigger payload is {flowName, failedStepName, failedStepDisplayName, failedMessage}. Omit to disable (the default). Never chains more than one hop even if the on-failure flow also has its own onFailureFlow set."},
 					"flow":                    map[string]any{"type": "object", "description": "the trigger + action graph itself — see this tool's own description for where to find the exact shape"},
 				},
 				"required": []string{"name", "flow"},
@@ -919,6 +920,7 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 	}
 
 	state, validationErrs, runErr := flowstore.RunWithHistory(&def.Flow, h.BuildRegistry, h.CredStore, h.HistoryStore, def.Name, params.Arguments, false)
+	flowstore.TriggerOnFailure(h.FlowStore, def.Name, def.OnFailureFlow, state, h.BuildRegistry, h.CredStore, h.HistoryStore)
 	writeFlowRunResult(w, req.ID, state, validationErrs, runErr)
 }
 

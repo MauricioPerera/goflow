@@ -234,21 +234,26 @@ func (s *Server) handleFlowsRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	s.runFlowVersion(w, &req.Flow, "", req.Trigger, req.ExecuteTrigger)
+	s.runFlowVersion(w, &req.Flow, "", "", req.Trigger, req.ExecuteTrigger)
 }
 
 // runFlowVersion is the shared run path for both POST /flows/run (an ad-hoc
-// FlowVersion in the body — flowName "") and POST /flows/{name}/run (a
+// FlowVersion in the body — flowName "", onFailureFlow "": an ad-hoc run has
+// no FlowDefinition to read one from) and POST /flows/{name}/run (a
 // FlowVersion fetched from the store by name — flowName is that name,
-// recorded alongside the run in history). The validate-then-execute logic
-// itself lives in flowstore.RunWithHistory (shared with the MCP tools/call
-// path); this method only translates its three return values into the HTTP
-// response shape the two routes have always had: 400 {"error":...} on a
-// registry failure, 400 {"errors":[...]} on a validation failure, and the
-// bare *model.ExecutionState as the whole 200 body on success (never
-// wrapped — matching the ad-hoc route's original shape, so the existing
-// /flows/run and /flows/{name}/run tests pass unchanged).
-func (s *Server) runFlowVersion(w http.ResponseWriter, fv *model.FlowVersion, flowName string, trigger any, executeTrigger bool) {
+// recorded alongside the run in history; onFailureFlow is that
+// FlowDefinition's own OnFailureFlow, if set). The validate-then-execute
+// logic itself lives in flowstore.RunWithHistory (shared with the MCP
+// tools/call path); this method only translates its three return values
+// into the HTTP response shape the two routes have always had: 400
+// {"error":...} on a registry failure, 400 {"errors":[...]} on a validation
+// failure, and the bare *model.ExecutionState as the whole 200 body on
+// success (never wrapped — matching the ad-hoc route's original shape, so
+// the existing /flows/run and /flows/{name}/run tests pass unchanged). A
+// FAILED verdict runs flowstore.TriggerOnFailure BEFORE the response is
+// written — deliberately synchronous, see that function's own doc comment
+// for why.
+func (s *Server) runFlowVersion(w http.ResponseWriter, fv *model.FlowVersion, flowName, onFailureFlow string, trigger any, executeTrigger bool) {
 	state, validationErrs, err := flowstore.RunWithHistory(fv, s.buildRegistry, s.credStore, s.runStore, flowName, trigger, executeTrigger)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -262,6 +267,8 @@ func (s *Server) runFlowVersion(w http.ResponseWriter, fv *model.FlowVersion, fl
 		writeJSON(w, http.StatusBadRequest, map[string]any{"errors": out})
 		return
 	}
+
+	flowstore.TriggerOnFailure(s.flowStore, flowName, onFailureFlow, state, s.buildRegistry, s.credStore, s.runStore)
 
 	// The ExecutionState is the whole body — not wrapped in another object.
 	// Its runtime types have no json tags, so fields marshal as their Go
@@ -392,7 +399,7 @@ func (s *Server) handleFlowRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.runFlowVersion(w, &def.Flow, name, req.Trigger, req.ExecuteTrigger)
+	s.runFlowVersion(w, &def.Flow, name, def.OnFailureFlow, req.Trigger, req.ExecuteTrigger)
 }
 
 // exportRequest is the body shape POST /flows/export/js expects — the same
@@ -517,6 +524,10 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
+	// A webhook-fired run has no human watching it — exactly the case
+	// OnFailureFlow exists for. Before the (already-generic, no-detail)
+	// response goes out, matching every other call site's ordering.
+	flowstore.TriggerOnFailure(s.flowStore, name, def.OnFailureFlow, state, s.buildRegistry, s.credStore, s.runStore)
 	writeWebhookResult(w, state)
 }
 

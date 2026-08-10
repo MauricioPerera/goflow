@@ -722,6 +722,33 @@ below for what a Go rewrite gets and gives up.
   `goflow_describe_catalog`) — the tool an agent is already told to call
   FIRST before authoring a flow around a piece, so the credential need
   surfaces at the earliest possible read, not after a failed run.
+- **On-failure notification** (`flowstore.FlowDefinition.OnFailureFlow`,
+  `flowstore.TriggerOnFailure`): a webhook- or scheduler-fired run has no
+  human watching it in real time — without this, the only way to learn a
+  run failed was polling `GET /runs`. `OnFailureFlow` names ANOTHER saved
+  flow to run whenever this one's `Verdict.Status` ends up `FAILED`; empty
+  (the default) disables it entirely, same "off unless opted in" shape as
+  `WebhookEnabled`. Rides along for free through every existing save path
+  (`POST /flows`, `goflow_save_flow`) since `FlowDefinition` decodes
+  generically. `TriggerOnFailure` itself needed no change to
+  `RunWithHistory` — the one function every transport already shares — it's
+  a small SEPARATE helper each of the four run-triggering call sites
+  (`POST /flows/{name}/run`, `POST /webhooks/{name}`, MCP `tools/call`'s
+  named-flow path, and `pkg/scheduler`'s tick loop) calls right after its
+  own existing `RunWithHistory`, since all four already have the
+  `FlowDefinition` in scope there. The on-failure flow runs through that
+  same `RunWithHistory` path too — recorded in history under its own name,
+  credentials resolved the same way as any other run — with a trigger
+  payload of `{flowName, failedStepName, failedStepDisplayName,
+  failedMessage}`. Deliberately synchronous (blocks the caller until the
+  on-failure flow itself finishes — the alternative, firing it in a
+  goroutine, would be untestable without a synchronization hook, and this
+  project has no flaky/async tests anywhere) and capped at exactly one hop
+  (the on-failure flow's own `OnFailureFlow`, if it has one, is never
+  read) — a circular pair (A's on-failure is B, B's on-failure is A) can
+  never loop. An ad-hoc run (`POST /flows/run`, MCP `goflow_run_flow`) has
+  no `FlowDefinition` to read this from, so it never applies there — same
+  scoping `WebhookEnabled` already has.
 
 ## Explicitly NOT in v1
 
