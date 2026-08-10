@@ -1038,3 +1038,292 @@ func TestPostFlowsRun_ValidationFailure_NotRecordedInHistory(t *testing.T) {
 		t.Fatalf("runs = %v, want nothing recorded for a flow that never ran", m["runs"])
 	}
 }
+
+// --- POST /webhooks/{name} ---------------------------------------------------
+
+// webhookEchoFlowDef reads n from the TRIGGER payload (not a hardcoded step
+// input, unlike validFlowDef) via {{ trigger_1.output.n }} — the shape a
+// real webhook flow needs, since the payload is whatever the external
+// sender's POST body carries.
+func webhookEchoFlowDef(name string, enabled bool, secretCred string) flowstore.FlowDefinition {
+	return flowstore.FlowDefinition{
+		Name: name, DisplayName: "Webhook Echo", Description: "doubles n from the webhook payload",
+		WebhookEnabled: enabled, WebhookSecretCredential: secretCred,
+		Flow: model.FlowVersion{
+			ID: "fv-webhook-echo",
+			Trigger: &model.FlowTrigger{
+				Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+				NextAction: &model.FlowAction{
+					Name: "double", DisplayName: "Double", Type: model.ActionCode,
+					Code: &model.CodeSettings{
+						Input:  map[string]any{"n": "{{ trigger_1.output.n }}"},
+						Source: `(params) => ({ doubled: params.n * 2 })`,
+					},
+				},
+			},
+		},
+	}
+}
+
+// webhookReplyFlowDef calls the webhook_reply piece's actionName ("stop" or
+// "respond") with a custom status/body/header, so a test can confirm
+// handleWebhook delivers it verbatim as the real HTTP response.
+func webhookReplyFlowDef(name, actionName string) flowstore.FlowDefinition {
+	return flowstore.FlowDefinition{
+		Name: name, DisplayName: "Webhook Reply", WebhookEnabled: true,
+		Flow: model.FlowVersion{
+			ID: "fv-webhook-reply",
+			Trigger: &model.FlowTrigger{
+				Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+				NextAction: &model.FlowAction{
+					Name: "reply", DisplayName: "Reply", Type: model.ActionPiece,
+					Piece: &model.PieceSettings{
+						PieceName: "webhook_reply", ActionName: actionName,
+						Input: map[string]any{
+							"status":  201,
+							"body":    map[string]any{"received": true},
+							"headers": map[string]any{"X-Custom": "yes"},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// webhookFailFlowDef is WebhookEnabled and throws — no explicit
+// Stop/Respond, so handleWebhook's fallback ack must reflect the failure.
+func webhookFailFlowDef(name string) flowstore.FlowDefinition {
+	return flowstore.FlowDefinition{
+		Name: name, DisplayName: "Webhook Fail", WebhookEnabled: true,
+		Flow: model.FlowVersion{
+			ID: "fv-webhook-fail",
+			Trigger: &model.FlowTrigger{
+				Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+				NextAction: &model.FlowAction{
+					Name: "boom", DisplayName: "Boom", Type: model.ActionCode,
+					Code: &model.CodeSettings{Source: `(params) => { throw new Error("boom"); }`},
+				},
+			},
+		},
+	}
+}
+
+func postWebhook(srv *Server, name, body, secretHeader string) *httptest.ResponseRecorder {
+	var r *http.Request
+	if body == "" {
+		r = httptest.NewRequest("POST", "/webhooks/"+name, nil)
+	} else {
+		r = httptest.NewRequest("POST", "/webhooks/"+name, strings.NewReader(body))
+	}
+	if secretHeader != "" {
+		r.Header.Set("X-Webhook-Secret", secretHeader)
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, r)
+	return rec
+}
+
+func TestWebhook_UnknownFlow_404(t *testing.T) {
+	srv := newTestServer(t)
+	rec := postWebhook(srv, "never-saved", "", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestWebhook_NotEnabled_404SameAsUnknown proves a saved-but-not-enabled
+// flow gets the IDENTICAL response an unknown flow gets — an outside caller
+// can't distinguish "doesn't exist" from "exists but not webhook-enabled".
+func TestWebhook_NotEnabled_404SameAsUnknown(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", webhookEchoFlowDef("disabled-flow", false, ""), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	rec := postWebhook(srv, "disabled-flow", "", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWebhook_NoAuthRequired_PayloadBecomesTriggerAndRuns(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", webhookEchoFlowDef("echo", true, ""), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Deliberately NO Authorization header — a third-party sender has no
+	// way to know GOFLOW_API_TOKEN.
+	r := httptest.NewRequest("POST", "/webhooks/echo", strings.NewReader(`{"n": 7}`))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	if m["status"] != "ok" {
+		t.Fatalf("body = %v, want the generic ack {status: ok} — not the full ExecutionState", m)
+	}
+}
+
+func TestWebhook_MalformedJSONBody_400(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", webhookEchoFlowDef("echo", true, ""), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	rec := postWebhook(srv, "echo", "{not valid json", "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWebhook_SecretConfigured_MissingOrWrongHeaderRejected(t *testing.T) {
+	srv := newTestServer(t)
+	if err := srv.credStore.Save("wh-secret", "correct-horse-battery-staple"); err != nil {
+		t.Fatalf("credStore.Save: %v", err)
+	}
+	if rec := do(t, srv, "POST", "/flows", webhookEchoFlowDef("secured", true, "wh-secret"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	if rec := postWebhook(srv, "secured", `{"n":1}`, ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no header: status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := postWebhook(srv, "secured", `{"n":1}`, "wrong-secret"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong header: status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWebhook_SecretConfigured_CorrectHeaderSucceeds(t *testing.T) {
+	srv := newTestServer(t)
+	if err := srv.credStore.Save("wh-secret", "correct-horse-battery-staple"); err != nil {
+		t.Fatalf("credStore.Save: %v", err)
+	}
+	if rec := do(t, srv, "POST", "/flows", webhookEchoFlowDef("secured", true, "wh-secret"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec := postWebhook(srv, "secured", `{"n":1}`, "correct-horse-battery-staple")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestWebhook_SecretCredentialUnresolvable_FailsClosed proves a
+// WebhookSecretCredential naming a credential that was never actually
+// saved denies every request — it must never silently behave as "no
+// secret required".
+func TestWebhook_SecretCredentialUnresolvable_FailsClosed(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", webhookEchoFlowDef("dangling", true, "never-saved-cred"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	rec := postWebhook(srv, "dangling", `{"n":1}`, "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestWebhook_StopResponse_DeliveredVerbatim proves ctx.Run.Stop's
+// status/body/headers become the REAL HTTP response — the first route in
+// this project where that's actually delivered instead of just recorded in
+// the ExecutionState.
+func TestWebhook_StopResponse_DeliveredVerbatim(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", webhookReplyFlowDef("stopper", "stop"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	rec := postWebhook(srv, "stopper", "", "")
+	if rec.Code != http.StatusCreated { // 201, as set by webhookReplyFlowDef's Input
+		t.Fatalf("status = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Custom"); got != "yes" {
+		t.Fatalf("X-Custom header = %q, want %q", got, "yes")
+	}
+	m := decode(t, rec)
+	if m["received"] != true {
+		t.Fatalf("body = %v, want {received: true} verbatim, not the ExecutionState", m)
+	}
+}
+
+func TestWebhook_RespondEarly_DeliveredVerbatim(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", webhookReplyFlowDef("responder", "respond"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	rec := postWebhook(srv, "responder", "", "")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	if m["received"] != true {
+		t.Fatalf("body = %v, want {received: true} verbatim", m)
+	}
+}
+
+func TestWebhook_NoExplicitResponse_FailedFlowGetsGenericAck500(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", webhookFailFlowDef("failer"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	rec := postWebhook(srv, "failer", "", "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	if m["status"] != "failed" {
+		t.Fatalf("body = %v, want the generic {status: failed} ack — not step-level error detail", m)
+	}
+}
+
+// TestWebhook_RecordedInHistory proves a webhook-triggered run goes through
+// flowstore.RunWithHistory exactly like every other transport — GET /runs
+// sees it with the flow's name.
+func TestWebhook_RecordedInHistory(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", webhookEchoFlowDef("echo", true, ""), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := postWebhook(srv, "echo", `{"n":3}`, ""); rec.Code != http.StatusOK {
+		t.Fatalf("webhook: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	m := decode(t, listRec)
+	runs, _ := m["runs"].([]any)
+	if len(runs) != 1 {
+		t.Fatalf("runs = %v, want exactly 1 recorded run", m["runs"])
+	}
+	summary, _ := runs[0].(map[string]any)
+	if summary["FlowName"] != "echo" {
+		t.Fatalf("FlowName = %v, want %q", summary["FlowName"], "echo")
+	}
+}
+
+// TestGetFlows_ListsWebhookEnabled proves GET /flows' metadata-only listing
+// includes WebhookEnabled, so an agent can discover which flows accept
+// POST /webhooks/{name} without fetching each one's full definition.
+func TestGetFlows_ListsWebhookEnabled(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", webhookEchoFlowDef("echo", true, ""), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, srv, "POST", "/flows", validFlowDef("plain"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec := do(t, srv, "GET", "/flows", nil, true)
+	m := decode(t, rec)
+	flows, _ := m["flows"].([]any)
+	byName := map[string]map[string]any{}
+	for _, f := range flows {
+		fm, _ := f.(map[string]any)
+		byName[fm["name"].(string)] = fm
+	}
+	if byName["echo"]["webhookEnabled"] != true {
+		t.Fatalf("echo.webhookEnabled = %v, want true", byName["echo"]["webhookEnabled"])
+	}
+	if byName["plain"]["webhookEnabled"] != false {
+		t.Fatalf("plain.webhookEnabled = %v, want false", byName["plain"]["webhookEnabled"])
+	}
+}

@@ -378,8 +378,10 @@ below for what a Go rewrite gets and gives up.
   verbatim, and `POST /flows/run`, `POST /flows/{name}/run`, and MCP's
   `tools/call` all serialize that Input straight back in the response —
   without the redaction pass a resolved secret would leak into the
-  HTTP/MCP reply. All three run paths go through `RunWithCredentials`
-  (via `RunWithHistory`) now, not just `flowstore.Run` directly. A flow
+  HTTP/MCP reply. Every way to run a flow — ad-hoc, named, MCP `tools/call`,
+  `POST /webhooks/{name}`, and `pkg/scheduler` (all below) — goes through
+  `RunWithCredentials` (via `RunWithHistory`) now, not just `flowstore.Run`
+  directly. A flow
   referencing a credential that isn't stored fails as a validation error
   (400/`isError`), the same
   category as referencing a piece that doesn't exist — not a 500.
@@ -397,18 +399,54 @@ below for what a Go rewrite gets and gives up.
   it ever reaches disk. `POST`/`GET /flows`, `GET`/`DELETE /flows/{name}`,
   and `POST /flows/{name}/run` share the same execution path as the ad-hoc
   route (`flowstore.Run`/`RunWithCredentials`/`RunWithHistory`, extracted
-  once a third caller — MCP, below — needed it too, so the three transports
+  once a third caller — MCP, below — needed it too, so the transports
   can't drift apart in what "run a flow" means).
+- **Webhook ingress** (`POST /webhooks/{name}`): the piece a persisted flow
+  was still missing — a way for a THIRD PARTY (Stripe, GitHub, anything
+  that can't know `GOFLOW_API_TOKEN`) to actually trigger one. Deliberately
+  NOT behind `s.auth` — the whole point is a caller with no token — gated
+  instead by two things checked in order: the flow must have
+  `FlowDefinition.WebhookEnabled` set (off by default, so saving a flow
+  never silently creates a public endpoint), and if
+  `WebhookSecretCredential` names a credential, the request's
+  `X-Webhook-Secret` header must match it, constant-time compared, failing
+  CLOSED (401) if the credential can't be resolved at all. That field is a
+  credential *reference*, not a plain string on `FlowDefinition` — a plain
+  field would put the secret in `flowstore`'s own plaintext JSON file,
+  exactly what `pkg/credentials` exists to avoid; this is the same
+  encrypted-at-rest store `$credential` markers already use, applied to a
+  second concern. A shared secret is only a floor, not a replacement for
+  real signature verification — a provider that signs its payloads
+  (GitHub's `X-Hub-Signature-256`, Stripe-Signature, ...) should still
+  verify that signature itself, inside the flow, using the `hash` piece's
+  existing HMAC support. An unknown flow name and a known-but-disabled one
+  get the identical 404, so an outside caller can't probe for valid names.
+  The request body is decoded as JSON and becomes the trigger payload
+  directly (no `{"trigger": ...}` envelope — a webhook sender has no reason
+  to know goflow's own request shape). The response is the other half of
+  what makes this route different from every other run-triggering one:
+  `model.ExecutionState.RespondedEarly`'s own doc comment says plainly
+  "there is deliberately no simulated HTTP layer here to actually deliver
+  it" — true at the engine layer, but `/webhooks/{name}` IS that HTTP
+  layer, the first transport in this project where a real outside caller is
+  actually waiting on `ctx.Run.Stop`/`Respond`'s reply, so it delivers that
+  status/body/headers verbatim instead of dumping the full
+  `ExecutionState` (which would leak internal step Input/Output to an
+  unauthenticated caller by default). Neither hook fired: a deliberately
+  generic ack — `{"status":"ok"}`/200 on success, `{"status":"failed"}`/500
+  otherwise, no step-level detail. Goes through the same
+  `flowstore.RunWithHistory` as every other transport, so a webhook-
+  triggered run shows up in `GET /runs` exactly like any other.
 - **Persistent run history** (`pkg/runstore`, wired in as
   `flowstore.RunWithHistory`): closes the gap this file used to describe
   under "Explicitly NOT in v1" — a `Verdict`/`Steps` map that existed only
   for the duration of one call and was returned to the caller, never stored.
   `RunWithHistory` wraps `RunWithCredentials` (credentials already resolved
   *and redacted* by the time a run reaches it, so a secret never gets as far
-  as the history store) and is now the single path all three transports
-  call — `POST /flows/run`, `POST /flows/{name}/run`, and MCP's
-  `tools/call` — so a run is recorded identically regardless of which one
-  triggered it. Unlike `catalog.Store`/`credentials.Store`/`flowstore.Store`,
+  as the history store) and is now the single path every way to run a flow
+  calls — `POST /flows/run`, `POST /flows/{name}/run`, MCP's `tools/call`,
+  `POST /webhooks/{name}`, and `pkg/scheduler` — so a run is recorded
+  identically regardless of which one triggered it. Unlike `catalog.Store`/`credentials.Store`/`flowstore.Store`,
   a run record has no caller-chosen name to key on, so `Store.Save` assigns
   a fresh random id and hands it back, the way a database insert returns a
   generated primary key. A run is recorded on both success AND failure (a
@@ -499,10 +537,10 @@ below for what a Go rewrite gets and gives up.
   never clash over the same literal cursor key — same reasoning
   `ScopedStore`'s doc comment already gives for exactly this "multiple
   flows, one trigger mechanism" shape), and for a due flow runs it through
-  `flowstore.RunWithHistory` — the identical path `POST /flows/{name}/run`
-  and MCP's `tools/call` already share, so a schedule-fired run resolves
-  and redacts credentials and lands in run history exactly like a manually
-  triggered one, not a fourth, subtly different way to run a flow.
+  `flowstore.RunWithHistory` — the identical path every other transport
+  already shares, so a schedule-fired run resolves and redacts credentials
+  and lands in run history exactly like a manually triggered one, not a
+  new, subtly different way to run a flow.
   In-memory cursors only, deliberately (a restart re-fires every
   schedule-triggered flow once, immediately — the same first-call behavior
   a brand-new flow already has, not a new failure mode); a per-flow
@@ -523,8 +561,9 @@ longer are, and should be stated plainly rather than left stale:
 
 - **"No server/API" is no longer true.** `pkg/httpapi` + `cmd/server` is a
   real HTTP server (`/health`, `/catalog`, `/pieces`, `/flows*`,
-  `/credentials*`, `/runs*`, `/mcp`, `/oauth/*`, `/.well-known/oauth-*`
-  — see "What's here" above), deployed and
+  `/credentials*`, `/runs*`, `/mcp`, `/oauth/*`, `/.well-known/oauth-*`,
+  `/webhooks/{name}` (deliberately public — see "What's here" above),
+  deployed and
   running on a real VPS as a systemd service. "No auth" is also no longer true, but
   stays narrow: every non-public route requires either the single shared
   bearer token (constant-time compared) or an access token minted by

@@ -94,6 +94,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /flows/{name}", s.auth(http.HandlerFunc(s.handleFlowGet)))
 	mux.Handle("DELETE /flows/{name}", s.auth(http.HandlerFunc(s.handleFlowDelete)))
 	mux.Handle("POST /flows/{name}/run", s.auth(http.HandlerFunc(s.handleFlowRun)))
+	// POST /webhooks/{name} is deliberately NOT behind s.auth — see
+	// handleWebhook's doc comment for why and what gates it instead.
+	mux.HandleFunc("POST /webhooks/{name}", s.handleWebhook)
 	mux.Handle("/credentials", s.auth(http.HandlerFunc(s.handleCredentials)))
 	mux.Handle("DELETE /credentials/{name}", s.auth(http.HandlerFunc(s.handleCredentialDelete)))
 	// /runs exposes the run history flowstore.RunWithHistory records for
@@ -223,14 +226,17 @@ func (s *Server) runFlowVersion(w http.ResponseWriter, fv *model.FlowVersion, fl
 }
 
 // flowSummary is the metadata-only projection of a FlowDefinition returned
-// by GET /flows — Name/DisplayName/Description only, never the full
-// FlowVersion. Deliberately light: the listing is meant to be cheap, like a
-// future tools/list of MCP, so a caller can pick a flow without every saved
-// flow's whole definition crossing the wire.
+// by GET /flows — never the full FlowVersion. Deliberately light: the
+// listing is meant to be cheap, like tools/list of MCP, so a caller can pick
+// a flow without every saved flow's whole definition crossing the wire.
+// WebhookEnabled is included (unlike WebhookSecretCredential, which isn't)
+// so an agent listing flows can see which ones accept POST /webhooks/{name}
+// without fetching each one's full GET /flows/{name}.
 type flowSummary struct {
-	Name        string `json:"name"`
-	DisplayName string `json:"displayName"`
-	Description string `json:"description"`
+	Name           string `json:"name"`
+	DisplayName    string `json:"displayName"`
+	Description    string `json:"description"`
+	WebhookEnabled bool   `json:"webhookEnabled"`
 }
 
 // handleFlows routes POST (save a named flow) and GET (list flows,
@@ -265,6 +271,7 @@ func (s *Server) handleFlows(w http.ResponseWriter, r *http.Request) {
 		for _, d := range defs {
 			summaries = append(summaries, flowSummary{
 				Name: d.Name, DisplayName: d.DisplayName, Description: d.Description,
+				WebhookEnabled: d.WebhookEnabled,
 			})
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"flows": summaries})
@@ -340,6 +347,129 @@ func (s *Server) handleFlowRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.runFlowVersion(w, &def.Flow, name, req.Trigger, req.ExecuteTrigger)
+}
+
+// handleWebhook handles POST /webhooks/{name} — the ingress route a THIRD
+// PARTY (Stripe, GitHub, a cron-as-a-service, ...) calls directly, which is
+// exactly why it isn't behind s.auth: an outside caller has no way to know
+// GOFLOW_API_TOKEN. What gates it instead:
+//   - The flow must have WebhookEnabled set (a flow saved without opting in
+//     is never publicly triggerable) — checked before anything else runs.
+//   - If the flow set WebhookSecretCredential, the request's
+//     X-Webhook-Secret header must match that credential's value,
+//     constant-time compared. Any resolution failure (credential missing,
+//     wrong type, empty) fails CLOSED as 401 — a secret that can't be
+//     resolved must never silently become "no secret required."
+//
+// An unknown name and a known-but-not-enabled name get the IDENTICAL 404 —
+// distinguishing them would let an outside caller probe for valid flow
+// names.
+//
+// The request body (if any) is decoded as JSON and becomes the trigger
+// payload verbatim — the same shape flowRunRequest.Trigger already is for
+// POST /flows/{name}/run, just read from the raw body instead of a
+// {"trigger": ...} envelope, since a webhook sender has no reason to know
+// goflow's envelope shape.
+//
+// Unlike every other run-triggering route, the HTTP response here is NOT
+// the full ExecutionState (that would leak internal step Input/Output to an
+// unauthenticated outside caller by default) — see writeWebhookResult.
+func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	def, ok, err := s.flowStore.Get(name)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if !ok || !def.WebhookEnabled {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+
+	if def.WebhookSecretCredential != "" {
+		val, ok, err := s.credStore.Get(def.WebhookSecretCredential)
+		secret, isString := val.(string)
+		if err != nil || !ok || !isString || secret == "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		got := r.Header.Get("X-Webhook-Secret")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(secret)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+	}
+
+	var payload any
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body: " + err.Error()})
+			return
+		}
+	}
+
+	state, validationErrs, runErr := flowstore.RunWithHistory(&def.Flow, s.buildRegistry, s.credStore, s.runStore, name, payload, true)
+	if runErr != nil || len(validationErrs) > 0 {
+		// Never expose validation/internal-fault detail to an
+		// unauthenticated third party — that level of detail is for the
+		// trusted /flows* routes only.
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeWebhookResult(w, state)
+}
+
+// writeWebhookResult delivers a PIECE action's ctx.Run.Stop/Respond as the
+// ACTUAL HTTP response — the first transport in this project to do so.
+// model.ExecutionState.RespondedEarly's own doc comment says this
+// plainly: "There is deliberately no simulated HTTP layer here to actually
+// deliver it... distinct from whatever the run's live-later Verdict/Steps
+// end up being" — true at the engine layer, but this IS that HTTP layer,
+// for the one route where a real outside caller is actually waiting on a
+// reply. StopResponse takes priority over RespondedEarly when a run
+// triggers both (Stop can only fire after Respond, if at all, since Stop
+// ends the run — Respond's own reply couldn't have gone out earlier than
+// this point either way, since this whole request is one synchronous call
+// from the caller's perspective; there's only one real HTTP response to
+// send, so the LATER, definitive one wins). Neither fired: a plain ack —
+// {"status":"ok"}/200 on SUCCEEDED, {"status":"failed"}/500 otherwise —
+// deliberately generic, not the full ExecutionState.
+func writeWebhookResult(w http.ResponseWriter, state *model.ExecutionState) {
+	if resp := state.Verdict.StopResponse; resp != nil {
+		writeWebhookResponse(w, resp)
+		return
+	}
+	if resp := state.RespondedEarly; resp != nil {
+		writeWebhookResponse(w, resp)
+		return
+	}
+	if state.Verdict.Status == model.FlowRunSucceeded {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "failed"})
+}
+
+// writeWebhookResponse sends resp verbatim: its Headers first (so a flow can
+// override Content-Type — e.g. to reply with XML to a provider that expects
+// it — before the default below ever applies), Status (defaulting to 200
+// if the flow left it unset), then Body JSON-encoded, unless Body is nil
+// (an empty response body).
+func writeWebhookResponse(w http.ResponseWriter, resp *model.WebhookResponse) {
+	for k, v := range resp.Headers {
+		w.Header().Set(k, v)
+	}
+	if w.Header().Get("Content-Type") == "" {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	status := resp.Status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	if resp.Body != nil {
+		_ = json.NewEncoder(w).Encode(resp.Body)
+	}
 }
 
 // credRequest is the body POST /credentials expects. Value is any JSON — a

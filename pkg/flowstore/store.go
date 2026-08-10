@@ -59,6 +59,26 @@ type FlowDefinition struct {
 	// POST /flows/run already accepts inline. Persisted verbatim so a run
 	// by name runs exactly what was saved.
 	Flow model.FlowVersion
+
+	// WebhookEnabled opts this flow into POST /webhooks/{name} — an
+	// unauthenticated (no GOFLOW_API_TOKEN) ingress route a third party
+	// (Stripe, GitHub, ...) can call directly, since it has no way to know
+	// that token. Off by default: saving a flow must never silently create
+	// a publicly-triggerable endpoint. See pkg/httpapi's webhook handler for
+	// the full contract.
+	WebhookEnabled bool
+
+	// WebhookSecretCredential, if set, names a credential in the
+	// credentials store (pkg/credentials) whose value POST /webhooks/{name}
+	// compares, constant-time, against the request's X-Webhook-Secret
+	// header. Deliberately a credential REFERENCE, not a plain string field
+	// here — a plain field would put the secret in this store's own
+	// plaintext JSON file, exactly what pkg/credentials exists to avoid.
+	// This is a coarse floor for providers that don't sign their payloads;
+	// a provider that does (GitHub's X-Hub-Signature-256, Stripe-Signature,
+	// ...) should still verify that signature itself inside the flow, using
+	// the hash piece's HMAC support — see README's webhook-ingress entry.
+	WebhookSecretCredential string
 }
 
 // Store is the surface a flow store exposes: Save persists a FlowDefinition
