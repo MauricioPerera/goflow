@@ -1216,3 +1216,95 @@ func TestRunFlow_InvalidFlowArgument_IsErrorTrue(t *testing.T) {
 		t.Fatalf("isError = %v, want true when \"flow\" isn't a valid flow object", result["isError"])
 	}
 }
+
+// --- goflow_export_flow_js --------------------------------------------------
+
+// resultText extracts the tool result's single text content item verbatim,
+// without decoding it as JSON — unlike toolText, since a successful export's
+// content is generated JavaScript source, not a JSON payload.
+func resultText(t *testing.T, result map[string]any) string {
+	t.Helper()
+	content, ok := result["content"].([]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("content = %v, want a one-element array", result["content"])
+	}
+	item, _ := content[0].(map[string]any)
+	text, _ := item["text"].(string)
+	if text == "" {
+		t.Fatalf("content[0].text is empty: %v", item)
+	}
+	return text
+}
+
+func TestExportFlowJS_AdHoc_Succeeds(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolExportFlowJS, map[string]any{"flow": flowVersionJSON()})
+	if result["isError"] != false {
+		t.Fatalf("isError = %v, want false: %v", result["isError"], result)
+	}
+	js := resultText(t, result)
+	if !strings.Contains(js, "async function runFlow(") {
+		t.Fatalf("exported text missing runFlow, want the generated exporter module:\n%s", js)
+	}
+	if !strings.Contains(js, `"id": "fv-mcp-saved"`) {
+		t.Fatalf("exported text missing the embedded flow JSON:\n%s", js)
+	}
+}
+
+func TestExportFlowJS_NamedFlow_Succeeds(t *testing.T) {
+	h := newHandlerWithFlows(t, doublesArgFlow())
+	result := callTool(t, h, toolExportFlowJS, map[string]any{"name": "double-it"})
+	if result["isError"] != false {
+		t.Fatalf("isError = %v, want false: %v", result["isError"], result)
+	}
+	js := resultText(t, result)
+	if !strings.Contains(js, `"id": "fv-mcp"`) {
+		t.Fatalf("exported text missing the saved flow's embedded JSON:\n%s", js)
+	}
+}
+
+func TestExportFlowJS_UnsupportedFlow_IsErrorTrueNamesViolation(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	badFlow := map[string]any{
+		"id": "fv-bad-export",
+		"trigger": map[string]any{
+			"name": "trigger_1", "displayName": "Trigger", "type": "EMPTY",
+			"nextAction": map[string]any{
+				"name": "route", "displayName": "Route", "type": "ROUTER",
+				"router": map[string]any{},
+			},
+		},
+	}
+	result := callTool(t, h, toolExportFlowJS, map[string]any{"flow": badFlow})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true for a ROUTER action", result["isError"])
+	}
+	msg := resultText(t, result)
+	if !strings.Contains(msg, "route") || !strings.Contains(msg, "ROUTER") {
+		t.Fatalf("error text = %q, want it to name the unsupported ROUTER action", msg)
+	}
+}
+
+func TestExportFlowJS_UnknownName_IsErrorTrue(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolExportFlowJS, map[string]any{"name": "never-saved"})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true for an unknown flow name", result["isError"])
+	}
+}
+
+func TestExportFlowJS_MissingArguments_IsErrorTrue(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolExportFlowJS, map[string]any{})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true when neither name nor flow is given", result["isError"])
+	}
+}
+
+func TestExportFlowJS_BothNameAndFlow_IsErrorTrue(t *testing.T) {
+	h := newHandlerWithFlows(t, doublesArgFlow())
+	result := callTool(t, h, toolExportFlowJS, map[string]any{"name": "double-it", "flow": flowVersionJSON()})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true when both name and flow are given", result["isError"])
+	}
+}

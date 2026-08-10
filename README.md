@@ -526,7 +526,7 @@ below for what a Go rewrite gets and gives up.
   OAuth access token) already has that exact same access on every httpapi
   route today — there's no scopes/permissions concept anywhere in this
   project to make MCP meaningfully narrower, so none of this is a new
-  privilege, only new reachability. Thirteen fixed tools are always present
+  privilege, only new reachability. Fourteen fixed tools are always present
   in `tools/list` alongside the per-flow ones, each with a real, precise
   `inputSchema` (unlike a per-flow tool's deliberately permissive one,
   since these have well-defined Go types behind them, not an untyped
@@ -538,7 +538,11 @@ below for what a Go rewrite gets and gives up.
   for the same reason. Shipped in two tiers so mutating power didn't land
   bundled with what was initially a pure discoverability improvement:
   - Read-only: `goflow_describe_catalog`, `goflow_list_flows`,
-    `goflow_get_flow`, `goflow_list_runs`, `goflow_get_run`.
+    `goflow_get_flow`, `goflow_list_runs`, `goflow_get_run`,
+    `goflow_export_flow_js` (the MCP equivalent of `POST /flows/export/js`
+    and `POST /flows/{name}/export/js` combined into one tool — takes
+    exactly one of `name` or `flow`, since export runs no code and
+    persists nothing either way, unlike `goflow_run_flow` below).
   - Write: `goflow_save_flow` and `goflow_delete_flow` (through the exact
     same `*flowstore.GatedStore` `POST`/`DELETE /flows` use — a flow
     referencing a missing piece is rejected, never partially saved);
@@ -569,7 +573,7 @@ below for what a Go rewrite gets and gives up.
     ever committing to `goflow_save_flow`.
 
   A saved flow (or, symmetrically, a credential name) that collides with
-  one of the thirteen reserved names is excluded from `tools/list` — not
+  one of the fourteen reserved names is excluded from `tools/list` — not
   deleted, not un-runnable/un-referenceable by name over HTTP — just
   shadowed in this one listing, and `tools/call` resolves that name to the
   fixed tool the same way, so the two methods never disagree about what a
@@ -617,7 +621,8 @@ below for what a Go rewrite gets and gives up.
   and run a flow against the exact same piece registry every other
   transport uses, without duplicating that assembly a third time.
 - **Export a simple linear flow to standalone JavaScript** (`pkg/exportjs`,
-  wired in as `POST /flows/export/js` and `POST /flows/{name}/export/js`):
+  wired in as `POST /flows/export/js`, `POST /flows/{name}/export/js`, and
+  MCP's `goflow_export_flow_js` — see the MCP meta tools entry below):
   a flow made of an `EMPTY` trigger plus a linear chain of `CODE`-only
   actions — no `ROUTER`, `LOOP_ON_ITEMS`, or `PIECE` action, no
   `PIECE_TRIGGER` — can be exported to a single, self-contained `.js` file

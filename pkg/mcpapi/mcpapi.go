@@ -19,8 +19,10 @@
 // none of this is a new privilege, only new reachability. Shipped in two
 // tiers on purpose, so mutating power didn't land bundled with what was
 // initially a pure discoverability improvement: goflow_describe_catalog,
-// goflow_list_flows, goflow_get_flow, goflow_list_runs, and
-// goflow_get_run are read-only; goflow_save_flow, goflow_delete_flow,
+// goflow_list_flows, goflow_get_flow, goflow_list_runs, goflow_get_run,
+// and goflow_export_flow_js are read-only (export runs no code and
+// persists nothing, whether given a saved flow's name or an ad-hoc one —
+// see toolExportFlowJS's own description); goflow_save_flow, goflow_delete_flow,
 // goflow_save_piece, goflow_delete_piece, goflow_list_credentials,
 // goflow_save_credential, and goflow_delete_credential mutate state — the
 // exact same mutations POST/DELETE /flows, POST/DELETE /pieces, and
@@ -49,6 +51,7 @@ import (
 
 	"goflow/pkg/catalog"
 	"goflow/pkg/credentials"
+	"goflow/pkg/exportjs"
 	"goflow/pkg/flowstore"
 	"goflow/pkg/flowvalidate"
 	"goflow/pkg/model"
@@ -113,6 +116,7 @@ const (
 	toolGetFlow         = "goflow_get_flow"
 	toolListRuns        = "goflow_list_runs"
 	toolGetRun          = "goflow_get_run"
+	toolExportFlowJS    = "goflow_export_flow_js"
 
 	toolSaveFlow         = "goflow_save_flow"
 	toolDeleteFlow       = "goflow_delete_flow"
@@ -130,6 +134,7 @@ var reservedToolNames = map[string]bool{
 	toolGetFlow:         true,
 	toolListRuns:        true,
 	toolGetRun:          true,
+	toolExportFlowJS:    true,
 
 	toolSaveFlow:         true,
 	toolDeleteFlow:       true,
@@ -188,6 +193,17 @@ func metaToolDescriptors() []map[string]any {
 				"type":       "object",
 				"properties": map[string]any{"id": map[string]any{"type": "string", "description": "the run's id, e.g. from goflow_list_runs"}},
 				"required":   []string{"id"},
+			},
+		},
+		{
+			"name":        toolExportFlowJS,
+			"description": "Export a flow to a single, self-contained JavaScript file (pkg/exportjs) — runnable directly in Node or a browser with no goflow/goja/Go dependency at all. Only a flow made of an EMPTY trigger plus a linear chain of CODE-only actions can be exported (no ROUTER, LOOP_ON_ITEMS, PIECE action, or PIECE_TRIGGER); anything else is rejected with a message naming every unsupported trigger/action, not just the first. Provide exactly one of \"name\" (export a saved flow) or \"flow\" (export an ad-hoc one, without saving it — same shape as goflow_run_flow's \"flow\" argument). Runs no code and persists nothing either way.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{"type": "string", "description": "a saved flow's name — mutually exclusive with \"flow\""},
+					"flow": map[string]any{"type": "object", "description": "an ad-hoc trigger + action graph — mutually exclusive with \"name\"; see goflow_save_flow's own description for where to find the exact shape"},
+				},
 			},
 		},
 		{
@@ -404,6 +420,56 @@ func (h *Handler) callGetRun(w http.ResponseWriter, req rawRequest, args map[str
 		return
 	}
 	writeToolText(w, req.ID, false, rec)
+}
+
+// callExportFlowJS resolves fv from exactly one of args["name"] (a saved
+// flow, fetched through h.FlowStore — the same store goflow_get_flow reads)
+// or args["flow"] (an ad-hoc one, decoded the same way callRunFlow decodes
+// its own "flow" argument), then runs it through exportjs.Export. A flow
+// outside exportjs.Supported's subset comes back as a tool RESULT with
+// isError:true and Export's own descriptive message (naming every
+// unsupported trigger/action) — the caller-supplied flow is unexportable,
+// not a server fault, the same category every other "bad input" tool
+// result in this file already uses. On success the generated JS source is
+// the tool result's text verbatim (writeToolText sends a string payload
+// unwrapped, not JSON-encoded), ready to be written straight to a .js file.
+func (h *Handler) callExportFlowJS(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	name, _ := args["name"].(string)
+	_, hasFlow := args["flow"]
+	if name != "" && hasFlow {
+		writeToolText(w, req.ID, true, "provide exactly one of \"name\" or \"flow\", not both")
+		return
+	}
+
+	var fv *model.FlowVersion
+	switch {
+	case name != "":
+		def, ok, err := h.FlowStore.Get(name)
+		if err != nil || !ok {
+			writeToolText(w, req.ID, true, fmt.Sprintf("no flow named %q", name))
+			return
+		}
+		fv = &def.Flow
+	case hasFlow:
+		var body struct {
+			Flow model.FlowVersion `json:"flow"`
+		}
+		if err := decodeArgs(args, &body); err != nil {
+			writeToolText(w, req.ID, true, "invalid arguments: "+err.Error())
+			return
+		}
+		fv = &body.Flow
+	default:
+		writeToolText(w, req.ID, true, "missing required argument: provide \"name\" or \"flow\"")
+		return
+	}
+
+	js, err := exportjs.Export(fv)
+	if err != nil {
+		writeToolText(w, req.ID, true, err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, js)
 }
 
 // --- write meta tools -----------------------------------------------------
@@ -783,6 +849,9 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 		return
 	case toolGetRun:
 		h.callGetRun(w, req, params.Arguments)
+		return
+	case toolExportFlowJS:
+		h.callExportFlowJS(w, req, params.Arguments)
 		return
 	case toolSaveFlow:
 		h.callSaveFlow(w, req, params.Arguments)
