@@ -17,6 +17,7 @@ import (
 	"io"
 	"net/http"
 
+	"goflow/pkg/credentials"
 	"goflow/pkg/flowstore"
 	"goflow/pkg/model"
 	"goflow/pkg/piece"
@@ -30,14 +31,21 @@ import (
 type Handler struct {
 	FlowStore     flowstore.Store
 	BuildRegistry func() (*piece.Registry, error)
+	// CredStore resolves $credential markers in a flow's Input before it runs
+	// and redacts the substituted values from the returned ExecutionState, so
+	// a tool call that uses a stored credential never leaks the secret back in
+	// the JSON-RPC result. May be nil only when no saved flow references a
+	// credential.
+	CredStore credentials.Store
 }
 
-// NewHandler returns a Handler wired to flowStore and buildRegistry. It is the
-// caller's job to gate it with auth (httpapi.Server mounts it behind its
-// bearer-token middleware, same as every other route); this package does not
-// know about auth on purpose — pkg/httpapi owns that concern.
-func NewHandler(flowStore flowstore.Store, buildRegistry func() (*piece.Registry, error)) *Handler {
-	return &Handler{FlowStore: flowStore, BuildRegistry: buildRegistry}
+// NewHandler returns a Handler wired to flowStore, buildRegistry, and
+// credStore. It is the caller's job to gate it with auth (httpapi.Server
+// mounts it behind its bearer-token middleware, same as every other route);
+// this package does not know about auth on purpose — pkg/httpapi owns that
+// concern.
+func NewHandler(flowStore flowstore.Store, buildRegistry func() (*piece.Registry, error), credStore credentials.Store) *Handler {
+	return &Handler{FlowStore: flowStore, BuildRegistry: buildRegistry, CredStore: credStore}
 }
 
 // nullID is the JSON-RPC id used when no id could be read from the request
@@ -231,7 +239,7 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 		return
 	}
 
-	state, validationErrs, runErr := flowstore.Run(&def.Flow, h.BuildRegistry, params.Arguments, false)
+	state, validationErrs, runErr := flowstore.RunWithCredentials(&def.Flow, h.BuildRegistry, h.CredStore, params.Arguments, false)
 	if runErr != nil {
 		writeError(w, req.ID, -32603, "internal error: "+runErr.Error())
 		return

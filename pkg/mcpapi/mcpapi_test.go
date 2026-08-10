@@ -8,10 +8,15 @@ import (
 	"strings"
 	"testing"
 
+	"goflow/pkg/credentials"
 	"goflow/pkg/flowstore"
 	"goflow/pkg/model"
 	"goflow/pkg/piece"
 )
+
+// testCredKey is a fixed 32-byte AES-256 key for the credentials store in
+// tests — constant so the on-disk shape is deterministic.
+var testCredKey = []byte("0123456789abcdef0123456789abcdef") // 32 bytes
 
 // emptyRegistryBuilder is a BuildRegistry that returns an empty registry —
 // enough for the CODE-only flows these tests use, which validate and run
@@ -24,19 +29,46 @@ func emptyRegistryBuilder() (*piece.Registry, error) {
 // newHandlerWithFlows builds a Handler backed by a real flowstore.FileStore in
 // a temp dir, saves the given flows directly (no gate needed: FileStore.Save
 // does not validate, and these flows are valid anyway), and returns the
-// handler plus the store dir.
+// handler plus the store dir. A real credentials.FileStore is wired too; nil
+// would be valid only if no flow references a credential, but a real store is
+// harmless and keeps the handler exercised the way production wires it.
 func newHandlerWithFlows(t *testing.T, defs ...flowstore.FlowDefinition) *Handler {
 	t.Helper()
 	fs, err := flowstore.NewFileStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewFileStore: %v", err)
 	}
+	credStore, err := credentials.NewFileStore(t.TempDir(), testCredKey)
+	if err != nil {
+		t.Fatalf("credentials.NewFileStore: %v", err)
+	}
 	for _, def := range defs {
 		if err := fs.Save(def); err != nil {
 			t.Fatalf("Save %q: %v", def.Name, err)
 		}
 	}
-	return NewHandler(fs, emptyRegistryBuilder)
+	return NewHandler(fs, emptyRegistryBuilder, credStore)
+}
+
+// newHandlerWithFlowsAndCreds is newHandlerWithFlows but also returns the
+// credentials store so a test can seed a real credential for a $credential
+// end-to-end run.
+func newHandlerWithFlowsAndCreds(t *testing.T, defs ...flowstore.FlowDefinition) (*Handler, *credentials.FileStore) {
+	t.Helper()
+	fs, err := flowstore.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	credStore, err := credentials.NewFileStore(t.TempDir(), testCredKey)
+	if err != nil {
+		t.Fatalf("credentials.NewFileStore: %v", err)
+	}
+	for _, def := range defs {
+		if err := fs.Save(def); err != nil {
+			t.Fatalf("Save %q: %v", def.Name, err)
+		}
+	}
+	return NewHandler(fs, emptyRegistryBuilder, credStore), credStore
 }
 
 // doublesArgFlow is a "double it" flow that reads n from the TRIGGER payload
@@ -352,5 +384,115 @@ func TestUnknownMethod_Error32601(t *testing.T) {
 	}
 	if !strings.Contains(errObj["message"].(string), "foo/bar") {
 		t.Fatalf("error.message = %v, want it to mention foo/bar", errObj["message"])
+	}
+}
+
+// usesCredentialFlow is a CODE-only flow whose step input references a stored
+// credential by name via the $credential marker. The CODE step returns the
+// resolved auth's length, so a successful run proves the real secret reached
+// the piece — without ever putting the secret itself in the output.
+func usesCredentialFlow() flowstore.FlowDefinition {
+	return flowstore.FlowDefinition{
+		Name:        "uses-cred",
+		DisplayName: "Uses Credential",
+		Description: "uses a $credential marker",
+		Flow: model.FlowVersion{
+			ID: "fv-cred",
+			Trigger: &model.FlowTrigger{
+				Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+				NextAction: &model.FlowAction{
+					Name: "use_auth", DisplayName: "Use Cred", Type: model.ActionCode,
+					Code: &model.CodeSettings{
+						Input:  map[string]any{"auth": map[string]any{"$credential": "relay"}},
+						Source: `(params) => ({ authLen: params.auth.length })`,
+					},
+				},
+			},
+		},
+	}
+}
+
+// TestToolsCall_CredentialMarker_SecretNotInBody_RealValueUsed is the
+// end-to-end MCP proof: a real credential is stored, a flow references it by
+// name, a tools/call runs that flow over the real Handler (no direct
+// flowstore call), and the raw HTTP response body must NOT contain the
+// secret anywhere — while the step's output authLen == len(secret) proves the
+// real value did reach the piece. This is the test that proves the redaction
+// works over the wire, not just at the library level.
+func TestToolsCall_CredentialMarker_SecretNotInBody_RealValueUsed(t *testing.T) {
+	h, credStore := newHandlerWithFlowsAndCreds(t, usesCredentialFlow())
+	const secret = "el-secreto-xyz-789"
+	if err := credStore.Save("relay", secret); err != nil {
+		t.Fatalf("Save credential: %v", err)
+	}
+
+	rec := call(t, h, map[string]any{
+		"jsonrpc": "2.0", "id": 11, "method": "tools/call",
+		"params": map[string]any{"name": "uses-cred", "arguments": map[string]any{}},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Read the RAW HTTP body — the exact bytes a client would receive — and
+	// assert the secret is nowhere in it.
+	body := rec.Body.String()
+	if strings.Contains(body, secret) {
+		t.Fatalf("real secret leaked into the tools/call response body:\n%s", body)
+	}
+
+	// The run succeeded and the placeholder is present (so redaction is
+	// observable). JSON escapes "<"/">", so check the decoded value.
+	m := decodeResponse(t, rec)
+	result, _ := m["result"].(map[string]any)
+	if result["isError"] != false {
+		t.Fatalf("isError = %v, want false for a successful run; body=%s", result["isError"], body)
+	}
+	content, _ := result["content"].([]any)
+	item, _ := content[0].(map[string]any)
+	text, _ := item["text"].(string)
+	var state map[string]any
+	if err := json.Unmarshal([]byte(text), &state); err != nil {
+		t.Fatalf("content text is not JSON: %v; text=%s", err, text)
+	}
+	steps, _ := state["Steps"].(map[string]any)
+	useAuth, _ := steps["use_auth"].(map[string]any)
+	input, _ := useAuth["Input"].(map[string]any)
+	if input["auth"] != "<credential:relay>" {
+		t.Fatalf("Input[auth] = %v, want placeholder <credential:relay>", input["auth"])
+	}
+	// authLen == len(secret) proves the REAL secret reached the piece (the
+	// output is computed from it); only the Input was redacted. After a JSON
+	// roundtrip the number is a float64.
+	output, _ := useAuth["Output"].(map[string]any)
+	authLen, _ := output["authLen"].(float64)
+	if int(authLen) != len(secret) {
+		t.Fatalf("authLen = %v, want %d (proves the real secret reached the piece)", authLen, len(secret))
+	}
+}
+
+// TestToolsCall_MissingCredential_IsErrorTrueMentionsName: a flow that
+// references a credential that isn't stored comes back as a tool RESULT with
+// isError:true (a configuration problem with this tool, not a protocol
+// error), and the message names the missing credential.
+func TestToolsCall_MissingCredential_IsErrorTrueMentionsName(t *testing.T) {
+	h := newHandlerWithFlows(t, usesCredentialFlow()) // "relay" never saved
+	rec := call(t, h, map[string]any{
+		"jsonrpc": "2.0", "id": 12, "method": "tools/call",
+		"params": map[string]any{"name": "uses-cred", "arguments": map[string]any{}},
+	})
+	m := decodeResponse(t, rec)
+	if _, isErr := m["error"]; isErr {
+		t.Fatalf("response is a protocol error %v, want a tool result", m)
+	}
+	result, _ := m["result"].(map[string]any)
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true for a missing credential", result["isError"])
+	}
+	content, _ := result["content"].([]any)
+	item, _ := content[0].(map[string]any)
+	text, _ := item["text"].(string)
+	if !strings.Contains(text, "relay") {
+		t.Fatalf("error text does not name the missing credential: %s", text)
 	}
 }

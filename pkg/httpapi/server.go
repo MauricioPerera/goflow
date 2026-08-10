@@ -76,7 +76,7 @@ func (s *Server) Handler() http.Handler {
 	// POST), behind the same bearer-token auth as every other route. The
 	// handler reuses this server's buildRegistry and flowStore, so a tool call
 	// validates and runs a flow against the exact same registry as /flows/run.
-	mux.Handle("POST /mcp", s.auth(mcpapi.NewHandler(s.flowStore, s.buildRegistry)))
+	mux.Handle("POST /mcp", s.auth(mcpapi.NewHandler(s.flowStore, s.buildRegistry, s.credStore)))
 	return s.logging(s.recover(mux))
 }
 
@@ -168,7 +168,7 @@ func (s *Server) handleFlowsRun(w http.ResponseWriter, r *http.Request) {
 // route's original shape, so the existing /flows/run and /flows/{name}/run
 // tests pass unchanged).
 func (s *Server) runFlowVersion(w http.ResponseWriter, fv *model.FlowVersion, trigger any, executeTrigger bool) {
-	state, validationErrs, err := flowstore.Run(fv, s.buildRegistry, trigger, executeTrigger)
+	state, validationErrs, err := flowstore.RunWithCredentials(fv, s.buildRegistry, s.credStore, trigger, executeTrigger)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return

@@ -615,6 +615,89 @@ func TestPostFlowRun_UnknownName_404(t *testing.T) {
 	}
 }
 
+// credentialFlowDef is a named flow whose CODE step references a stored
+// credential by name via the $credential marker. The step returns the
+// resolved auth's length, so a successful run proves the real secret reached
+// the piece — without ever putting the secret itself in the output.
+func credentialFlowDef(name, credName string) flowstore.FlowDefinition {
+	return flowstore.FlowDefinition{
+		Name:        name,
+		DisplayName: "Uses Credential",
+		Description: "uses a $credential marker",
+		InputSchema: "none",
+		Flow: model.FlowVersion{
+			ID: "fv-cred",
+			Trigger: &model.FlowTrigger{
+				Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+				NextAction: &model.FlowAction{
+					Name: "use_auth", DisplayName: "Use Cred", Type: model.ActionCode,
+					Code: &model.CodeSettings{
+						Input:  map[string]any{"auth": map[string]any{"$credential": credName}},
+						Source: `(params) => ({ authLen: params.auth.length })`,
+					},
+				},
+			},
+		},
+	}
+}
+
+// TestPostFlowRun_ByName_WithCredential_SecretNotInBody_RealValueUsed is the
+// end-to-end HTTP proof for the named-flow run path: a real credential is
+// stored over HTTP, a flow referencing it by name is saved over HTTP, the
+// flow is run via POST /flows/{name}/run, and the RAW response body must not
+// contain the secret anywhere — while the step's output authLen == len(secret)
+// proves the real value reached the piece. This is the test that proves the
+// redaction works over the wire on the HTTP path, not just at the library
+// level.
+func TestPostFlowRun_ByName_WithCredential_SecretNotInBody_RealValueUsed(t *testing.T) {
+	srv := newTestServer(t)
+	const secret = "el-secreto-xyz-789"
+	// Store the real credential over HTTP.
+	rec := do(t, srv, "POST", "/credentials", map[string]any{"name": "relay", "value": secret}, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("save credential: status = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+	// Save the flow that references it by name over HTTP.
+	rec = do(t, srv, "POST", "/flows", credentialFlowDef("uses-cred", "relay"), true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("save flow: status = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+	// Run it by name over HTTP.
+	rec = do(t, srv, "POST", "/flows/uses-cred/run", flowRunRequest{}, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Read the RAW HTTP body — the exact bytes a client would receive — and
+	// assert the secret is nowhere in it.
+	body := rec.Body.String()
+	if strings.Contains(body, secret) {
+		t.Fatalf("real secret leaked into the POST /flows/{name}/run response body:\n%s", body)
+	}
+
+	// The run succeeded; the step's Input holds the placeholder, and its
+	// Output authLen == len(secret) proves the real secret reached the piece.
+	var state map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &state); err != nil {
+		t.Fatalf("decode state: %v; body=%s", err, body)
+	}
+	verdict, _ := state["Verdict"].(map[string]any)
+	if verdict["Status"] != string(model.FlowRunSucceeded) {
+		t.Fatalf("Verdict.Status = %v, want SUCCEEDED; body=%s", verdict["Status"], body)
+	}
+	steps, _ := state["Steps"].(map[string]any)
+	useAuth, _ := steps["use_auth"].(map[string]any)
+	input, _ := useAuth["Input"].(map[string]any)
+	if input["auth"] != "<credential:relay>" {
+		t.Fatalf("Input[auth] = %v, want placeholder <credential:relay>", input["auth"])
+	}
+	output, _ := useAuth["Output"].(map[string]any)
+	authLen, _ := output["authLen"].(float64)
+	if int(authLen) != len(secret) {
+		t.Fatalf("authLen = %v, want %d (proves the real secret reached the piece)", authLen, len(secret))
+	}
+}
+
 // --- MCP (/mcp) over HTTP ---------------------------------------------------
 
 // TestPostMcp_NoAuth_401 confirms /mcp sits behind the same bearer-token
