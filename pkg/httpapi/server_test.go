@@ -5,22 +5,46 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"goflow/pkg/catalog"
+	"goflow/pkg/credentials"
 	"goflow/pkg/model"
 )
 
+// testCredKey is a fixed 32-byte AES-256 key for the credentials store in
+// tests — constant so the raw-file checks are deterministic.
+var testCredKey = []byte("0123456789abcdef0123456789abcdef") // 32 bytes
+
 // newTestServer wires a real FileStore in a temp dir (no interface mocks)
-// behind a GatedStore, exactly like cmd/server does in production.
+// behind a GatedStore, exactly like cmd/server does in production. It also
+// wires a real credentials.FileStore in its own temp dir.
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	fs, err := catalog.NewFileStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewFileStore: %v", err)
 	}
-	return NewServer(&catalog.GatedStore{Underlying: fs}, "secret-token")
+	credStore, err := credentials.NewFileStore(t.TempDir(), testCredKey)
+	if err != nil {
+		t.Fatalf("credentials.NewFileStore: %v", err)
+	}
+	return NewServer(&catalog.GatedStore{Underlying: fs}, credStore, "secret-token")
+}
+
+// credDir returns the on-disk directory backing the server's credentials
+// store, so tests can read raw .enc files directly. The store is a
+// *credentials.FileStore in tests; reach in via the interface to its dir.
+func credDir(t *testing.T, srv *Server) string {
+	t.Helper()
+	fs, ok := srv.credStore.(*credentials.FileStore)
+	if !ok {
+		t.Fatalf("credStore is %T, want *credentials.FileStore", srv.credStore)
+	}
+	return fs.Dir()
 }
 
 func do(t *testing.T, srv *Server, method, path string, body any, auth bool) *httptest.ResponseRecorder {
@@ -257,5 +281,144 @@ func TestRecoverMiddleware_PanicBecomes500(t *testing.T) {
 	m := decode(t, rec)
 	if m["error"] != "internal error" {
 		t.Fatalf("body = %v, want error=internal error", m)
+	}
+}
+
+// --- credentials -------------------------------------------------------------
+
+func TestPostCredentials_NoAuth_401_NoFileWritten(t *testing.T) {
+	srv := newTestServer(t)
+	dir := credDir(t, srv)
+	rec := do(t, srv, "POST", "/credentials", map[string]any{"name": "x", "value": "y"}, false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	// Auth short-circuits before the handler runs, so nothing is written.
+	if _, err := os.Stat(filepath.Join(dir, "x.enc")); err == nil {
+		t.Fatalf("credential file written despite failed auth")
+	}
+}
+
+func TestPostCredentials_Valid_SecretNotInRawFile(t *testing.T) {
+	srv := newTestServer(t)
+	dir := credDir(t, srv)
+	secret := "el-secreto-super-unico-xyz123"
+	rec := do(t, srv, "POST", "/credentials", map[string]any{"name": "vault", "value": secret}, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	if m["saved"] != true || m["name"] != "vault" {
+		t.Fatalf("body = %v, want saved=true name=vault", m)
+	}
+	// The response must not leak the value.
+	if strings.Contains(rec.Body.String(), secret) {
+		t.Fatalf("response body leaks the secret: %s", rec.Body.String())
+	}
+	// The on-disk file must not contain the plaintext secret.
+	raw, err := os.ReadFile(filepath.Join(dir, "vault.enc"))
+	if err != nil {
+		t.Fatalf("read raw file: %v", err)
+	}
+	if strings.Contains(string(raw), secret) {
+		t.Fatalf("plaintext secret in raw file:\n%s", raw)
+	}
+}
+
+func TestGetCredentials_ListsNamesSortedNoValues(t *testing.T) {
+	srv := newTestServer(t)
+	// Save three with recognizable secret values, in non-sorted order.
+	for _, n := range []string{"charlie", "alpha", "bravo"} {
+		rec := do(t, srv, "POST", "/credentials", map[string]any{"name": n, "value": "secret-value-" + n}, true)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("save %q: status = %d, want 201; body=%s", n, rec.Code, rec.Body.String())
+		}
+	}
+	rec := do(t, srv, "GET", "/credentials", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	m := decode(t, rec)
+	names, ok := m["credentials"].([]any)
+	if !ok {
+		t.Fatalf("body = %v, want credentials array", m)
+	}
+	want := []string{"alpha", "bravo", "charlie"}
+	if len(names) != len(want) {
+		t.Fatalf("names = %v, want %v", names, want)
+	}
+	for i, n := range want {
+		if names[i] != n {
+			t.Fatalf("names = %v, want %v (sorted)", names, want)
+		}
+	}
+	// The body must not contain any of the secret values.
+	body := rec.Body.String()
+	for _, n := range want {
+		if strings.Contains(body, "secret-value-"+n) {
+			t.Fatalf("GET /credentials body leaks a value: %s", body)
+		}
+	}
+}
+
+func TestDeleteCredential_ExistingThenGone(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "POST", "/credentials", map[string]any{"name": "killme", "value": "v"}, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d, want 201", rec.Code)
+	}
+	rec = do(t, srv, "DELETE", "/credentials/killme", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	if m["deleted"] != true || m["name"] != "killme" {
+		t.Fatalf("body = %v, want deleted=true name=killme", m)
+	}
+	// A subsequent GET /credentials no longer lists it.
+	rec = do(t, srv, "GET", "/credentials", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list: status = %d, want 200", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "killme") {
+		t.Fatalf("deleted name still listed: %s", rec.Body.String())
+	}
+}
+
+func TestDeleteCredential_Missing_404(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "DELETE", "/credentials/nope", nil, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	if m["error"] != "not found" {
+		t.Fatalf("body = %v, want error=not found", m)
+	}
+}
+
+func TestPostCredentials_InvalidName_400NothingWritten(t *testing.T) {
+	srv := newTestServer(t)
+	dir := credDir(t, srv)
+	for _, name := range []string{"", "../escape"} {
+		body := map[string]any{"name": name, "value": "v"}
+		rec := do(t, srv, "POST", "/credentials", body, true)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("name=%q: status = %d, want 400; body=%s", name, rec.Code, rec.Body.String())
+		}
+	}
+	// Nothing landed outside the credentials dir (the ../escape attempt).
+	if _, err := os.Stat(filepath.Join(filepath.Dir(dir), "escape.enc")); err == nil {
+		t.Fatalf("traversal wrote outside credentials dir")
+	}
+	// And the empty-name case wrote nothing inside either.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".enc") {
+			t.Fatalf("unexpected credential file written: %s", e.Name())
+		}
 	}
 }

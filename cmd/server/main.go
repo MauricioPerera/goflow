@@ -4,11 +4,13 @@
 package main
 
 import (
+	"encoding/hex"
 	"log"
 	"net/http"
 	"os"
 
 	"goflow/pkg/catalog"
+	"goflow/pkg/credentials"
 	"goflow/pkg/httpapi"
 )
 
@@ -32,6 +34,30 @@ func main() {
 		os.Exit(1)
 	}
 
+	// GOFLOW_CREDENTIALS_KEY is a 64-char hex string (32 bytes) — the AES-256
+	// key for the credential vault. Never start with the cipher misconfigured:
+	// a missing, non-hex, or wrong-length key is a hard failure, same as the
+	// API token. No truncation, no padding, no silent default.
+	keyHex := os.Getenv("GOFLOW_CREDENTIALS_KEY")
+	if keyHex == "" {
+		log.Println("GOFLOW_CREDENTIALS_KEY is not set or is empty — refusing to start without credential encryption configured")
+		os.Exit(1)
+	}
+	credKey, err := hex.DecodeString(keyHex)
+	if err != nil {
+		log.Printf("GOFLOW_CREDENTIALS_KEY is not valid hex: %v — refusing to start", err)
+		os.Exit(1)
+	}
+	if len(credKey) != 32 {
+		log.Printf("GOFLOW_CREDENTIALS_KEY decodes to %d bytes, want 32 — refusing to start", len(credKey))
+		os.Exit(1)
+	}
+
+	credentialsDir := os.Getenv("GOFLOW_CREDENTIALS_DIR")
+	if credentialsDir == "" {
+		credentialsDir = "./data/credentials"
+	}
+
 	// NewFileStore creates the directory if missing (os.MkdirAll inside),
 	// so no separate mkdir here.
 	fileStore, err := catalog.NewFileStore(catalogDir)
@@ -40,7 +66,12 @@ func main() {
 	}
 	gated := &catalog.GatedStore{Underlying: fileStore}
 
-	srv := httpapi.NewServer(gated, token)
-	log.Printf("goflow-server listening on %s (catalog: %s)", addr, catalogDir)
+	credStore, err := credentials.NewFileStore(credentialsDir, credKey)
+	if err != nil {
+		log.Fatalf("opening credentials store at %q: %v", credentialsDir, err)
+	}
+
+	srv := httpapi.NewServer(gated, credStore, token)
+	log.Printf("goflow-server listening on %s (catalog: %s, credentials: %s)", addr, catalogDir, credentialsDir)
 	log.Fatal(http.ListenAndServe(addr, srv.Handler()))
 }

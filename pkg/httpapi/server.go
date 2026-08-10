@@ -18,6 +18,7 @@ import (
 	"net/http"
 
 	"goflow/pkg/catalog"
+	"goflow/pkg/credentials"
 	"goflow/pkg/engine"
 	"goflow/pkg/flowvalidate"
 	"goflow/pkg/model"
@@ -30,14 +31,17 @@ import (
 // but typed as the interface so tests can pass any Store) and the bearer
 // token every non-/health route is gated on.
 type Server struct {
-	store catalog.Store
-	token string
+	store     catalog.Store
+	credStore credentials.Store
+	token     string
 }
 
-// NewServer returns a Server that authorizes non-/health routes with token
-// and reads/writes catalog Definitions through store.
-func NewServer(store catalog.Store, token string) *Server {
-	return &Server{store: store, token: token}
+// NewServer returns a Server that authorizes non-/health routes with token,
+// reads/writes catalog Definitions through store, and manages encrypted
+// credentials through credStore. credStore is never asked to decrypt over
+// HTTP — only Save/List/Delete are exposed; Get is for trusted Go callers.
+func NewServer(store catalog.Store, credStore credentials.Store, token string) *Server {
+	return &Server{store: store, credStore: credStore, token: token}
 }
 
 // Handler assembles the route table and wraps it with the middleware stack:
@@ -50,6 +54,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/catalog", s.auth(http.HandlerFunc(s.handleCatalog)))
 	mux.Handle("/pieces", s.auth(http.HandlerFunc(s.handlePieces)))
 	mux.Handle("/flows/run", s.auth(http.HandlerFunc(s.handleFlowsRun)))
+	mux.Handle("/credentials", s.auth(http.HandlerFunc(s.handleCredentials)))
+	mux.Handle("DELETE /credentials/{name}", s.auth(http.HandlerFunc(s.handleCredentialDelete)))
 	return s.logging(s.recover(mux))
 }
 
@@ -155,6 +161,72 @@ func (s *Server) handleFlowsRun(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(state)
+}
+
+// credRequest is the body POST /credentials expects. Value is any JSON — a
+// string, object, whatever the caller wants sealed. A null/absent value is
+// rejected as 400 below.
+type credRequest struct {
+	Name  string `json:"name"`
+	Value *any   `json:"value"`
+}
+
+// handleCredentials routes POST (save) and GET (list names) at /credentials.
+// POST never echoes the value back — only {"saved":true,"name":...}. GET
+// never returns values, only the sorted name list. There is intentionally no
+// GET /credentials/{name} here: the decrypted value is never exposed over
+// HTTP (see the security note on credentials.Store.Get).
+func (s *Server) handleCredentials(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		var req credRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if req.Name == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+			return
+		}
+		if req.Value == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "value is required"})
+			return
+		}
+		if err := s.credStore.Save(req.Name, *req.Value); err != nil {
+			// Includes invalid-name (path traversal) errors from the store's
+			// own validation — surfaced verbatim, not rewritten.
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{"saved": true, "name": req.Name})
+
+	case http.MethodGet:
+		names, err := s.credStore.List()
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"credentials": names})
+
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+	}
+}
+
+// handleCredentialDelete handles DELETE /credentials/{name} using the Go
+// 1.22+ ServeMux pattern routing (r.PathValue). The store's ErrNotFound maps
+// to 404; any other error to 400. Success returns the name, never a value.
+func (s *Server) handleCredentialDelete(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if err := s.credStore.Delete(name); err != nil {
+		if err == credentials.ErrNotFound {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "name": name})
 }
 
 // --- middleware -------------------------------------------------------------
