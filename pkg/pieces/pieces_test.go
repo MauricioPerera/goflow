@@ -48,6 +48,7 @@ func TestRegisterAll_EveryCatalogPieceBecomesResolvable(t *testing.T) {
 		{"uuid", "action", "generate"},
 		{"base64", "action", "encode"},
 		{"base64", "action", "decode"},
+		{"email", "action", "send"},
 	}
 	for _, c := range cases {
 		switch c.kind {
@@ -74,7 +75,7 @@ func TestAll_ReturnsOneEntryPerCatalogPiece(t *testing.T) {
 	}
 	for _, want := range []string{
 		"http", "json", "delay", "webhook", "crypto",
-		"storage", "approval", "webhook_reply", "text", "datetime", "hash", "regex", "csv", "uuid", "base64",
+		"storage", "approval", "webhook_reply", "text", "datetime", "hash", "regex", "csv", "uuid", "base64", "email",
 	} {
 		if !seen[want] {
 			t.Fatalf("All() did not include piece %q", want)

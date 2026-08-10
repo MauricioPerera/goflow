@@ -17,6 +17,7 @@ import (
 	csvpiece "goflow/pkg/pieces/csv"
 	"goflow/pkg/pieces/datetime"
 	"goflow/pkg/pieces/delay"
+	emailpiece "goflow/pkg/pieces/email"
 	hashpiece "goflow/pkg/pieces/hash"
 	httppiece "goflow/pkg/pieces/http"
 	"goflow/pkg/pieces/json"
@@ -51,6 +52,7 @@ func All() []piece.Piece {
 		csvpiece.New(),
 		uuid.New(),
 		base64piece.New(),
+		emailpiece.New(),
 	}
 }
 
