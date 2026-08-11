@@ -254,7 +254,7 @@ func (s *Server) handleFlowsRun(w http.ResponseWriter, r *http.Request) {
 // written — deliberately synchronous, see that function's own doc comment
 // for why.
 func (s *Server) runFlowVersion(w http.ResponseWriter, fv *model.FlowVersion, flowName, onFailureFlow string, trigger any, executeTrigger bool) {
-	state, validationErrs, err := flowstore.RunWithHistory(fv, s.buildRegistry, s.credStore, s.runStore, flowName, trigger, executeTrigger)
+	state, validationErrs, err := flowstore.RunWithHistory(fv, s.buildRegistry, s.credStore, s.runStore, s.flowStore, flowName, trigger, executeTrigger)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -516,7 +516,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	state, validationErrs, runErr := flowstore.RunWithHistory(&def.Flow, s.buildRegistry, s.credStore, s.runStore, name, payload, true)
+	state, validationErrs, runErr := flowstore.RunWithHistory(&def.Flow, s.buildRegistry, s.credStore, s.runStore, s.flowStore, name, payload, true)
 	if runErr != nil || len(validationErrs) > 0 {
 		// Never expose validation/internal-fault detail to an
 		// unauthenticated third party — that level of detail is for the

@@ -296,6 +296,53 @@ func TestPiecesExport_NoAuth_401(t *testing.T) {
 	}
 }
 
+func TestFlowRun_CallFlow_InvokesNamedFlow_RecordedInHistory(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", notifyFlowDef("leaf"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save leaf: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	root := flowstore.FlowDefinition{
+		Name: "root", DisplayName: "Root",
+		Flow: model.FlowVersion{
+			ID: "fv-root",
+			Trigger: &model.FlowTrigger{
+				Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+				NextAction: &model.FlowAction{
+					Name: "call", DisplayName: "Call", Type: model.ActionCallFlow,
+					CallFlow: &model.CallFlowSettings{FlowName: "leaf"},
+				},
+			},
+		},
+	}
+	if rec := do(t, srv, "POST", "/flows", root, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save root: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec := do(t, srv, "POST", "/flows/root/run", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var state map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &state); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, rec.Body.String())
+	}
+	if verdict, _ := state["Verdict"].(map[string]any); verdict["Status"] != string(model.FlowRunSucceeded) {
+		t.Fatalf("Verdict = %v, want SUCCEEDED", state["Verdict"])
+	}
+
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	m := decode(t, listRec)
+	runs, _ := m["runs"].([]any)
+	names := map[string]int{}
+	for _, r := range runs {
+		rm, _ := r.(map[string]any)
+		names[rm["FlowName"].(string)]++
+	}
+	if names["root"] != 1 || names["leaf"] != 1 {
+		t.Fatalf("recorded runs = %v, want exactly one for \"root\" and one for \"leaf\"", names)
+	}
+}
+
 func TestFlowsRun_SimpleCodeAction_Succeeds(t *testing.T) {
 	srv := newTestServer(t)
 	fv := model.FlowVersion{

@@ -157,6 +157,43 @@ func TestScheduler_OnFailureConfigured_TriggersNamedFlow_RecordedInHistory(t *te
 	}
 }
 
+func TestScheduler_CallFlow_InvokesNamedFlow_RecordedInHistory(t *testing.T) {
+	fs := newFlowStore(t)
+	if err := fs.Save(flowstore.FlowDefinition{Name: "leaf", DisplayName: "Leaf", Flow: notifyFlow()}); err != nil {
+		t.Fatalf("Save leaf: %v", err)
+	}
+	root := model.FlowVersion{
+		ID: "fv-root",
+		Trigger: &model.FlowTrigger{
+			Name: "trigger_1", DisplayName: "Schedule", Type: model.TriggerPiece,
+			PieceName: schedule.PieceName, TriggerName: schedule.TriggerName,
+			Input: map[string]any{"intervalSeconds": int64(1)},
+			NextAction: &model.FlowAction{
+				Name: "call", DisplayName: "Call", Type: model.ActionCallFlow,
+				CallFlow: &model.CallFlowSettings{FlowName: "leaf"},
+			},
+		},
+	}
+	if err := fs.Save(flowstore.FlowDefinition{Name: "root", DisplayName: "Root", Flow: root}); err != nil {
+		t.Fatalf("Save root: %v", err)
+	}
+	hist := runstore.NewMemoryStore()
+	sched := scheduler.New(fs, scheduleRegistry, nil, hist, 100*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sched.Run(ctx)
+
+	summaries := waitForRuns(t, hist, 2, 2*time.Second)
+	names := map[string]int{}
+	for _, s := range summaries {
+		names[s.FlowName]++
+	}
+	if names["root"] != 1 || names["leaf"] != 1 {
+		t.Fatalf("recorded runs = %v, want exactly one for \"root\" and one for \"leaf\"", names)
+	}
+}
+
 func TestScheduler_NonScheduleFlowsAreIgnored(t *testing.T) {
 	fs := newFlowStore(t)
 	// EMPTY-triggered flow: the scheduler must never touch this, regardless

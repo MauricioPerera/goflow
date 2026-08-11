@@ -238,6 +238,50 @@ func TestValidate_LoopItemsInvalidSyntax(t *testing.T) {
 	}
 }
 
+func TestValidate_CallFlowWellFormed_NoErrors(t *testing.T) {
+	call := &model.FlowAction{
+		Name: "call", DisplayName: "Call", Type: model.ActionCallFlow,
+		CallFlow: &model.CallFlowSettings{FlowName: "sub-flow", Input: map[string]any{"n": "{{ trigger_1.output.n }}"}},
+	}
+	fv := &model.FlowVersion{ID: "fv-1", Trigger: trigger(call)}
+	if errs := flowvalidate.Validate(fv, nil); len(errs) != 0 {
+		t.Fatalf("Validate() = %+v, want no errors", errs)
+	}
+}
+
+func TestValidate_CallFlowNilSettings(t *testing.T) {
+	call := &model.FlowAction{Name: "call", DisplayName: "Call", Type: model.ActionCallFlow}
+	fv := &model.FlowVersion{ID: "fv-1", Trigger: trigger(call)}
+	errs := flowvalidate.Validate(fv, nil)
+	if len(errs) != 1 {
+		t.Fatalf("errs = %+v, want exactly one error for nil CallFlow settings", errs)
+	}
+}
+
+func TestValidate_CallFlowMissingFlowName(t *testing.T) {
+	call := &model.FlowAction{
+		Name: "call", DisplayName: "Call", Type: model.ActionCallFlow,
+		CallFlow: &model.CallFlowSettings{},
+	}
+	fv := &model.FlowVersion{ID: "fv-1", Trigger: trigger(call)}
+	errs := flowvalidate.Validate(fv, nil)
+	if len(errs) != 1 || errs[0].Path != "trigger > call.callFlow.flowName" {
+		t.Fatalf("errs = %+v, want exactly one error at \"trigger > call.callFlow.flowName\"", errs)
+	}
+}
+
+func TestValidate_CallFlowInputInvalidTemplateSyntax(t *testing.T) {
+	call := &model.FlowAction{
+		Name: "call", DisplayName: "Call", Type: model.ActionCallFlow,
+		CallFlow: &model.CallFlowSettings{FlowName: "sub-flow", Input: map[string]any{"n": "{{ 1 + }}"}},
+	}
+	fv := &model.FlowVersion{ID: "fv-1", Trigger: trigger(call)}
+	errs := flowvalidate.Validate(fv, nil)
+	if len(errs) != 1 {
+		t.Fatalf("errs = %+v, want exactly one syntax error", errs)
+	}
+}
+
 func TestValidate_CodeSourceInvalidSyntax(t *testing.T) {
 	step := codeAction("step_1")
 	step.Code.Source = "(params) => { this is not valid js !! }"

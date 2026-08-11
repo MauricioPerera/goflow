@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"goflow/pkg/credentials"
+	"goflow/pkg/engine"
 	"goflow/pkg/flowvalidate"
 	"goflow/pkg/model"
 	"goflow/pkg/piece"
@@ -280,12 +281,16 @@ func redactSteps(steps map[string]*model.StepOutput, refs []CredentialRef) {
 //     configuration problem, the same category as referencing a piece that
 //     doesn't exist, not a server fault.
 //   - state non-nil: the flow ran, with every credential redacted on it.
-func RunWithCredentials(fv *model.FlowVersion, buildRegistry func() (*piece.Registry, error), credStore credentials.Store, trigger any, executeTrigger bool) (state *model.ExecutionState, validationErrs []flowvalidate.ValidationError, err error) {
+//
+// callFlow is passed straight through to Run unchanged — see that
+// function's own doc comment for why RunWithCredentials itself builds no
+// actual sub-flow lookup/execution logic (RunWithHistory does).
+func RunWithCredentials(fv *model.FlowVersion, buildRegistry func() (*piece.Registry, error), credStore credentials.Store, callFlow engine.CallFlowFunc, trigger any, executeTrigger bool) (state *model.ExecutionState, validationErrs []flowvalidate.ValidationError, err error) {
 	resolved, refs, err := ResolveCredentials(fv, credStore)
 	if err != nil {
 		return nil, []flowvalidate.ValidationError{{Path: "credentials", Message: err.Error()}}, nil
 	}
-	state, validationErrs, err = Run(resolved, buildRegistry, trigger, executeTrigger)
+	state, validationErrs, err = Run(resolved, buildRegistry, callFlow, trigger, executeTrigger)
 	if err != nil {
 		return nil, validationErrs, err
 	}

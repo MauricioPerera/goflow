@@ -35,7 +35,17 @@ import (
 // httpapi.Server.buildRegistry and GatedStore.Save: a flow must validate and
 // run against the piece registry AS IT IS now, including JS pieces added to
 // the catalog after this process started.
-func Run(fv *model.FlowVersion, buildRegistry func() (*piece.Registry, error), trigger any, executeTrigger bool) (state *model.ExecutionState, validationErrs []flowvalidate.ValidationError, err error) {
+//
+// callFlow backs CALL_FLOW actions (see engine.CallFlowFunc) — nil disables
+// them (a flow using one fails clearly instead of panicking). Run itself
+// has no idea how a sub-flow actually gets looked up and run; it only
+// wires whatever it's given onto the Engine — RunWithHistory is the one
+// place in this package that actually BUILDS a real callFlow closure (flow
+// lookup, cycle detection, recording), since it's the one with a Store,
+// credStore, and historyStore all in scope together. Run/RunWithCredentials
+// stay agnostic on purpose, matching how neither of them knows about
+// credentials.Store either — the caller two levels up owns that.
+func Run(fv *model.FlowVersion, buildRegistry func() (*piece.Registry, error), callFlow engine.CallFlowFunc, trigger any, executeTrigger bool) (state *model.ExecutionState, validationErrs []flowvalidate.ValidationError, err error) {
 	registry, err := buildRegistry()
 	if err != nil {
 		return nil, nil, fmt.Errorf("flowstore: building registry: %w", err)
@@ -44,6 +54,7 @@ func Run(fv *model.FlowVersion, buildRegistry func() (*piece.Registry, error), t
 		return nil, errs, nil
 	}
 	eng := engine.New(registry)
+	eng.CallFlow = callFlow
 	return eng.ExecuteBegin(fv, engine.BeginInput{
 		TriggerPayload: trigger,
 		ExecuteTrigger: executeTrigger,

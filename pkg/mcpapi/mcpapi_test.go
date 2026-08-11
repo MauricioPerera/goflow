@@ -468,6 +468,40 @@ func TestToolsCall_OnFailureConfigured_TriggersNamedFlow_RecordedInHistory(t *te
 	}
 }
 
+func TestToolsCall_CallFlow_InvokesNamedFlow_RecordedInHistory(t *testing.T) {
+	root := flowstore.FlowDefinition{
+		Name: "root", DisplayName: "Root",
+		Flow: model.FlowVersion{
+			ID: "fv-root",
+			Trigger: &model.FlowTrigger{
+				Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+				NextAction: &model.FlowAction{
+					Name: "call", DisplayName: "Call", Type: model.ActionCallFlow,
+					CallFlow: &model.CallFlowSettings{FlowName: "notify"},
+				},
+			},
+		},
+	}
+	h, hist := newHandlerWithFlowsAndHistory(t, notifyFlow(), root)
+
+	result := callTool(t, h, "root", nil)
+	if result["isError"] != false {
+		t.Fatalf("isError = %v, want false: %v", result["isError"], result)
+	}
+
+	summaries, err := hist.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	names := map[string]int{}
+	for _, s := range summaries {
+		names[s.FlowName]++
+	}
+	if names["root"] != 1 || names["notify"] != 1 {
+		t.Fatalf("recorded runs = %v, want exactly one for \"root\" and one for \"notify\"", names)
+	}
+}
+
 func TestToolsCall_OnFailureNotConfigured_DoesNotTriggerAnything(t *testing.T) {
 	h, hist := newHandlerWithFlowsAndHistory(t, notifyFlow(), throwsFlow()) // throwsFlow has no OnFailureFlow set
 

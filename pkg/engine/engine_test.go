@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -245,6 +246,127 @@ func TestContinueOnFailure(t *testing.T) {
 	}
 	if state.Steps["throwing"].Status != model.StepFailed {
 		t.Fatalf("throwing status = %v", state.Steps["throwing"].Status)
+	}
+	assertOutput(t, state, "echo_step", map[string]any{"key": int64(3)})
+}
+
+func callFlowAction(name string, input map[string]any) *model.FlowAction {
+	return &model.FlowAction{
+		Name: name, DisplayName: name, Type: model.ActionCallFlow,
+		CallFlow: &model.CallFlowSettings{FlowName: "sub-flow", Input: input},
+	}
+}
+
+// syntheticSubState builds a minimal, valid *model.ExecutionState the way a
+// real sub-run would produce one — enough for executeCallFlow to treat it
+// as a genuine result, without actually running a second flow through this
+// package (that recursive wiring belongs to pkg/flowstore, tested there).
+func syntheticSubState(succeeded bool) *model.ExecutionState {
+	state := model.NewExecutionState()
+	state.Steps["sub_step"] = &model.StepOutput{Type: model.ActionCode, Status: model.StepSucceeded, Output: map[string]any{"ok": true}}
+	if succeeded {
+		state.Verdict = model.Verdict{Status: model.FlowRunSucceeded}
+	} else {
+		state.Verdict = model.Verdict{Status: model.FlowRunFailed, FailedStep: &model.FailedStep{Name: "sub_step", DisplayName: "Sub Step", Message: "sub-flow boom"}}
+	}
+	return state
+}
+
+func TestCallFlow_Succeeds_OutputIsFullSubRunState(t *testing.T) {
+	call := callFlowAction("call", map[string]any{"n": 21})
+	fv := &model.FlowVersion{ID: "fv-callflow", Trigger: trigger(call)}
+	eng := engine.New(piece.NewRegistry())
+	eng.CallFlow = func(flowName string, in any) (*model.ExecutionState, error) {
+		if flowName != "sub-flow" {
+			t.Fatalf("CallFlow got flowName = %q, want \"sub-flow\"", flowName)
+		}
+		inMap, _ := in.(map[string]any)
+		if inMap["n"] != 21 {
+			t.Fatalf("CallFlow got trigger = %#v, want the resolved Input", in)
+		}
+		return syntheticSubState(true), nil
+	}
+	state := eng.ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+
+	if state.Verdict.Status != model.FlowRunSucceeded {
+		t.Fatalf("verdict = %+v", state.Verdict)
+	}
+	out := state.Steps["call"]
+	if out.Status != model.StepSucceeded {
+		t.Fatalf("call step status = %v", out.Status)
+	}
+	subState, ok := out.Output.(*model.ExecutionState)
+	if !ok {
+		t.Fatalf("Output = %#v (%T), want the full *model.ExecutionState the sub-flow returned", out.Output, out.Output)
+	}
+	if subState.Verdict.Status != model.FlowRunSucceeded {
+		t.Fatalf("nested sub-state Verdict = %+v, want SUCCEEDED — the whole sub-run, not just its last step, must be reachable", subState.Verdict)
+	}
+}
+
+func TestCallFlow_SubFlowFailed_StepFailsWithSubFlowMessage(t *testing.T) {
+	call := callFlowAction("call", nil)
+	fv := &model.FlowVersion{ID: "fv-callflow-fail", Trigger: trigger(call)}
+	eng := engine.New(piece.NewRegistry())
+	eng.CallFlow = func(string, any) (*model.ExecutionState, error) { return syntheticSubState(false), nil }
+	state := eng.ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+
+	if state.Verdict.Status != model.FlowRunFailed {
+		t.Fatalf("verdict = %+v, want FAILED — a failed sub-flow call must fail the calling step too", state.Verdict)
+	}
+	out := state.Steps["call"]
+	if out.Status != model.StepFailed || out.ErrorMessage != "sub-flow boom" {
+		t.Fatalf("call step = %+v, want FAILED with the sub-flow's own FailedStep.Message", out)
+	}
+	if _, ok := out.Output.(*model.ExecutionState); !ok {
+		t.Fatalf("Output = %#v, want the sub-state still attached even on failure, for inspection", out.Output)
+	}
+}
+
+func TestCallFlow_NilHook_FailsClearlyNotPanic(t *testing.T) {
+	call := callFlowAction("call", nil)
+	fv := &model.FlowVersion{ID: "fv-callflow-nohook", Trigger: trigger(call)}
+	// engine.New never sets CallFlow — nil by default.
+	state := engine.New(piece.NewRegistry()).ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+
+	if state.Verdict.Status != model.FlowRunFailed {
+		t.Fatalf("verdict = %+v, want FAILED", state.Verdict)
+	}
+	if !strings.Contains(state.Steps["call"].ErrorMessage, "not enabled") {
+		t.Fatalf("ErrorMessage = %q, want it to say sub-flow calls aren't enabled", state.Steps["call"].ErrorMessage)
+	}
+}
+
+func TestCallFlow_HookError_FailsStepWithThatMessage(t *testing.T) {
+	call := callFlowAction("call", nil)
+	fv := &model.FlowVersion{ID: "fv-callflow-err", Trigger: trigger(call)}
+	eng := engine.New(piece.NewRegistry())
+	eng.CallFlow = func(string, any) (*model.ExecutionState, error) { return nil, fmt.Errorf("no flow named %q", "sub-flow") }
+	state := eng.ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+
+	if state.Verdict.Status != model.FlowRunFailed {
+		t.Fatalf("verdict = %+v, want FAILED", state.Verdict)
+	}
+	if state.Steps["call"].ErrorMessage != `no flow named "sub-flow"` {
+		t.Fatalf("ErrorMessage = %q, want the hook's own error verbatim", state.Steps["call"].ErrorMessage)
+	}
+}
+
+func TestCallFlow_ContinueOnFailure_ChainKeepsGoing(t *testing.T) {
+	echoStep := codeAction("echo_step", echoSource, map[string]any{"key": "{{ 1 + 2 }}"})
+	call := callFlowAction("call", nil)
+	call.Error = &model.ErrorHandling{ContinueOnFailure: true}
+	call.NextAction = echoStep
+	fv := &model.FlowVersion{ID: "fv-callflow-cof", Trigger: trigger(call)}
+	eng := engine.New(piece.NewRegistry())
+	eng.CallFlow = func(string, any) (*model.ExecutionState, error) { return syntheticSubState(false), nil }
+	state := eng.ExecuteBegin(fv, engine.BeginInput{TriggerPayload: map[string]any{}})
+
+	if state.Verdict.Status != model.FlowRunSucceeded {
+		t.Fatalf("verdict = %+v, want SUCCEEDED — continueOnFailure should absorb the sub-flow's failure, same as any other action type", state.Verdict)
+	}
+	if state.Steps["call"].Status != model.StepFailed {
+		t.Fatalf("call status = %v, want FAILED (recorded, just not fatal to the run)", state.Steps["call"].Status)
 	}
 	assertOutput(t, state, "echo_step", map[string]any{"key": int64(3)})
 }

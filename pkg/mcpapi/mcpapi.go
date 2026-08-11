@@ -219,7 +219,7 @@ func metaToolDescriptors() []map[string]any {
 		},
 		{
 			"name":        toolSaveFlow,
-			"description": "Save (create, or overwrite if the name already exists) a named flow. Validated against the CURRENT piece registry before being persisted — a flow referencing a piece that doesn't exist is rejected, never partially saved. The \"flow\" argument's shape is not constrained by this schema (it's a recursive, variant-typed trigger/action graph — see goflow_get_flow on an existing flow, or goflow_describe_catalog for the piece names/actions it can reference, for the exact JSON shape).",
+			"description": "Save (create, or overwrite if the name already exists) a named flow. Validated against the CURRENT piece registry before being persisted — a flow referencing a piece that doesn't exist is rejected, never partially saved. The \"flow\" argument's shape is not constrained by this schema (it's a recursive, variant-typed trigger/action graph — see goflow_get_flow on an existing flow, or goflow_describe_catalog for the piece names/actions it can reference, for the exact JSON shape). One action type worth knowing about explicitly: type \"CALL_FLOW\" with callFlow:{flowName, input} runs ANOTHER saved flow as a step — its full result becomes this step's Output (not just its last step), and a nonexistent target, a cycle, or a chain deeper than 10 hops all fail the calling step cleanly rather than crashing anything.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -919,7 +919,7 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 		return
 	}
 
-	state, validationErrs, runErr := flowstore.RunWithHistory(&def.Flow, h.BuildRegistry, h.CredStore, h.HistoryStore, def.Name, params.Arguments, false)
+	state, validationErrs, runErr := flowstore.RunWithHistory(&def.Flow, h.BuildRegistry, h.CredStore, h.HistoryStore, h.FlowStore, def.Name, params.Arguments, false)
 	flowstore.TriggerOnFailure(h.FlowStore, def.Name, def.OnFailureFlow, state, h.BuildRegistry, h.CredStore, h.HistoryStore)
 	writeFlowRunResult(w, req.ID, state, validationErrs, runErr)
 }
@@ -965,7 +965,7 @@ func (h *Handler) callRunFlow(w http.ResponseWriter, req rawRequest, args map[st
 		writeToolText(w, req.ID, true, "invalid arguments: "+err.Error())
 		return
 	}
-	state, validationErrs, runErr := flowstore.RunWithHistory(&body.Flow, h.BuildRegistry, h.CredStore, h.HistoryStore, "", body.Trigger, body.ExecuteTrigger)
+	state, validationErrs, runErr := flowstore.RunWithHistory(&body.Flow, h.BuildRegistry, h.CredStore, h.HistoryStore, h.FlowStore, "", body.Trigger, body.ExecuteTrigger)
 	writeFlowRunResult(w, req.ID, state, validationErrs, runErr)
 }
 

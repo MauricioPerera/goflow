@@ -28,7 +28,7 @@ func failingRegistry() (*piece.Registry, error) {
 // validationErrs), and both state and validationErrs are nil.
 func TestRun_BuildRegistryFails_PropagatesErr(t *testing.T) {
 	fv := validCodeFlow()
-	state, vErrs, err := Run(&fv, failingRegistry, nil, false)
+	state, vErrs, err := Run(&fv, failingRegistry, nil, nil, false)
 	if err == nil {
 		t.Fatalf("err = nil, want a buildRegistry failure")
 	}
@@ -52,7 +52,7 @@ func TestRun_BuildRegistryFails_PropagatesErr(t *testing.T) {
 // (not err), with state nil and err nil.
 func TestRun_PieceReferencingFlowAgainstEmptyRegistry_ReturnsValidationErrs(t *testing.T) {
 	fv := pieceReferencingFlow()
-	state, vErrs, err := Run(&fv, emptyRegistry, nil, false)
+	state, vErrs, err := Run(&fv, emptyRegistry, nil, nil, false)
 	if err != nil {
 		t.Fatalf("err = %v, want nil — a validation failure is not an err", err)
 	}
@@ -79,7 +79,7 @@ func TestRun_PieceReferencingFlowAgainstEmptyRegistry_ReturnsValidationErrs(t *t
 // Verdict.Status is model.FlowRunSucceeded, with err and validationErrs nil.
 func TestRun_ValidCodeFlow_ReturnsSucceededState(t *testing.T) {
 	fv := validCodeFlow()
-	state, vErrs, err := Run(&fv, emptyRegistry, nil, false)
+	state, vErrs, err := Run(&fv, emptyRegistry, nil, nil, false)
 	if err != nil {
 		t.Fatalf("err = %v, want nil for a valid flow", err)
 	}

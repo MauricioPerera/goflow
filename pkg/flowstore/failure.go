@@ -61,7 +61,7 @@ func TriggerOnFailure(store Store, flowName, onFailureFlow string, state *model.
 		"failedMessage":         failedMessage,
 	}
 
-	if _, _, runErr := RunWithHistory(&def.Flow, buildRegistry, credStore, historyStore, def.Name, payload, false); runErr != nil {
+	if _, _, runErr := RunWithHistory(&def.Flow, buildRegistry, credStore, historyStore, store, def.Name, payload, false); runErr != nil {
 		log.Printf("flowstore: TriggerOnFailure: running on-failure flow %q for %q: %v", onFailureFlow, flowName, runErr)
 	}
 }

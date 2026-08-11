@@ -265,7 +265,7 @@ func TestRedactCredentials_OnRealRunState_RedactsInputOnly(t *testing.T) {
 	}
 	fv := credMarkerFlow("use_auth", "smtp-relay")
 
-	state, vErrs, err := RunWithCredentials(&fv, emptyRegistry, store, nil, false)
+	state, vErrs, err := RunWithCredentials(&fv, emptyRegistry, store, nil, nil, false)
 	if err != nil {
 		t.Fatalf("RunWithCredentials err: %v", err)
 	}
@@ -332,7 +332,7 @@ func TestRunWithCredentials_SecretNotInStateJSON(t *testing.T) {
 	}
 	fv := credMarkerFlow("use_auth", "smtp-relay")
 
-	state, vErrs, err := RunWithCredentials(&fv, emptyRegistry, store, nil, false)
+	state, vErrs, err := RunWithCredentials(&fv, emptyRegistry, store, nil, nil, false)
 	if err != nil {
 		t.Fatalf("RunWithCredentials err: %v", err)
 	}
@@ -394,7 +394,7 @@ func TestRunWithCredentials_CredentialInsideLoop_AllIterationsRedacted(t *testin
 		},
 	}
 
-	state, vErrs, err := RunWithCredentials(&fv, emptyRegistry, store, nil, false)
+	state, vErrs, err := RunWithCredentials(&fv, emptyRegistry, store, nil, nil, false)
 	if err != nil {
 		t.Fatalf("RunWithCredentials err: %v", err)
 	}
@@ -441,7 +441,7 @@ func TestRunWithCredentials_CredentialInsideLoop_AllIterationsRedacted(t *testin
 func TestRunWithCredentials_MissingCredential_ReturnsValidationErrsNotErr(t *testing.T) {
 	store := newCredStore(t)
 	fv := credMarkerFlow("use_auth", "no-such-cred")
-	state, vErrs, err := RunWithCredentials(&fv, emptyRegistry, store, nil, false)
+	state, vErrs, err := RunWithCredentials(&fv, emptyRegistry, store, nil, nil, false)
 	if err != nil {
 		t.Fatalf("err = %v, want nil — a missing credential is not an err", err)
 	}

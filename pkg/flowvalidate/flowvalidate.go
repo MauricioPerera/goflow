@@ -182,6 +182,23 @@ func (w *walker) checkAction(path string, action *model.FlowAction) {
 		w.checkJSSyntax(path+".loop.items", trimTemplate(action.Loop.Items))
 		w.walkChain(path+".loop.firstLoopAction", action.Loop.FirstLoopAction)
 
+	case model.ActionCallFlow:
+		if action.CallFlow == nil {
+			w.errs = append(w.errs, ValidationError{Path: path, Message: "type is CALL_FLOW but CallFlow settings is nil"})
+			return
+		}
+		if action.CallFlow.FlowName == "" {
+			w.errs = append(w.errs, ValidationError{Path: path + ".callFlow.flowName", Message: "CALL_FLOW action has no target flow name"})
+		}
+		// Whether FlowName actually names a SAVED flow is deliberately not
+		// checked here — this package only ever receives a *piece.Registry,
+		// never a flow store, same reason a $credential marker's target
+		// isn't checked here either (pkg/flowstore.ResolveCredentials owns
+		// that, at run time, not save/validate time). A CALL_FLOW to a
+		// nonexistent flow surfaces as a clean FAILED step instead — see
+		// Engine.CallFlow's doc comment.
+		w.errs = append(w.errs, checkTemplatesInMap(path+".callFlow.input", action.CallFlow.Input)...)
+
 	default:
 		w.errs = append(w.errs, ValidationError{Path: path, Message: fmt.Sprintf("unknown action type %q", action.Type)})
 	}

@@ -34,6 +34,7 @@ const (
 	ActionPiece       FlowActionType = "PIECE"
 	ActionRouter      FlowActionType = "ROUTER"
 	ActionLoopOnItems FlowActionType = "LOOP_ON_ITEMS"
+	ActionCallFlow    FlowActionType = "CALL_FLOW"
 )
 
 // FlowTriggerType discriminates a trigger: EMPTY passes its payload through
@@ -117,7 +118,7 @@ type ErrorHandling struct {
 }
 
 // FlowAction is one node in the action chain. Type selects exactly one of
-// Code/Piece/Router/Loop to be non-nil.
+// Code/Piece/Router/Loop/CallFlow to be non-nil.
 type FlowAction struct {
 	Name        string         `json:"name"`
 	DisplayName string         `json:"displayName"`
@@ -126,10 +127,11 @@ type FlowAction struct {
 	NextAction  *FlowAction    `json:"nextAction,omitempty"`
 	Error       *ErrorHandling `json:"error,omitempty"`
 
-	Code   *CodeSettings   `json:"code,omitempty"`
-	Piece  *PieceSettings  `json:"piece,omitempty"`
-	Router *RouterSettings `json:"router,omitempty"`
-	Loop   *LoopSettings   `json:"loop,omitempty"`
+	Code     *CodeSettings     `json:"code,omitempty"`
+	Piece    *PieceSettings    `json:"piece,omitempty"`
+	Router   *RouterSettings   `json:"router,omitempty"`
+	Loop     *LoopSettings     `json:"loop,omitempty"`
+	CallFlow *CallFlowSettings `json:"callFlow,omitempty"`
 }
 
 // CodeSettings holds a CODE action's inputs and JS source. Unlike
@@ -160,6 +162,18 @@ type RouterSettings struct {
 type LoopSettings struct {
 	Items           string      `json:"items"` // template string resolving to an array
 	FirstLoopAction *FlowAction `json:"firstLoopAction,omitempty"`
+}
+
+// CallFlowSettings holds a CALL_FLOW action's target and the trigger payload
+// to pass it — the Go analogue of n8n's "Execute Workflow" node. FlowName
+// names ANOTHER saved flow (looked up the same way OnFailureFlow is);
+// Input is that sub-flow's trigger payload, {{ }}-templated like every
+// other action's Input before running. See Engine.CallFlow's doc comment
+// for how the sub-flow actually gets invoked (pkg/engine itself has no
+// concept of a flow store — this is wired in from pkg/flowstore).
+type CallFlowSettings struct {
+	FlowName string         `json:"flowName"`
+	Input    map[string]any `json:"input,omitempty"`
 }
 
 // FlowTrigger is the entry point of a flow.

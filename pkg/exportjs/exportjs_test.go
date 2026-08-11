@@ -81,6 +81,21 @@ func TestSupported_RejectsPieceAction(t *testing.T) {
 	}
 }
 
+func TestSupported_RejectsCallFlowAction(t *testing.T) {
+	// A generated JS file has no flowstore.Store to look another flow up
+	// in — pkg/engine.CallFlowFunc requires exactly that, which this
+	// package deliberately never re-hosts, same reasoning as PIECE.
+	callFlow := &model.FlowAction{
+		Name: "delegate", Type: model.ActionCallFlow,
+		CallFlow: &model.CallFlowSettings{FlowName: "some-other-flow"},
+	}
+	fv := emptyTriggerFlow(callFlow)
+	errs := exportjs.Supported(fv)
+	if len(errs) != 1 || errs[0].Path != "delegate" || !strings.Contains(errs[0].Message, "CALL_FLOW") {
+		t.Fatalf("errs = %v, want exactly one violation naming the CALL_FLOW action", errs)
+	}
+}
+
 func TestSupported_ReportsEveryViolationNotJustFirst(t *testing.T) {
 	router := &model.FlowAction{Name: "route", Type: model.ActionRouter, Router: &model.RouterSettings{}}
 	loop := &model.FlowAction{Name: "loop", Type: model.ActionLoopOnItems, Loop: &model.LoopSettings{}, NextAction: router}

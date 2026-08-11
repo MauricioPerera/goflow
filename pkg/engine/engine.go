@@ -28,6 +28,18 @@ type RetryConstants struct {
 
 var DefaultRetryConstants = RetryConstants{MaxAttempts: 4, ExponentialBase: 2, IntervalMs: 2000}
 
+// CallFlowFunc runs another saved flow by name for a CALL_FLOW action —
+// pkg/engine has no concept of a flow store (pkg/flowstore imports pkg/engine,
+// not the other way around, so engine can't import flowstore without a
+// cycle), so this is the hook a caller wires in from outside to make
+// CALL_FLOW actually work. trigger is the sub-flow's already-{{ }}-resolved
+// Input; the returned *model.ExecutionState becomes the CALL_FLOW step's own
+// Output verbatim — the whole sub-run, not just its last step, same shape
+// every other "a flow ran" result in this project already has. An error
+// here (sub-flow not found, cycle detected, depth limit hit, ...) fails the
+// CALL_FLOW step exactly like a thrown PIECE/CODE error would.
+type CallFlowFunc func(flowName string, trigger any) (*model.ExecutionState, error)
+
 // Engine executes flows. Safe to reuse across runs (holds no per-run state).
 type Engine struct {
 	Registry        *piece.Registry
@@ -35,6 +47,13 @@ type Engine struct {
 	MaxLogSizeBytes int // 0 disables the check
 	Files           piece.FileWriter
 	Store           piece.Store // wired into every PIECE action's ActionContext.Store — see its doc comment
+	// CallFlow backs CALL_FLOW actions — see CallFlowFunc. Nil (the New()
+	// default) means CALL_FLOW is disabled: a flow using it fails clearly
+	// ("sub-flow calls are not enabled for this execution context") rather
+	// than panicking on a nil call. cmd/lambda's single-fixed-flow model
+	// deliberately never wires this — a CALL_FLOW action there fails the
+	// same clear way, not silently.
+	CallFlow CallFlowFunc
 }
 
 func New(registry *piece.Registry) *Engine {
@@ -237,6 +256,8 @@ func (e *Engine) executeChain(action *model.FlowAction, state *model.ExecutionSt
 			e.executeRouter(action, state)
 		case model.ActionLoopOnItems:
 			e.executeLoop(action, state)
+		case model.ActionCallFlow:
+			e.executeCallFlow(action, state)
 		}
 		e.checkLogSize(action, state)
 		if state.Verdict.Status != model.FlowRunRunning {
@@ -640,6 +661,49 @@ func containerStepStatus(runStatus model.FlowRunStatus) model.StepOutputStatus {
 		return model.StepPaused
 	}
 	return model.StepFailed
+}
+
+// --- CALL_FLOW ----------------------------------------------------------
+
+// executeCallFlow resolves the sub-flow's Input the same way CODE/PIECE
+// resolve theirs, then hands it to e.CallFlow (see CallFlowFunc). The
+// sub-run's FULL ExecutionState becomes this step's Output — not just its
+// last step's Output — matching every other "a flow ran" result shape in
+// this project, so a caller reaches into it the same way it would reach
+// into the trigger step's output ({{ step.output.Steps.someName.Output }}
+// etc). This step's own Status mirrors the sub-run's Verdict: a FAILED
+// sub-run fails this step too (with the sub-run's own FailedStep.Message
+// as this step's ErrorMessage), so retry/ContinueOnFailure apply exactly
+// like a thrown PIECE/CODE error would — a failed sub-flow call is not
+// silently treated as this step succeeding.
+func (e *Engine) executeCallFlow(action *model.FlowAction, state *model.ExecutionState) {
+	if state.IsCompleted(action.Name) {
+		return
+	}
+	out := e.runWithRetry(action, func() *model.StepOutput {
+		start := time.Now()
+		resolvedInput, err := expr.ResolveMap(action.CallFlow.Input, expr.NewScope(state))
+		if err != nil {
+			return failedStep(model.ActionCallFlow, resolvedInput, err, ms(start))
+		}
+		if e.CallFlow == nil {
+			return failedStep(model.ActionCallFlow, resolvedInput,
+				fmt.Errorf("sub-flow calls are not enabled for this execution context"), ms(start))
+		}
+		subState, err := e.CallFlow(action.CallFlow.FlowName, resolvedInput)
+		if err != nil {
+			return failedStep(model.ActionCallFlow, resolvedInput, err, ms(start))
+		}
+		if subState.Verdict.Status == model.FlowRunFailed {
+			msg := "sub-flow failed"
+			if fs := subState.Verdict.FailedStep; fs != nil {
+				msg = fs.Message
+			}
+			return &model.StepOutput{Type: model.ActionCallFlow, Status: model.StepFailed, Input: resolvedInput, Output: subState, ErrorMessage: msg, DurationMs: ms(start)}
+		}
+		return &model.StepOutput{Type: model.ActionCallFlow, Status: model.StepSucceeded, Input: resolvedInput, Output: subState, DurationMs: ms(start)}
+	})
+	recordStep(state, action, out)
 }
 
 // --- shared helpers ---------------------------------------------------------

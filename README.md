@@ -749,6 +749,51 @@ below for what a Go rewrite gets and gives up.
   never loop. An ad-hoc run (`POST /flows/run`, MCP `goflow_run_flow`) has
   no `FlowDefinition` to read this from, so it never applies there — same
   scoping `WebhookEnabled` already has.
+- **Sub-flow composition** (a new `CALL_FLOW` action type, `model.
+  CallFlowSettings`, `engine.CallFlowFunc`): the piece-authoring story was
+  always "the AI generates pieces and populates the catalog itself," so
+  the real gap for a growing, AI-authored catalog wasn't more pieces — it
+  was that every flow was an island; nothing let one flow call ANOTHER
+  saved flow as a step, the way n8n's "Execute Workflow" node does.
+  `pkg/engine` itself can't import `pkg/flowstore` (that would cycle —
+  `flowstore` already imports `engine`), so `Engine.CallFlow` is a plain
+  hook function (`engine.CallFlowFunc`) the engine calls for a `CALL_FLOW`
+  action and otherwise knows nothing about; `pkg/flowstore` is the only
+  place that actually builds a real one. `Run`/`RunWithCredentials` just
+  pass whatever `CallFlowFunc` they're given straight through to the
+  `Engine` unchanged; `RunWithHistory` is where the real implementation
+  lives, since it's the one function with a flow `Store`, `credStore`,
+  and `historyStore` all in scope together to build a working closure
+  from. That closure resolves the target by name, recurses back into
+  itself through the exact same `RunWithCredentials` path (so a sub-flow's
+  own `$credential` markers resolve exactly like a top-level run's do —
+  not a special case), and records EACH hop as its own separate history
+  entry under its own flow name — a 3-deep `CALL_FLOW` chain produces 3
+  independently inspectable `GET /runs/{id}` records, not one. A
+  `CALL_FLOW` step's Output is the sub-flow's FULL `*model.
+  ExecutionState` (Steps + Verdict), not just its last step — the same
+  "a flow ran" shape `POST /flows/run` and every other transport already
+  return, reachable from a later `{{ }}` template exactly like the
+  trigger step's output already is. A FAILED sub-run fails the calling
+  step too (with the sub-run's own `FailedStep.Message` as this step's
+  `ErrorMessage`), so retry/`ContinueOnFailure` apply exactly like a
+  thrown `PIECE`/`CODE` error would — a failed sub-flow call is never
+  silently treated as success. Two safety nets, since A calling B calling
+  A is a real risk `OnFailureFlow`'s "cap at one hop" trick can't solve
+  here (legitimate composition genuinely needs more than one hop): true
+  cycle detection (the call path — every flow name already running in
+  this call stack — is checked before each recursive call, catching A
+  re-entering itself through any number of intermediate flows, not just
+  a direct pair) plus a hard depth backstop (`maxCallFlowDepth`, 10) for
+  a long-but-non-cyclic chain. `flowvalidate.Validate` only checks
+  `CALL_FLOW` structurally (settings present, a non-empty target name,
+  well-formed `{{ }}` templates in `Input`) — same as it already leaves
+  `$credential` targets and `OnFailureFlow` targets unchecked, since it
+  only ever receives a `*piece.Registry`, never a flow store; calling a
+  flow that doesn't exist surfaces as a clean FAILED step at run time
+  instead. `pkg/exportjs` rejects `CALL_FLOW` the same way it already
+  rejects `ROUTER`/`LOOP_ON_ITEMS`/`PIECE` — a generated standalone JS
+  file has no flow store to look another flow up in either.
 
 ## Explicitly NOT in v1
 

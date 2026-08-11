@@ -9,7 +9,7 @@ import (
 )
 
 func failedStateFrom(fv model.FlowVersion) *model.ExecutionState {
-	state, _, err := Run(&fv, emptyRegistry, nil, false)
+	state, _, err := Run(&fv, emptyRegistry, nil, nil, false)
 	if err != nil {
 		panic(err)
 	}
@@ -50,7 +50,7 @@ func TestTriggerOnFailure_NoopWhenSucceeded(t *testing.T) {
 
 func succeededStateFrom(t *testing.T, fv model.FlowVersion) *model.ExecutionState {
 	t.Helper()
-	state, _, err := Run(&fv, emptyRegistry, nil, false)
+	state, _, err := Run(&fv, emptyRegistry, nil, nil, false)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
