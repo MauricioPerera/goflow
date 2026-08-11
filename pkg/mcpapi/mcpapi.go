@@ -43,21 +43,27 @@
 // /credentials already allow over HTTP, through the exact same underlying
 // Store calls (including catalog.GatedStore's and flowstore.GatedStore's
 // validation gates — a tool call can't bypass either), just reachable
-// without HTTP. goflow_run_flow and goflow_replay_run fit neither tier
-// cleanly — both have the same real side effects any flow run can (a
-// PIECE action can call a real API, use a credential, ...) but persist
-// nothing of their own — so they're described on their own terms.
-// goflow_run_flow is the MCP equivalent of POST /flows/run, closing the
-// one asymmetry left after the rest of this tier shipped — an MCP-only
-// client could save/delete/run a NAMED flow but had no way to try an
-// inline one first, the way POST /flows/run already lets an HTTP caller
-// do before ever committing to goflow_save_flow. goflow_replay_run is
-// the MCP equivalent of POST /runs/{id}/replay — re-runs a past run's
-// trigger against its flow's CURRENT definition, the natural complement
-// to goflow_save_flow's "examples" (hand-written cases) and
+// without HTTP. goflow_run_flow, goflow_replay_run, and goflow_resume_run
+// fit neither tier cleanly — all three have the same real side effects
+// any flow run can (a PIECE action can call a real API, use a
+// credential, ...) but persist nothing of their own — so they're
+// described on their own terms. goflow_run_flow is the MCP equivalent of
+// POST /flows/run, closing the one asymmetry left after the rest of this
+// tier shipped — an MCP-only client could save/delete/run a NAMED flow
+// but had no way to try an inline one first, the way POST /flows/run
+// already lets an HTTP caller do before ever committing to
+// goflow_save_flow. goflow_replay_run is the MCP equivalent of
+// POST /runs/{id}/replay — re-runs a past run's trigger against its
+// flow's CURRENT definition, the natural complement to
+// goflow_save_flow's "examples" (hand-written cases) and
 // goflow_rollback_flow_version (undo an edit): proving whether an edit
 // changed behavior against real historical traffic instead of only
-// hand-written ones.
+// hand-written ones. goflow_resume_run is the MCP equivalent of
+// POST /runs/{id}/resume — continues a run PAUSED at a piece calling
+// ctx.Run.WaitForWaitpoint (see pkg/pieces/approval), closing the gap
+// left after pause/resume shipped at the engine layer with no transport
+// ever reaching it: see flowstore.ResumeRun's own doc comment for the
+// "current definition, no idempotency guard" caveats it inherits.
 //
 // Everything here is encoding/json + net/http — JSON-RPC 2.0 is simple enough
 // that pulling in a library would add a dependency for nothing, matching the
@@ -170,6 +176,7 @@ const (
 	toolDeleteFlow           = "goflow_delete_flow"
 	toolRunFlow              = "goflow_run_flow"
 	toolReplayRun            = "goflow_replay_run"
+	toolResumeRun            = "goflow_resume_run"
 	toolRollbackFlowVersion  = "goflow_rollback_flow_version"
 	toolSavePiece            = "goflow_save_piece"
 	toolDeletePiece          = "goflow_delete_piece"
@@ -198,6 +205,7 @@ var reservedToolNames = map[string]bool{
 	toolDeleteFlow:           true,
 	toolRunFlow:              true,
 	toolReplayRun:            true,
+	toolResumeRun:            true,
 	toolRollbackFlowVersion:  true,
 	toolSavePiece:            true,
 	toolDeletePiece:          true,
@@ -396,6 +404,18 @@ func metaToolDescriptors() []map[string]any {
 				"type":       "object",
 				"properties": map[string]any{"id": map[string]any{"type": "string", "description": "the past run's id, e.g. from goflow_list_runs"}},
 				"required":   []string{"id"},
+			},
+		},
+		{
+			"name":        toolResumeRun,
+			"description": "Continue a PAUSED run — the MCP equivalent of POST /runs/{id}/resume. A run pauses at a piece that calls ctx.Run.WaitForWaitpoint (the built-in \"approval\" piece is the one shipped example: it waits for {\"approved\": bool, \"comment\": string}). Runs against the flow's CURRENT definition (not a pinned snapshot from when it paused) — same choice goflow_replay_run makes, for the same reason; if the flow was edited while the run sat waiting, resuming can silently take a different path than what actually paused. No idempotency guard: resuming the same id twice succeeds twice, producing two independent resumed runs — a caller needing at-most-once semantics (e.g. an approval with real side effects downstream) must enforce that itself. Recorded in goflow_list_runs/goflow_get_run with resumeOfRunId set to the run you started from. Fails if the run id doesn't exist, if it was an ad-hoc run (no flow name to resume against), if its own recorded state isn't PAUSED, or if the flow was deleted since.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id":            map[string]any{"type": "string", "description": "the paused run's id, e.g. from goflow_list_runs"},
+					"resumePayload": map[string]any{"description": "handed to the waiting piece's ctx.resumePayload — for the built-in approval piece, {\"approved\": bool, \"comment\": string}"},
+				},
+				"required": []string{"id"},
 			},
 		},
 		{
@@ -1265,6 +1285,9 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 	case toolReplayRun:
 		h.callReplayRun(w, req, params.Arguments)
 		return
+	case toolResumeRun:
+		h.callResumeRun(w, req, params.Arguments)
+		return
 	case toolRollbackFlowVersion:
 		h.callRollbackFlowVersion(w, req, params.Arguments)
 		return
@@ -1362,6 +1385,26 @@ func (h *Handler) callReplayRun(w http.ResponseWriter, req rawRequest, args map[
 		return
 	}
 	state, validationErrs, err := flowstore.ReplayRun(h.HistoryStore, h.FlowStore, h.BuildRegistry, h.CredStore, h.HistoryStore, id)
+	if err != nil {
+		writeToolText(w, req.ID, true, err.Error())
+		return
+	}
+	writeFlowRunResult(w, req.ID, state, validationErrs, nil)
+}
+
+// callResumeRun continues args["id"]'s PAUSED run with args["resumePayload"]
+// via flowstore.ResumeRun — every rejection ResumeRun can produce (run id
+// not found, an ad-hoc run, a run whose own state isn't PAUSED, or the
+// flow deleted since) comes back as a tool RESULT with isError:true via
+// writeFlowRunResult's own err-handling, same category as
+// callReplayRun's own bad-id handling.
+func (h *Handler) callResumeRun(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	id, _ := args["id"].(string)
+	if id == "" {
+		writeToolText(w, req.ID, true, "missing required argument: id")
+		return
+	}
+	state, validationErrs, err := flowstore.ResumeRun(h.HistoryStore, h.FlowStore, h.BuildRegistry, h.CredStore, h.HistoryStore, id, args["resumePayload"])
 	if err != nil {
 		writeToolText(w, req.ID, true, err.Error())
 		return

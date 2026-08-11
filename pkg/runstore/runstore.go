@@ -77,6 +77,13 @@ type Record struct {
 	// ever marks its own top-level record — a sub-flow triggered from
 	// inside one is a normal run, not itself a replay).
 	ReplayOfRunID string
+	// ResumeOfRunID, if set, is the id of the PAUSED run this one resumed
+	// — flowstore.ResumeRun's own trace of provenance, mirroring
+	// ReplayOfRunID's own reasoning above. Empty for every run that
+	// wasn't produced by resuming a pause, including the resumed run's
+	// own eventual completion history entries beyond the first (only the
+	// record ResumeRun directly produces carries it).
+	ResumeOfRunID string
 }
 
 // Summary is the metadata-only projection List returns — mirrors
@@ -94,6 +101,9 @@ type Summary struct {
 	// string, cheap enough that hiding it would only cost a caller an
 	// extra Get to tell a replay apart from an organic run while browsing.
 	ReplayOfRunID string
+	// ResumeOfRunID mirrors Record's own field, same reasoning as
+	// ReplayOfRunID above.
+	ResumeOfRunID string
 }
 
 // Store is the surface a run-history store exposes. Save assigns rec a
@@ -139,7 +149,7 @@ func summarize(rec Record) Summary {
 	if rec.State != nil {
 		status = rec.State.Verdict.Status
 	}
-	return Summary{ID: rec.ID, FlowName: rec.FlowName, Status: status, StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt, ReplayOfRunID: rec.ReplayOfRunID}
+	return Summary{ID: rec.ID, FlowName: rec.FlowName, Status: status, StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt, ReplayOfRunID: rec.ReplayOfRunID, ResumeOfRunID: rec.ResumeOfRunID}
 }
 
 // sortNewestFirst orders by StartedAt descending — most recent run first,

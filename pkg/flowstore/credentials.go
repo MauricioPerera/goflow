@@ -299,3 +299,25 @@ func RunWithCredentials(fv *model.FlowVersion, buildRegistry func() (*piece.Regi
 	}
 	return state, validationErrs, nil
 }
+
+// ResumeWithCredentials is RunWithCredentials' counterpart for Resume,
+// same reasoning throughout: fv is fetched fresh (see ResumeRun), so any
+// $credential marker in it is unresolved again and needs the same
+// resolve-before-run/redact-after-run treatment a fresh Run gets — the
+// original run's credentials were already redacted before its State was
+// ever persisted (see runstore's own doc comment), so this is about the
+// CURRENT definition being resumed against, not the past one.
+func ResumeWithCredentials(fv *model.FlowVersion, buildRegistry func() (*piece.Registry, error), credStore credentials.Store, callFlow engine.CallFlowFunc, priorState *model.ExecutionState, resumePayload any) (state *model.ExecutionState, validationErrs []flowvalidate.ValidationError, err error) {
+	resolved, refs, err := ResolveCredentials(fv, credStore)
+	if err != nil {
+		return nil, []flowvalidate.ValidationError{{Path: "credentials", Message: err.Error()}}, nil
+	}
+	state, validationErrs, err = Resume(resolved, buildRegistry, callFlow, priorState, resumePayload)
+	if err != nil {
+		return nil, validationErrs, err
+	}
+	if state != nil {
+		RedactCredentials(state, refs)
+	}
+	return state, validationErrs, nil
+}

@@ -526,7 +526,7 @@ below for what a Go rewrite gets and gives up.
   OAuth access token) already has that exact same access on every httpapi
   route today — there's no scopes/permissions concept anywhere in this
   project to make MCP meaningfully narrower, so none of this is a new
-  privilege, only new reachability. Twenty-four fixed tools are always present
+  privilege, only new reachability. Twenty-five fixed tools are always present
   in `tools/list` alongside the per-flow ones, each with a real, precise
   `inputSchema` (unlike a per-flow tool's deliberately permissive one,
   since these have well-defined Go types behind them, not an untyped
@@ -601,10 +601,12 @@ below for what a Go rewrite gets and gives up.
     ever committing to `goflow_save_flow`. `goflow_replay_run` is the MCP
     equivalent of `POST /runs/{id}/replay` — same "neither tier" shape
     (real side effects, persists nothing new of its own beyond the run it
-    records); see the replay entry below.
+    records); see the replay entry below. `goflow_resume_run` is the MCP
+    equivalent of `POST /runs/{id}/resume` — same shape again; see the
+    resume entry below.
 
   A saved flow (or, symmetrically, a credential name) that collides with
-  one of the twenty-four reserved names is excluded from `tools/list` — not
+  one of the twenty-five reserved names is excluded from `tools/list` — not
   deleted, not un-runnable/un-referenceable by name over HTTP — just
   shadowed in this one listing, and `tools/call` resolves that name to the
   fixed tool the same way, so the two methods never disagree about what a
@@ -960,6 +962,35 @@ below for what a Go rewrite gets and gives up.
   automatic diff against the original run — the caller already has both
   run ids and can compare them directly; a structural diff would be real
   added scope nothing has asked for yet.
+- **Resume a PAUSED run over HTTP/MCP** (`flowstore.ResumeRun` —
+  `POST /runs/{id}/resume`, MCP's `goflow_resume_run`): pause/resume
+  itself (`engine.ExecuteResume`, the "Approval" piece's
+  `ctx.Run.WaitForWaitpoint`) had existed at the engine layer since
+  early on, exercised only in tests — nothing on any transport ever
+  called it, so a flow that paused waiting for a human decision had no
+  way to actually continue outside hand-written Go. Closes that gap:
+  `runstore.Record.State` already stores the complete
+  `*model.ExecutionState` a `PAUSED` step needs (nothing new to persist
+  for this), and the engine's own structure guarantees at most one live
+  pause point per run (a container's `IsCompleted` check stops the
+  moment any step goes non-`Running`), so a caller only ever needs
+  `{id, resumePayload}` — never a target step name. Same "current
+  definition, not a pinned snapshot" choice `ReplayRun` already made,
+  for the same reason (no second storage field to keep one) — but
+  disclosed plainly here because it matters more for resume: replay is
+  an intentional "did an edit change behavior" probe, while a resumed
+  run is normally meant to just continue exactly what paused, so an
+  edit landing while a run sat waiting (a human approval pending for
+  days, say) can silently send it down a different path than what
+  actually paused; `engine.ExecuteResume` itself has no guard against
+  this either. Flow version history makes such drift auditable and
+  reversible after the fact, not prevented up front. Also has no
+  idempotency guard — resuming the same run id twice succeeds twice,
+  producing two independent resumed runs; a caller needing at-most-once
+  semantics (an approval whose downstream steps have real side effects)
+  has to enforce that itself today. `runstore.Record` gains a
+  `ResumeOfRunID` field, mirroring `ReplayOfRunID`'s own provenance
+  tracking.
 - **Signed, time-limited licenses for distributed binaries**
   (`pkg/license`, `cmd/licensegen` — `GOFLOW_LICENSE_FILE`): for a
   binary handed to someone outside this repo, the same hard-fail-at-

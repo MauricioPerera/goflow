@@ -1436,6 +1436,149 @@ func TestRunReplay_NoAuth_401(t *testing.T) {
 	}
 }
 
+// approvalFlowVersion is a single-action flow using the built-in
+// "approval" Go piece (pkg/pieces/approval, registered via pieces.All()
+// — see buildRegistry) — pauses on run, completes only once resumed with
+// a decision payload.
+func approvalFlowVersion() model.FlowVersion {
+	return model.FlowVersion{
+		ID: "fv-approval",
+		Trigger: &model.FlowTrigger{
+			Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+			NextAction: &model.FlowAction{
+				Name: "approve", DisplayName: "Approve", Type: model.ActionPiece,
+				Piece: &model.PieceSettings{PieceName: "approval", ActionName: "request", Input: map[string]any{
+					"message": "please approve this",
+				}},
+			},
+		},
+	}
+}
+
+func TestRunResume_ContinuesPausedRun_MarkedInHistory(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", flowstore.FlowDefinition{Name: "resume-me", DisplayName: "Resume Me", Flow: approvalFlowVersion()}, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	rec := do(t, srv, "POST", "/flows/resume-me/run", flowRunRequest{Trigger: map[string]any{}}, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var pausedState map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &pausedState); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, rec.Body.String())
+	}
+	verdict, _ := pausedState["Verdict"].(map[string]any)
+	if verdict["Status"] != "PAUSED" {
+		t.Fatalf("Verdict = %v, want PAUSED", verdict)
+	}
+
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	runs, _ := decode(t, listRec)["runs"].([]any)
+	if len(runs) != 1 {
+		t.Fatalf("runs = %+v, want exactly 1", runs)
+	}
+	first, _ := runs[0].(map[string]any)
+	pausedRunID, _ := first["ID"].(string)
+	if pausedRunID == "" {
+		t.Fatalf("run summary missing ID: %v", first)
+	}
+
+	rec = do(t, srv, "POST", "/runs/"+pausedRunID+"/resume", map[string]any{"resumePayload": map[string]any{"approved": true, "comment": "looks good"}}, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("resume: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resumedState map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resumedState); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, rec.Body.String())
+	}
+	resumedVerdict, _ := resumedState["Verdict"].(map[string]any)
+	if resumedVerdict["Status"] != "SUCCEEDED" {
+		t.Fatalf("resumed Verdict = %v, want SUCCEEDED", resumedVerdict)
+	}
+	steps, _ := resumedState["Steps"].(map[string]any)
+	approve, _ := steps["approve"].(map[string]any)
+	output, _ := approve["Output"].(map[string]any)
+	if output["approved"] != true || output["comment"] != "looks good" {
+		t.Fatalf("Output = %#v, want the resume payload reflected", output)
+	}
+
+	listRec = do(t, srv, "GET", "/runs", nil, true)
+	runs, _ = decode(t, listRec)["runs"].([]any)
+	if len(runs) != 2 {
+		t.Fatalf("runs = %+v, want exactly 2 (paused + resumed)", runs)
+	}
+	foundResume := false
+	for _, r := range runs {
+		rm, _ := r.(map[string]any)
+		if rm["ID"] != pausedRunID && rm["ResumeOfRunID"] == pausedRunID {
+			foundResume = true
+		}
+	}
+	if !foundResume {
+		t.Fatalf("runs = %+v, want one entry with ResumeOfRunID = %q", runs, pausedRunID)
+	}
+}
+
+func TestRunResume_AdHocRun_400(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "POST", "/flows/run", runRequest{Flow: approvalFlowVersion(), Trigger: map[string]any{}}, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	runs, _ := decode(t, listRec)["runs"].([]any)
+	first, _ := runs[0].(map[string]any)
+	runID, _ := first["ID"].(string)
+
+	rec = do(t, srv, "POST", "/runs/"+runID+"/resume", map[string]any{"resumePayload": map[string]any{"approved": true}}, true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "ad-hoc") {
+		t.Fatalf("body = %s, want it to mention the run is ad-hoc", rec.Body.String())
+	}
+}
+
+func TestRunResume_NotPaused_400(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", flowstore.FlowDefinition{Name: "not-paused", DisplayName: "Not Paused", Flow: doubleFlowVersion()}, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	rec := do(t, srv, "POST", "/flows/not-paused/run", flowRunRequest{Trigger: map[string]any{"n": 5}}, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	runs, _ := decode(t, listRec)["runs"].([]any)
+	first, _ := runs[0].(map[string]any)
+	runID, _ := first["ID"].(string)
+
+	rec = do(t, srv, "POST", "/runs/"+runID+"/resume", map[string]any{"resumePayload": map[string]any{}}, true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "not paused") {
+		t.Fatalf("body = %s, want it to mention the run isn't paused", rec.Body.String())
+	}
+}
+
+func TestRunResume_UnknownID_400(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "POST", "/runs/never-existed/resume", map[string]any{"resumePayload": map[string]any{}}, true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRunResume_NoAuth_401(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "POST", "/runs/whatever/resume", map[string]any{"resumePayload": map[string]any{}}, false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
 func TestPostFlowRun_UnknownName_404(t *testing.T) {
 	srv := newTestServer(t)
 	rec := do(t, srv, "POST", "/flows/never-saved/run", flowRunRequest{}, true)

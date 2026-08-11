@@ -14,6 +14,7 @@ import (
 	"goflow/pkg/flowstore"
 	"goflow/pkg/model"
 	"goflow/pkg/piece"
+	approvalpiece "goflow/pkg/pieces/approval"
 	"goflow/pkg/runstore"
 )
 
@@ -1892,6 +1893,179 @@ func TestReplayRun_UnknownID_IsErrorTrue(t *testing.T) {
 func TestReplayRun_MissingID_IsErrorTrue(t *testing.T) {
 	h := newHandlerWithFlows(t)
 	result := callTool(t, h, toolReplayRun, map[string]any{})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true when id is missing", result["isError"])
+	}
+}
+
+// --- goflow_resume_run ---------------------------------------------------
+
+// approvalRegistryBuilder is emptyRegistryBuilder's counterpart for resume
+// tests — the only BuildRegistry in this file that registers a REAL piece
+// (pkg/pieces/approval) rather than staying empty, since resume needs
+// something that actually pauses (ctx.Run.WaitForWaitpoint).
+func approvalRegistryBuilder() (*piece.Registry, error) {
+	r := piece.NewRegistry()
+	r.Register(approvalpiece.New())
+	return r, nil
+}
+
+// newHandlerWithApprovalFlows mirrors newHandlerWithFlowsAndHistory, but
+// wires approvalRegistryBuilder instead of emptyRegistryBuilder so a
+// saved flow using the "approval" piece can actually pause/resume.
+func newHandlerWithApprovalFlows(t *testing.T, defs ...flowstore.FlowDefinition) (*Handler, runstore.Store) {
+	t.Helper()
+	fs, err := flowstore.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	gated := &flowstore.GatedStore{Underlying: fs, BuildRegistry: approvalRegistryBuilder, Versions: flowstore.NewMemoryVersionStore()}
+	credStore, err := credentials.NewFileStore(t.TempDir(), testCredKey)
+	if err != nil {
+		t.Fatalf("credentials.NewFileStore: %v", err)
+	}
+	for _, def := range defs {
+		if err := fs.Save(def); err != nil {
+			t.Fatalf("Save %q: %v", def.Name, err)
+		}
+	}
+	historyStore := runstore.NewMemoryStore()
+	catalogStore := gatedTestCatalogStore()
+	return NewHandler(gated, approvalRegistryBuilder, credStore, historyStore, catalogStore, gated.Versions, catalogStore.Versions), historyStore
+}
+
+func approvalFlowJSON() map[string]any {
+	return map[string]any{
+		"id": "fv-mcp-approval",
+		"trigger": map[string]any{
+			"name": "trigger_1", "displayName": "Trigger", "type": "EMPTY",
+			"nextAction": map[string]any{
+				"name": "approve", "displayName": "Approve", "type": "PIECE",
+				"piece": map[string]any{
+					"pieceName": "approval", "actionName": "request",
+					"input": map[string]any{"message": "please approve this"},
+				},
+			},
+		},
+	}
+}
+
+func TestResumeRun_ContinuesPausedRun_MarkedInHistory(t *testing.T) {
+	h, hist := newHandlerWithApprovalFlows(t)
+	saveResult := callTool(t, h, toolSaveFlow, map[string]any{"name": "resume-me", "flow": approvalFlowJSON()})
+	if saveResult["isError"] != false {
+		t.Fatalf("save isError = %v: %v", saveResult["isError"], saveResult)
+	}
+
+	// A PAUSED verdict is reported as isError:true by writeFlowRunResult
+	// (isError tracks "did this run SUCCEED", not "did the call itself
+	// fail") — content is still present and decodable either way, same as
+	// a FAILED run's own tool result.
+	runResult := callTool(t, h, "resume-me", map[string]any{})
+	if runResult["isError"] != true {
+		t.Fatalf("run isError = %v, want true for a PAUSED verdict: %v", runResult["isError"], runResult)
+	}
+	var pausedState struct {
+		Verdict struct{ Status string } `json:"Verdict"`
+	}
+	toolText(t, runResult, &pausedState)
+	if pausedState.Verdict.Status != "PAUSED" {
+		t.Fatalf("Verdict = %+v, want PAUSED", pausedState.Verdict)
+	}
+
+	summaries, err := hist.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("summaries = %+v, want exactly 1", summaries)
+	}
+	pausedRunID := summaries[0].ID
+
+	resumeResult := callTool(t, h, toolResumeRun, map[string]any{"id": pausedRunID, "resumePayload": map[string]any{"approved": true, "comment": "looks good"}})
+	if resumeResult["isError"] != false {
+		t.Fatalf("resume isError = %v: %v", resumeResult["isError"], resumeResult)
+	}
+	var resumedState struct {
+		Verdict struct{ Status string } `json:"Verdict"`
+		Steps   map[string]struct {
+			Output map[string]any `json:"Output"`
+		} `json:"Steps"`
+	}
+	toolText(t, resumeResult, &resumedState)
+	if resumedState.Verdict.Status != "SUCCEEDED" {
+		t.Fatalf("resumed Verdict = %+v, want SUCCEEDED", resumedState.Verdict)
+	}
+	out := resumedState.Steps["approve"].Output
+	if out["approved"] != true || out["comment"] != "looks good" {
+		t.Fatalf("Output = %#v, want the resume payload reflected", out)
+	}
+
+	summaries, err = hist.List()
+	if err != nil {
+		t.Fatalf("List after resume: %v", err)
+	}
+	if len(summaries) != 2 {
+		t.Fatalf("summaries = %+v, want exactly 2 (paused + resumed)", summaries)
+	}
+	foundResume := false
+	for _, s := range summaries {
+		if s.ID != pausedRunID && s.ResumeOfRunID == pausedRunID {
+			foundResume = true
+		}
+	}
+	if !foundResume {
+		t.Fatalf("summaries = %+v, want one entry with ResumeOfRunID = %q", summaries, pausedRunID)
+	}
+}
+
+func TestResumeRun_AdHocRun_IsErrorTrue(t *testing.T) {
+	h, hist := newHandlerWithApprovalFlows(t)
+	// isError:true here reflects the PAUSED verdict, not a call failure —
+	// see TestResumeRun_ContinuesPausedRun_MarkedInHistory's own comment.
+	runResult := callTool(t, h, toolRunFlow, map[string]any{"flow": approvalFlowJSON()})
+	if runResult["isError"] != true {
+		t.Fatalf("run isError = %v, want true for a PAUSED verdict: %v", runResult["isError"], runResult)
+	}
+	summaries, _ := hist.List()
+	runID := summaries[0].ID
+
+	result := callTool(t, h, toolResumeRun, map[string]any{"id": runID, "resumePayload": map[string]any{"approved": true}})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true — an ad-hoc run has no flow name to resume against", result["isError"])
+	}
+}
+
+func TestResumeRun_NotPaused_IsErrorTrue(t *testing.T) {
+	h, hist := newHandlerWithFlowsAndHistory(t)
+	saveResult := callTool(t, h, toolSaveFlow, map[string]any{"name": "not-paused", "flow": flowVersionJSON()})
+	if saveResult["isError"] != false {
+		t.Fatalf("save isError = %v: %v", saveResult["isError"], saveResult)
+	}
+	runResult := callTool(t, h, "not-paused", map[string]any{"n": 5})
+	if runResult["isError"] != false {
+		t.Fatalf("run isError = %v: %v", runResult["isError"], runResult)
+	}
+	summaries, _ := hist.List()
+	runID := summaries[0].ID
+
+	result := callTool(t, h, toolResumeRun, map[string]any{"id": runID, "resumePayload": map[string]any{}})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true — the run succeeded outright and was never paused", result["isError"])
+	}
+}
+
+func TestResumeRun_UnknownID_IsErrorTrue(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolResumeRun, map[string]any{"id": "never-existed", "resumePayload": map[string]any{}})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true", result["isError"])
+	}
+}
+
+func TestResumeRun_MissingID_IsErrorTrue(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolResumeRun, map[string]any{})
 	if result["isError"] != true {
 		t.Fatalf("isError = %v, want true when id is missing", result["isError"])
 	}

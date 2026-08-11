@@ -157,6 +157,8 @@ func (s *Server) Handler() http.Handler {
 	// POST /runs/{id}/replay re-runs a past run's trigger against the
 	// flow's CURRENT definition — see handleRunReplay.
 	mux.Handle("POST /runs/{id}/replay", s.auth(http.HandlerFunc(s.handleRunReplay)))
+	// POST /runs/{id}/resume continues a PAUSED run — see handleRunResume.
+	mux.Handle("POST /runs/{id}/resume", s.auth(http.HandlerFunc(s.handleRunResume)))
 	// /mcp exposes the saved flows as MCP tools (JSON-RPC 2.0 over a single
 	// POST), behind the same auth as every other route (static token OR a
 	// live OAuth access token — see auth). authMCP additionally advertises
@@ -929,6 +931,46 @@ func (s *Server) handleRunGet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRunReplay(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	state, validationErrs, err := flowstore.ReplayRun(s.runStore, s.flowStore, s.buildRegistry, s.credStore, s.runStore, id)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(validationErrs) > 0 {
+		out := make([]map[string]string, len(validationErrs))
+		for i, e := range validationErrs {
+			out[i] = map[string]string{"path": e.Path, "message": e.Message}
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]any{"errors": out})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(state)
+}
+
+type resumeRequest struct {
+	ResumePayload any `json:"resumePayload"`
+}
+
+// handleRunResume handles POST /runs/{id}/resume — continues {id}'s PAUSED
+// run, feeding the request body's resumePayload to whichever piece is
+// waiting on it (see pkg/pieces/approval), via flowstore.ResumeRun. A 400
+// covers every rejection ResumeRun can produce: run id not found, an
+// ad-hoc run with no flow name to resume against, the run's own recorded
+// state not being PAUSED, or the flow having been deleted since. Success
+// returns the new *model.ExecutionState, the same bare-body shape
+// handleRunReplay already uses; the new run's own id (with ResumeOfRunID
+// set to {id}) is visible via GET /runs. No idempotency guard — see
+// flowstore.ResumeRun's own doc comment; resuming the same {id} twice
+// succeeds twice.
+func (s *Server) handleRunResume(w http.ResponseWriter, r *http.Request) {
+	var req resumeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	id := r.PathValue("id")
+	state, validationErrs, err := flowstore.ResumeRun(s.runStore, s.flowStore, s.buildRegistry, s.credStore, s.runStore, id, req.ResumePayload)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return

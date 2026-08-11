@@ -60,3 +60,36 @@ func Run(fv *model.FlowVersion, buildRegistry func() (*piece.Registry, error), c
 		ExecuteTrigger: executeTrigger,
 	}), nil, nil
 }
+
+// Resume is Run's counterpart for continuing a PAUSED run instead of
+// starting a fresh one — same "assemble registry, validate, wire
+// CallFlow" shape, but calls engine.ExecuteResume with priorState
+// (typically a runstore.Record.State fetched by id — see ResumeRun)
+// instead of engine.ExecuteBegin with a trigger payload. fv is
+// re-validated against the CURRENT registry exactly like Run does: since
+// fv is normally the flow's CURRENT saved definition (see ResumeRun),
+// not necessarily the one that was running when it paused, this catches
+// an edit that broke the flow outright — it does NOT catch an edit that
+// changed behavior more subtly (renamed/reordered steps after the
+// resume point); engine.ExecuteResume itself has no guard against that
+// either. resumePayload is engine-opaque, handed straight to whichever
+// piece's ctx.resumePayload is waiting on it (see pkg/pieces/approval
+// for the one piece in this catalog that reads it). priorState is
+// assumed to already be paused — Resume does not check this itself, the
+// same way Run doesn't second-guess ExecuteBegin's own preconditions;
+// see ResumeRun for the actual "was this run paused" check.
+func Resume(fv *model.FlowVersion, buildRegistry func() (*piece.Registry, error), callFlow engine.CallFlowFunc, priorState *model.ExecutionState, resumePayload any) (state *model.ExecutionState, validationErrs []flowvalidate.ValidationError, err error) {
+	registry, err := buildRegistry()
+	if err != nil {
+		return nil, nil, fmt.Errorf("flowstore: building registry: %w", err)
+	}
+	if errs := flowvalidate.Validate(fv, registry); len(errs) > 0 {
+		return nil, errs, nil
+	}
+	eng := engine.New(registry)
+	eng.CallFlow = callFlow
+	return eng.ExecuteResume(fv, engine.ResumeInput{
+		PriorState:    priorState,
+		ResumePayload: resumePayload,
+	}), nil, nil
+}
