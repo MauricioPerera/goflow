@@ -526,7 +526,7 @@ below for what a Go rewrite gets and gives up.
   OAuth access token) already has that exact same access on every httpapi
   route today — there's no scopes/permissions concept anywhere in this
   project to make MCP meaningfully narrower, so none of this is a new
-  privilege, only new reachability. Twenty-one fixed tools are always present
+  privilege, only new reachability. Twenty-four fixed tools are always present
   in `tools/list` alongside the per-flow ones, each with a real, precise
   `inputSchema` (unlike a per-flow tool's deliberately permissive one,
   since these have well-defined Go types behind them, not an untyped
@@ -555,7 +555,12 @@ below for what a Go rewrite gets and gives up.
     below), `goflow_piece_usage` and `goflow_credential_usage` (the MCP
     equivalents of `GET /pieces/{name}/usage` and
     `GET /credentials/{name}/usage` — every saved flow referencing a
-    piece/credential by name; see the reference-checking entry below).
+    piece/credential by name; see the reference-checking entry below),
+    `goflow_list_piece_versions` and `goflow_get_piece_version` (the MCP
+    equivalents of `GET /pieces/{name}/versions` and
+    `GET /pieces/{name}/versions/{id}` — they only ever READ what
+    `GatedStore.Save` already recorded, see the piece-versioning entry
+    below).
   - Write: `goflow_save_flow` and `goflow_delete_flow` (through the exact
     same `*flowstore.GatedStore` `POST`/`DELETE /flows` use — a flow
     referencing a missing piece is rejected, never partially saved);
@@ -570,7 +575,12 @@ below for what a Go rewrite gets and gives up.
     persists, one failing example rejects the whole piece, and delete
     needs no gate at all, since removal can't fail a quality check the
     way a save can — same reasoning `flowstore.GatedStore.Delete` already
-    documents); `goflow_list_credentials`, `goflow_save_credential`,
+    documents); `goflow_rollback_piece_version` (the MCP equivalent of
+    `POST /pieces/{name}/versions/{id}/rollback` — restores a past piece
+    version by fetching it and calling the exact same `GatedStore.Save` a
+    live edit goes through, so a version that no longer passes every
+    example fails to roll back rather than silently restoring something
+    broken now; see the piece-versioning entry below); `goflow_list_credentials`, `goflow_save_credential`,
     `goflow_delete_credential` (a credential's value is never echoed back
     in a tool result, matching `POST /credentials` exactly — `Store.Get`,
     the only thing that ever returns a decrypted value, is for trusted Go
@@ -594,7 +604,7 @@ below for what a Go rewrite gets and gives up.
     records); see the replay entry below.
 
   A saved flow (or, symmetrically, a credential name) that collides with
-  one of the twenty-one reserved names is excluded from `tools/list` — not
+  one of the twenty-four reserved names is excluded from `tools/list` — not
   deleted, not un-runnable/un-referenceable by name over HTTP — just
   shadowed in this one listing, and `tools/call` resolves that name to the
   fixed tool the same way, so the two methods never disagree about what a
@@ -871,6 +881,34 @@ below for what a Go rewrite gets and gives up.
   real one; a deployment that doesn't configure one behaves exactly as it
   did before this existed. No pruning/TTL, matching the same accepted,
   disclosed tradeoff `runstore` already has.
+- **Piece version history + rollback** (`catalog.VersionRecord`,
+  `catalog.VersionStore`, `GatedStore.Rollback` — `GET
+  /pieces/{name}/versions`, `GET /pieces/{name}/versions/{id}`,
+  `POST /pieces/{name}/versions/{id}/rollback`, and MCP's
+  `goflow_list_piece_versions`/`goflow_get_piece_version`/
+  `goflow_rollback_piece_version`): the piece-level mirror of flow
+  versioning above, closing the same gap for pieces — a piece edit can
+  pass every worked `Example` and still turn out to break something the
+  examples didn't cover, and without this the only way back was
+  remembering (or re-authoring) its previous `Definition` by hand. Same
+  shape throughout: every successful `GatedStore.Save` records an
+  immutable snapshot, `Rollback` is "fetch a past version's `Definition`
+  and `Save` it again" (going through the exact same `Validate` gate —
+  every example actually re-run — so a version that no longer passes
+  fails to roll back rather than silently restoring something broken
+  now), and it records its own new version entry, so history only ever
+  grows. Optional, nil-means-off — `cmd/server`'s
+  `GOFLOW_PIECE_VERSIONS_DIR` (default `./data/piece_versions`) wires a
+  real one. Building this surfaced a real, already-shipped bug: rapid
+  sequential saves can land on an identical `time.Now()` value on a
+  coarse system clock, and since both `MemoryVersionStore` and
+  `FileVersionStore` build their "newest first" list by ranging over a
+  map/directory (unordered) before sorting, a `SavedAt` tie made the
+  sort's result effectively random — not just flaky, genuinely wrong
+  ordering. This existed in `flowstore.VersionRecord` too (already
+  deployed, from the flow-versioning work above) and is fixed in both
+  packages together here: a monotonic `Seq` counter, assigned at `Save`
+  time, breaks a `SavedAt` tie deterministically.
 - **Reference checking before delete** (`flowstore.
   FindFlowsReferencingCredential`, `flowstore.FindFlowsReferencingPiece`
   — `GET /pieces/{name}/usage`, `GET /credentials/{name}/usage`, and

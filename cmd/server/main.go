@@ -80,6 +80,11 @@ func main() {
 		flowVersionsDir = "./data/flow_versions"
 	}
 
+	pieceVersionsDir := os.Getenv("GOFLOW_PIECE_VERSIONS_DIR")
+	if pieceVersionsDir == "" {
+		pieceVersionsDir = "./data/piece_versions"
+	}
+
 	// GOFLOW_SCHEDULER_TICK is how often pkg/scheduler checks every saved
 	// flow for a due schedule trigger — NOT any individual flow's own
 	// intervalSeconds (that's per-flow, configured on the flow itself). A
@@ -116,7 +121,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("opening catalog store at %q: %v", catalogDir, err)
 	}
-	gated := &catalog.GatedStore{Underlying: fileStore}
+	pieceVersionStore, err := catalog.NewFileVersionStore(pieceVersionsDir)
+	if err != nil {
+		log.Fatalf("opening piece version store at %q: %v", pieceVersionsDir, err)
+	}
+	gated := &catalog.GatedStore{Underlying: fileStore, Versions: pieceVersionStore}
 
 	credStore, err := credentials.NewFileStore(credentialsDir, credKey)
 	if err != nil {
@@ -142,7 +151,7 @@ func main() {
 		log.Fatalf("opening flow version store at %q: %v", flowVersionsDir, err)
 	}
 
-	srv := httpapi.NewServer(gated, credStore, flowStore, runStore, versionStore, token, issuer)
+	srv := httpapi.NewServer(gated, credStore, flowStore, runStore, versionStore, pieceVersionStore, token, issuer)
 
 	// The scheduler needs its own *flowstore.GatedStore over the same
 	// flowsDir httpapi.NewServer just wrapped internally — a second Go
@@ -162,6 +171,6 @@ func main() {
 	// it matches the HTTP server's own existing behavior.
 	go sched.Run(context.Background())
 
-	log.Printf("goflow-server listening on %s (catalog: %s, credentials: %s, flows: %s, runs: %s, flow versions: %s, oauth issuer: %s, scheduler tick: %s)", addr, catalogDir, credentialsDir, flowsDir, runsDir, flowVersionsDir, issuer, tick)
+	log.Printf("goflow-server listening on %s (catalog: %s, credentials: %s, flows: %s, runs: %s, flow versions: %s, piece versions: %s, oauth issuer: %s, scheduler tick: %s)", addr, catalogDir, credentialsDir, flowsDir, runsDir, flowVersionsDir, pieceVersionsDir, issuer, tick)
 	log.Fatal(http.ListenAndServe(addr, srv.Handler()))
 }

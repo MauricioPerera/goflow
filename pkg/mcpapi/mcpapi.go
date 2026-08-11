@@ -22,19 +22,21 @@
 // goflow_export_catalog, goflow_list_flows, goflow_get_flow,
 // goflow_list_runs, goflow_get_run, goflow_export_flow_js,
 // goflow_list_flow_versions, goflow_get_flow_version, goflow_piece_usage,
-// and goflow_credential_usage are read-only (export runs no code and
+// goflow_credential_usage, goflow_list_piece_versions, and
+// goflow_get_piece_version are read-only (export runs no code and
 // persists nothing, whether given a saved flow's name or an ad-hoc one —
 // see toolExportFlowJS's own description; goflow_export_catalog is the
 // same idea for a JS-authored piece's full Definition, since
 // goflow_describe_catalog's own text is lossy on purpose — see
-// toolExportCatalog's own description; the two flow-version tools only
-// ever READ what GatedStore.Save already recorded, see VersionRecord's
-// own doc comment; the two usage tools only ever READ which flows
-// reference a piece/credential — they never block goflow_delete_piece/
-// goflow_delete_credential, which stay exactly as gate-free as those
-// always were, see FindFlowsReferencingCredential's own doc comment);
-// goflow_save_flow, goflow_delete_flow,
-// goflow_rollback_flow_version, goflow_save_piece, goflow_delete_piece,
+// toolExportCatalog's own description; the flow- and piece-version list/
+// get tools only ever READ what GatedStore.Save already recorded, see
+// VersionRecord's own doc comment (flowstore's and catalog's); the two
+// usage tools only ever READ which flows reference a piece/credential —
+// they never block goflow_delete_piece/goflow_delete_credential, which
+// stay exactly as gate-free as those always were, see
+// FindFlowsReferencingCredential's own doc comment); goflow_save_flow,
+// goflow_delete_flow, goflow_rollback_flow_version, goflow_save_piece,
+// goflow_delete_piece, goflow_rollback_piece_version,
 // goflow_list_credentials, goflow_save_credential, and
 // goflow_delete_credential mutate state — the exact same mutations
 // POST/DELETE /flows, POST/DELETE /pieces, and POST/GET/DELETE
@@ -116,17 +118,27 @@ type Handler struct {
 	// already is. May be nil (version history disabled), matching every
 	// other optional Store in this Handler.
 	VersionStore flowstore.VersionStore
+	// PieceVersionStore backs goflow_list_piece_versions/
+	// goflow_get_piece_version/goflow_rollback_piece_version — the
+	// piece-level analogue of VersionStore above, for the exact same
+	// reason: CatalogStore is typed as the plain catalog.Store interface
+	// (Save/Get/List/Delete only, no Rollback/Versions), so a separate
+	// field is needed rather than a type assertion down to
+	// *catalog.GatedStore. May be nil (piece version history disabled),
+	// matching every other optional Store in this Handler.
+	PieceVersionStore catalog.VersionStore
 }
 
 // NewHandler returns a Handler wired to flowStore, buildRegistry, credStore,
-// historyStore, catalogStore, and versionStore. It is the caller's job to
-// gate it with auth (httpapi.Server mounts it behind its bearer-token
-// middleware, same as every other route); this package does not know about
-// auth on purpose — pkg/httpapi owns that concern.
-func NewHandler(flowStore flowstore.Store, buildRegistry func() (*piece.Registry, error), credStore credentials.Store, historyStore runstore.Store, catalogStore catalog.Store, versionStore flowstore.VersionStore) *Handler {
+// historyStore, catalogStore, versionStore, and pieceVersionStore. It is the
+// caller's job to gate it with auth (httpapi.Server mounts it behind its
+// bearer-token middleware, same as every other route); this package does not
+// know about auth on purpose — pkg/httpapi owns that concern.
+func NewHandler(flowStore flowstore.Store, buildRegistry func() (*piece.Registry, error), credStore credentials.Store, historyStore runstore.Store, catalogStore catalog.Store, versionStore flowstore.VersionStore, pieceVersionStore catalog.VersionStore) *Handler {
 	return &Handler{
 		FlowStore: flowStore, BuildRegistry: buildRegistry, CredStore: credStore,
 		HistoryStore: historyStore, CatalogStore: catalogStore, VersionStore: versionStore,
+		PieceVersionStore: pieceVersionStore,
 	}
 }
 
@@ -140,53 +152,59 @@ func NewHandler(flowStore flowstore.Store, buildRegistry func() (*piece.Registry
 // MCP tool-name slot is shadowed), keeping tools/list and tools/call
 // consistent about what a reserved name resolves to.
 const (
-	toolDescribeCatalog  = "goflow_describe_catalog"
-	toolListFlows        = "goflow_list_flows"
-	toolGetFlow          = "goflow_get_flow"
-	toolListRuns         = "goflow_list_runs"
-	toolGetRun           = "goflow_get_run"
-	toolExportFlowJS     = "goflow_export_flow_js"
-	toolExportCatalog    = "goflow_export_catalog"
-	toolListFlowVersions = "goflow_list_flow_versions"
-	toolGetFlowVersion   = "goflow_get_flow_version"
-	toolPieceUsage       = "goflow_piece_usage"
-	toolCredentialUsage  = "goflow_credential_usage"
+	toolDescribeCatalog   = "goflow_describe_catalog"
+	toolListFlows         = "goflow_list_flows"
+	toolGetFlow           = "goflow_get_flow"
+	toolListRuns          = "goflow_list_runs"
+	toolGetRun            = "goflow_get_run"
+	toolExportFlowJS      = "goflow_export_flow_js"
+	toolExportCatalog     = "goflow_export_catalog"
+	toolListFlowVersions  = "goflow_list_flow_versions"
+	toolGetFlowVersion    = "goflow_get_flow_version"
+	toolPieceUsage        = "goflow_piece_usage"
+	toolCredentialUsage   = "goflow_credential_usage"
+	toolListPieceVersions = "goflow_list_piece_versions"
+	toolGetPieceVersion   = "goflow_get_piece_version"
 
-	toolSaveFlow            = "goflow_save_flow"
-	toolDeleteFlow          = "goflow_delete_flow"
-	toolRunFlow             = "goflow_run_flow"
-	toolReplayRun           = "goflow_replay_run"
-	toolRollbackFlowVersion = "goflow_rollback_flow_version"
-	toolSavePiece           = "goflow_save_piece"
-	toolDeletePiece         = "goflow_delete_piece"
-	toolListCredentials     = "goflow_list_credentials"
-	toolSaveCredential      = "goflow_save_credential"
-	toolDeleteCredential    = "goflow_delete_credential"
+	toolSaveFlow             = "goflow_save_flow"
+	toolDeleteFlow           = "goflow_delete_flow"
+	toolRunFlow              = "goflow_run_flow"
+	toolReplayRun            = "goflow_replay_run"
+	toolRollbackFlowVersion  = "goflow_rollback_flow_version"
+	toolSavePiece            = "goflow_save_piece"
+	toolDeletePiece          = "goflow_delete_piece"
+	toolRollbackPieceVersion = "goflow_rollback_piece_version"
+	toolListCredentials      = "goflow_list_credentials"
+	toolSaveCredential       = "goflow_save_credential"
+	toolDeleteCredential     = "goflow_delete_credential"
 )
 
 var reservedToolNames = map[string]bool{
-	toolDescribeCatalog:  true,
-	toolListFlows:        true,
-	toolGetFlow:          true,
-	toolListRuns:         true,
-	toolGetRun:           true,
-	toolExportFlowJS:     true,
-	toolExportCatalog:    true,
-	toolListFlowVersions: true,
-	toolGetFlowVersion:   true,
-	toolPieceUsage:       true,
-	toolCredentialUsage:  true,
+	toolDescribeCatalog:   true,
+	toolListFlows:         true,
+	toolGetFlow:           true,
+	toolListRuns:          true,
+	toolGetRun:            true,
+	toolExportFlowJS:      true,
+	toolExportCatalog:     true,
+	toolListFlowVersions:  true,
+	toolGetFlowVersion:    true,
+	toolPieceUsage:        true,
+	toolCredentialUsage:   true,
+	toolListPieceVersions: true,
+	toolGetPieceVersion:   true,
 
-	toolSaveFlow:            true,
-	toolDeleteFlow:          true,
-	toolRunFlow:             true,
-	toolReplayRun:           true,
-	toolRollbackFlowVersion: true,
-	toolSavePiece:           true,
-	toolDeletePiece:         true,
-	toolListCredentials:     true,
-	toolSaveCredential:      true,
-	toolDeleteCredential:    true,
+	toolSaveFlow:             true,
+	toolDeleteFlow:           true,
+	toolRunFlow:              true,
+	toolReplayRun:            true,
+	toolRollbackFlowVersion:  true,
+	toolSavePiece:            true,
+	toolDeletePiece:          true,
+	toolRollbackPieceVersion: true,
+	toolListCredentials:      true,
+	toolSaveCredential:       true,
+	toolDeleteCredential:     true,
 }
 
 // metaToolDescriptors is the tools/list entry for each reserved name above.
@@ -280,6 +298,27 @@ func metaToolDescriptors() []map[string]any {
 				"type":       "object",
 				"properties": map[string]any{"name": map[string]any{"type": "string", "description": "the credential's name"}},
 				"required":   []string{"name"},
+			},
+		},
+		{
+			"name":        toolListPieceVersions,
+			"description": "List every past version of a JS-authored catalog piece, metadata only (id, savedAt), newest first — one entry per time it was successfully saved (GatedStore.Save records one automatically). Returns an empty array both when the piece has none yet and when piece version history isn't configured on this server at all.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"name": map[string]any{"type": "string", "description": "the piece's name"}},
+				"required":   []string{"name"},
+			},
+		},
+		{
+			"name":        toolGetPieceVersion,
+			"description": "Get one past version's full Definition by id (from goflow_list_piece_versions) — exactly what that piece looked like when it was saved, so you can inspect it before deciding whether to goflow_rollback_piece_version to it.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name":      map[string]any{"type": "string", "description": "the piece's name"},
+					"versionId": map[string]any{"type": "string", "description": "a version id from goflow_list_piece_versions"},
+				},
+				"required": []string{"name", "versionId"},
 			},
 		},
 		{
@@ -389,6 +428,18 @@ func metaToolDescriptors() []map[string]any {
 				"type":       "object",
 				"properties": map[string]any{"name": map[string]any{"type": "string"}},
 				"required":   []string{"name"},
+			},
+		},
+		{
+			"name":        toolRollbackPieceVersion,
+			"description": "Restore a JS-authored piece to a past version (id from goflow_list_piece_versions) — fetches that version's Definition and saves it again, going through the EXACT SAME validation gate goflow_save_piece already applies (every action/trigger/dropdown's Examples are RUN again; a version that no longer passes fails to roll back). Records its own new version entry too, same as any other save — history only ever grows, a rollback never rewrites it. Fails if versionId belongs to a different piece than name.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name":      map[string]any{"type": "string", "description": "the piece's name"},
+					"versionId": map[string]any{"type": "string", "description": "a version id from goflow_list_piece_versions"},
+				},
+				"required": []string{"name", "versionId"},
 			},
 		},
 		{
@@ -594,6 +645,51 @@ func (h *Handler) callGetFlowVersion(w http.ResponseWriter, req rawRequest, args
 	rec, ok, err := h.VersionStore.Get(versionID)
 	if err != nil || !ok || rec.FlowName != name {
 		writeToolText(w, req.ID, true, fmt.Sprintf("no version %q for flow %q", versionID, name))
+		return
+	}
+	writeToolText(w, req.ID, false, rec)
+}
+
+// callListPieceVersions lists every past version recorded for
+// args["name"], metadata only, newest first. Returns an empty list both
+// when the piece has none yet and when h.PieceVersionStore is nil,
+// mirroring callListFlowVersions' own reasoning.
+func (h *Handler) callListPieceVersions(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	name, _ := args["name"].(string)
+	if name == "" {
+		writeToolText(w, req.ID, true, "missing required argument: name")
+		return
+	}
+	if h.PieceVersionStore == nil {
+		writeToolText(w, req.ID, false, map[string]any{"versions": []catalog.VersionSummary{}})
+		return
+	}
+	versions, err := h.PieceVersionStore.ListForPiece(name)
+	if err != nil {
+		writeError(w, req.ID, -32603, "internal error: "+err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, map[string]any{"versions": versions})
+}
+
+// callGetPieceVersion returns one version's full VersionRecord (including
+// its complete Definition) by id. A missing id, or one belonging to a
+// DIFFERENT piece than args["name"], both come back as the same "no
+// version" tool error — mirroring callGetFlowVersion's own reasoning.
+func (h *Handler) callGetPieceVersion(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	name, _ := args["name"].(string)
+	versionID, _ := args["versionId"].(string)
+	if name == "" || versionID == "" {
+		writeToolText(w, req.ID, true, "missing required argument: name and versionId are both required")
+		return
+	}
+	if h.PieceVersionStore == nil {
+		writeToolText(w, req.ID, true, "piece version history is not configured on this server")
+		return
+	}
+	rec, ok, err := h.PieceVersionStore.Get(versionID)
+	if err != nil || !ok || rec.PieceName != name {
+		writeToolText(w, req.ID, true, fmt.Sprintf("no version %q for piece %q", versionID, name))
 		return
 	}
 	writeToolText(w, req.ID, false, rec)
@@ -824,6 +920,42 @@ func (h *Handler) callDeletePiece(w http.ResponseWriter, req rawRequest, args ma
 		return
 	}
 	writeToolText(w, req.ID, false, map[string]any{"deleted": true, "name": name})
+}
+
+// callRollbackPieceVersion restores args["name"] to the version named by
+// args["versionId"]: fetches it from h.PieceVersionStore and calls
+// h.CatalogStore.Save with its Definition — h.CatalogStore is a
+// *catalog.GatedStore in production, so this goes through the EXACT SAME
+// validation gate goflow_save_piece already applies (every example is RUN
+// again; a version that no longer passes fails to roll back), and that
+// same Save call records its own new version entry too, mirroring
+// callRollbackFlowVersion's own reasoning.
+func (h *Handler) callRollbackPieceVersion(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	name, _ := args["name"].(string)
+	versionID, _ := args["versionId"].(string)
+	if name == "" || versionID == "" {
+		writeToolText(w, req.ID, true, "missing required argument: name and versionId are both required")
+		return
+	}
+	if h.PieceVersionStore == nil {
+		writeToolText(w, req.ID, true, "piece version history is not configured on this server")
+		return
+	}
+	rec, ok, err := h.PieceVersionStore.Get(versionID)
+	if err != nil || !ok || rec.PieceName != name {
+		writeToolText(w, req.ID, true, fmt.Sprintf("no version %q for piece %q", versionID, name))
+		return
+	}
+	if err := h.CatalogStore.Save(rec.Definition); err != nil {
+		writeToolText(w, req.ID, true, err.Error())
+		return
+	}
+	def, ok, err := h.CatalogStore.Get(name)
+	if err != nil || !ok {
+		writeError(w, req.ID, -32603, "internal error: "+err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, def)
 }
 
 func (h *Handler) callListCredentials(w http.ResponseWriter, req rawRequest) {
@@ -1112,6 +1244,12 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 	case toolCredentialUsage:
 		h.callCredentialUsage(w, req, params.Arguments)
 		return
+	case toolListPieceVersions:
+		h.callListPieceVersions(w, req, params.Arguments)
+		return
+	case toolGetPieceVersion:
+		h.callGetPieceVersion(w, req, params.Arguments)
+		return
 	case toolExportFlowJS:
 		h.callExportFlowJS(w, req, params.Arguments)
 		return
@@ -1135,6 +1273,9 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 		return
 	case toolDeletePiece:
 		h.callDeletePiece(w, req, params.Arguments)
+		return
+	case toolRollbackPieceVersion:
+		h.callRollbackPieceVersion(w, req, params.Arguments)
 		return
 	case toolListCredentials:
 		h.callListCredentials(w, req)

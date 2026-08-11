@@ -54,6 +54,17 @@ type Server struct {
 	token          string
 	expectedBearer []byte // "Bearer " + token, precomputed once — see auth
 	oauthSrv       *oauth.Server
+	// pieceVersionStore backs GET /pieces/{name}/versions* — the
+	// piece-catalog analogue of flowStore.Versions above. A SEPARATE
+	// field rather than reached through store (unlike flowStore, store
+	// stays typed as the plain catalog.Store interface here — see
+	// NewServer's own doc comment for why): store is the caller's
+	// ALREADY-gated *catalog.GatedStore in production, so its own
+	// Versions field (set by the caller, not this constructor) is what
+	// actually records a new version on every successful POST /pieces;
+	// this field only needs read access plus the small "fetch old +
+	// re-Save" logic handlePieceVersionRollback does directly.
+	pieceVersionStore catalog.VersionStore
 }
 
 // NewServer returns a Server that authorizes non-public routes with token
@@ -73,13 +84,19 @@ type Server struct {
 // see flowstore.VersionRecord); wired onto the same *flowstore.GatedStore
 // this constructor already builds, so /flows (save) records a version the
 // exact same way it validates — one gate, not two independently-wired
-// concerns. issuer is this server's externally-reachable base URL, passed
-// straight through to oauth.NewServer for its metadata.
-func NewServer(store catalog.Store, credStore credentials.Store, flowStore flowstore.Store, runStore runstore.Store, versionStore flowstore.VersionStore, token, issuer string) *Server {
+// concerns. pieceVersionStore backs GET /pieces/{name}/versions* — unlike
+// versionStore, store here is expected to ALREADY be a *catalog.GatedStore
+// the caller constructed with its own Versions field set to this SAME
+// pieceVersionStore, so a piece save actually records through that gate;
+// this parameter only gives this Server read access (list/get) plus what
+// Rollback needs. issuer is this server's externally-reachable base URL,
+// passed straight through to oauth.NewServer for its metadata.
+func NewServer(store catalog.Store, credStore credentials.Store, flowStore flowstore.Store, runStore runstore.Store, versionStore flowstore.VersionStore, pieceVersionStore catalog.VersionStore, token, issuer string) *Server {
 	s := &Server{
 		store: store, credStore: credStore, runStore: runStore, token: token,
-		expectedBearer: []byte("Bearer " + token),
-		oauthSrv:       oauth.NewServer(token, issuer),
+		expectedBearer:    []byte("Bearer " + token),
+		oauthSrv:          oauth.NewServer(token, issuer),
+		pieceVersionStore: pieceVersionStore,
 	}
 	s.flowStore = &flowstore.GatedStore{Underlying: flowStore, BuildRegistry: s.buildRegistry, Versions: versionStore}
 	return s
@@ -99,6 +116,12 @@ func (s *Server) Handler() http.Handler {
 	// so a caller can check before DELETE, not just after — see
 	// handlePieceUsage. Read-only; DELETE itself is unaffected/unblocked.
 	mux.Handle("GET /pieces/{name}/usage", s.auth(http.HandlerFunc(s.handlePieceUsage)))
+	// /pieces/{name}/versions* — every past version GatedStore.Save
+	// recorded for this piece, and rolling back to one — see
+	// handlePieceVersionsList.
+	mux.Handle("GET /pieces/{name}/versions", s.auth(http.HandlerFunc(s.handlePieceVersionsList)))
+	mux.Handle("GET /pieces/{name}/versions/{id}", s.auth(http.HandlerFunc(s.handlePieceVersionGet)))
+	mux.Handle("POST /pieces/{name}/versions/{id}/rollback", s.auth(http.HandlerFunc(s.handlePieceVersionRollback)))
 	// GET /pieces/export returns every JS-authored piece's FULL Definition
 	// (source, examples — everything Save accepts), unlike GET /catalog's
 	// DescribeCombined text — see handlePiecesExport.
@@ -140,7 +163,7 @@ func (s *Server) Handler() http.Handler {
 	// where to find this resource's OAuth metadata on a 401, so a
 	// spec-compliant client discovers the flow below instead of just
 	// retrying the same bare token forever.
-	mux.Handle("POST /mcp", s.authMCP(mcpapi.NewHandler(s.flowStore, s.buildRegistry, s.credStore, s.runStore, s.store, s.flowStore.Versions)))
+	mux.Handle("POST /mcp", s.authMCP(mcpapi.NewHandler(s.flowStore, s.buildRegistry, s.credStore, s.runStore, s.store, s.flowStore.Versions, s.pieceVersionStore)))
 
 	// OAuth 2.1 endpoints (pkg/oauth) — deliberately NOT behind s.auth: they
 	// ARE the mechanism a client without a token yet uses to get one. See
@@ -221,6 +244,97 @@ func (s *Server) handlePieceDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "name": name})
+}
+
+// handlePieceVersionsList handles GET /pieces/{name}/versions — every past
+// version GatedStore.Save recorded for this piece, metadata only (id,
+// pieceName, savedAt — never the full Definition, same "listing stays
+// cheap" reasoning GET /pieces/export already applies), newest first.
+// Returns an empty array both when the piece has no recorded versions
+// yet and when version history isn't configured on this server at all —
+// mirrors handleFlowVersionsList exactly.
+func (s *Server) handlePieceVersionsList(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if s.pieceVersionStore == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"versions": []catalog.VersionSummary{}})
+		return
+	}
+	versions, err := s.pieceVersionStore.ListForPiece(name)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"versions": versions})
+}
+
+// handlePieceVersionGet handles GET /pieces/{name}/versions/{id} — the
+// full VersionRecord (including its complete Definition — every
+// action/trigger/dropdown's real source), so a caller can inspect exactly
+// what a past version looked like before deciding to roll back to it. A
+// missing id, or one belonging to a DIFFERENT piece than {name}, both
+// come back as 404 — the latter deliberately, so a caller can't probe
+// for another piece's version ids by guessing. Mirrors
+// handleFlowVersionGet exactly.
+func (s *Server) handlePieceVersionGet(w http.ResponseWriter, r *http.Request) {
+	name, id := r.PathValue("name"), r.PathValue("id")
+	if s.pieceVersionStore == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	rec, ok, err := s.pieceVersionStore.Get(id)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if !ok || rec.PieceName != name {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
+}
+
+// handlePieceVersionRollback handles
+// POST /pieces/{name}/versions/{id}/rollback — restores {name} to version
+// {id}: fetches the VersionRecord and calls s.store.Save with its
+// Definition. Unlike handleFlowVersionRollback (which reaches
+// s.flowStore.Rollback directly, since flowStore is the concrete
+// *flowstore.GatedStore), s.store here is the plain catalog.Store
+// interface — Rollback isn't reachable through it — so this does the
+// small "fetch old + re-Save" logic itself. s.store.Save still dispatches
+// to the underlying *catalog.GatedStore in production, so this goes
+// through the EXACT SAME Validate gate (which actually RUNS every
+// action/trigger/dropdown's Examples) a live edit already does, and — since
+// that GatedStore's own Versions field is the same pieceVersionStore —
+// automatically records its own new version entry too.
+func (s *Server) handlePieceVersionRollback(w http.ResponseWriter, r *http.Request) {
+	name, id := r.PathValue("name"), r.PathValue("id")
+	if s.pieceVersionStore == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "catalog: version history is not configured on this store"})
+		return
+	}
+	rec, ok, err := s.pieceVersionStore.Get(id)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("catalog: no version %q", id)})
+		return
+	}
+	if rec.PieceName != name {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("catalog: version %q belongs to piece %q, not %q", id, rec.PieceName, name)})
+		return
+	}
+	if err := s.store.Save(rec.Definition); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	def, ok, err := s.store.Get(name)
+	if err != nil || !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, def)
 }
 
 // handlePieceUsage handles GET /pieces/{name}/usage — the names of every

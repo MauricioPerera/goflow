@@ -55,7 +55,7 @@ func gatedTestFlowStore(t *testing.T) (*flowstore.FileStore, *flowstore.GatedSto
 // the real quality gate (every example actually run) exactly like
 // POST /pieces would be.
 func gatedTestCatalogStore() *catalog.GatedStore {
-	return &catalog.GatedStore{Underlying: catalog.NewMemoryStore()}
+	return &catalog.GatedStore{Underlying: catalog.NewMemoryStore(), Versions: catalog.NewMemoryVersionStore()}
 }
 
 // newHandlerWithFlows builds a Handler backed by a real, GATED
@@ -78,7 +78,8 @@ func newHandlerWithFlows(t *testing.T, defs ...flowstore.FlowDefinition) *Handle
 			t.Fatalf("Save %q: %v", def.Name, err)
 		}
 	}
-	return NewHandler(gated, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), gatedTestCatalogStore(), gated.Versions)
+	catalogStore := gatedTestCatalogStore()
+	return NewHandler(gated, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), catalogStore, gated.Versions, catalogStore.Versions)
 }
 
 // newHandlerWithFlowsAndCreds is newHandlerWithFlows but also returns the
@@ -96,7 +97,8 @@ func newHandlerWithFlowsAndCreds(t *testing.T, defs ...flowstore.FlowDefinition)
 			t.Fatalf("Save %q: %v", def.Name, err)
 		}
 	}
-	return NewHandler(gated, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), gatedTestCatalogStore(), gated.Versions), credStore
+	catalogStore := gatedTestCatalogStore()
+	return NewHandler(gated, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), catalogStore, gated.Versions, catalogStore.Versions), credStore
 }
 
 // newHandlerWithFlowsAndHistory is newHandlerWithFlows but also returns the
@@ -114,7 +116,8 @@ func newHandlerWithFlowsAndHistory(t *testing.T, defs ...flowstore.FlowDefinitio
 		}
 	}
 	historyStore := runstore.NewMemoryStore()
-	return NewHandler(gated, emptyRegistryBuilder, credStore, historyStore, gatedTestCatalogStore(), gated.Versions), historyStore
+	catalogStore := gatedTestCatalogStore()
+	return NewHandler(gated, emptyRegistryBuilder, credStore, historyStore, catalogStore, gated.Versions, catalogStore.Versions), historyStore
 }
 
 // newHandlerWithFlowsAndCatalog is newHandlerWithFlows but also returns the
@@ -134,7 +137,7 @@ func newHandlerWithFlowsAndCatalog(t *testing.T, defs ...flowstore.FlowDefinitio
 		}
 	}
 	catalogStore := gatedTestCatalogStore()
-	return NewHandler(gated, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), catalogStore, gated.Versions), catalogStore
+	return NewHandler(gated, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), catalogStore, gated.Versions, catalogStore.Versions), catalogStore
 }
 
 // doublesArgFlow is a "double it" flow that reads n from the TRIGGER payload
@@ -1266,6 +1269,198 @@ func TestRollbackFlowVersion_UnknownID_IsErrorTrue(t *testing.T) {
 	result := callTool(t, h, toolRollbackFlowVersion, map[string]any{"name": "v", "versionId": "never-saved"})
 	if result["isError"] != true {
 		t.Fatalf("isError = %v, want true", result["isError"])
+	}
+}
+
+// pieceVersionJSON is the toolSavePiece "actions" argument for a minimal
+// valid piece — one action, one passing example, matching
+// TestSavePiece_ValidExample_PersistedAndDescribed's own shape.
+func pieceVersionJSON() []any {
+	return []any{
+		map[string]any{
+			"name": "run", "displayName": "Run", "description": "runs it",
+			"inputSchema": "x (number, required)",
+			"source":      "(ctx) => ({ doubled: Number(ctx.input.x) * 2 })",
+			"examples": []any{
+				map[string]any{"description": "doubles 5", "input": map[string]any{"x": 5}, "checkOutput": true, "wantOutput": map[string]any{"doubled": float64(10)}},
+			},
+		},
+	}
+}
+
+func TestListPieceVersions_ReflectsEachSave(t *testing.T) {
+	h, _ := newHandlerWithFlowsAndCatalog(t)
+	if r := callTool(t, h, toolSavePiece, map[string]any{"name": "p", "displayName": "P", "actions": pieceVersionJSON()}); r["isError"] != false {
+		t.Fatalf("save 1 isError = %v: %v", r["isError"], r)
+	}
+	if r := callTool(t, h, toolSavePiece, map[string]any{"name": "p", "displayName": "p2", "actions": pieceVersionJSON()}); r["isError"] != false {
+		t.Fatalf("save 2 isError = %v: %v", r["isError"], r)
+	}
+
+	result := callTool(t, h, toolListPieceVersions, map[string]any{"name": "p"})
+	if result["isError"] != false {
+		t.Fatalf("isError = %v: %v", result["isError"], result)
+	}
+	var body struct {
+		Versions []map[string]any `json:"versions"`
+	}
+	toolText(t, result, &body)
+	if len(body.Versions) != 2 {
+		t.Fatalf("versions = %+v, want exactly 2", body.Versions)
+	}
+}
+
+func TestListPieceVersions_UnknownPiece_EmptyList(t *testing.T) {
+	h, _ := newHandlerWithFlowsAndCatalog(t)
+	result := callTool(t, h, toolListPieceVersions, map[string]any{"name": "never-saved"})
+	if result["isError"] != false {
+		t.Fatalf("isError = %v: %v", result["isError"], result)
+	}
+	var body struct {
+		Versions []map[string]any `json:"versions"`
+	}
+	toolText(t, result, &body)
+	if len(body.Versions) != 0 {
+		t.Fatalf("versions = %+v, want empty", body.Versions)
+	}
+}
+
+func TestListPieceVersions_MissingName_IsErrorTrue(t *testing.T) {
+	h, _ := newHandlerWithFlowsAndCatalog(t)
+	result := callTool(t, h, toolListPieceVersions, map[string]any{})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true when name is missing", result["isError"])
+	}
+}
+
+func TestGetPieceVersion_ReturnsFullDefinition(t *testing.T) {
+	h, _ := newHandlerWithFlowsAndCatalog(t)
+	if r := callTool(t, h, toolSavePiece, map[string]any{"name": "p", "displayName": "P", "actions": pieceVersionJSON()}); r["isError"] != false {
+		t.Fatalf("save isError = %v: %v", r["isError"], r)
+	}
+	listResult := callTool(t, h, toolListPieceVersions, map[string]any{"name": "p"})
+	var list struct {
+		Versions []struct {
+			ID string `json:"ID"`
+		} `json:"versions"`
+	}
+	toolText(t, listResult, &list)
+	if len(list.Versions) != 1 {
+		t.Fatalf("versions = %+v, want exactly 1", list.Versions)
+	}
+
+	result := callTool(t, h, toolGetPieceVersion, map[string]any{"name": "p", "versionId": list.Versions[0].ID})
+	if result["isError"] != false {
+		t.Fatalf("isError = %v: %v", result["isError"], result)
+	}
+	var rec struct {
+		PieceName  string `json:"PieceName"`
+		Definition struct {
+			Name string `json:"Name"`
+		} `json:"Definition"`
+	}
+	toolText(t, result, &rec)
+	if rec.PieceName != "p" || rec.Definition.Name != "p" {
+		t.Fatalf("version record = %+v, want PieceName/Definition.Name = p", rec)
+	}
+}
+
+func TestGetPieceVersion_WrongPieceName_IsErrorTrue(t *testing.T) {
+	h, _ := newHandlerWithFlowsAndCatalog(t)
+	if r := callTool(t, h, toolSavePiece, map[string]any{"name": "a", "displayName": "A", "actions": pieceVersionJSON()}); r["isError"] != false {
+		t.Fatalf("save a isError = %v: %v", r["isError"], r)
+	}
+	if r := callTool(t, h, toolSavePiece, map[string]any{"name": "b", "displayName": "B", "actions": pieceVersionJSON()}); r["isError"] != false {
+		t.Fatalf("save b isError = %v: %v", r["isError"], r)
+	}
+	listResult := callTool(t, h, toolListPieceVersions, map[string]any{"name": "a"})
+	var list struct {
+		Versions []struct {
+			ID string `json:"ID"`
+		} `json:"versions"`
+	}
+	toolText(t, listResult, &list)
+
+	result := callTool(t, h, toolGetPieceVersion, map[string]any{"name": "b", "versionId": list.Versions[0].ID})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true — a's version id fetched through b must not resolve", result["isError"])
+	}
+}
+
+func TestRollbackPieceVersion_RestoresPastVersion(t *testing.T) {
+	h, _ := newHandlerWithFlowsAndCatalog(t)
+	if r := callTool(t, h, toolSavePiece, map[string]any{"name": "p", "displayName": "original", "actions": pieceVersionJSON()}); r["isError"] != false {
+		t.Fatalf("save original isError = %v: %v", r["isError"], r)
+	}
+	listResult := callTool(t, h, toolListPieceVersions, map[string]any{"name": "p"})
+	var list struct {
+		Versions []struct {
+			ID string `json:"ID"`
+		} `json:"versions"`
+	}
+	toolText(t, listResult, &list)
+	originalVersionID := list.Versions[0].ID
+
+	if r := callTool(t, h, toolSavePiece, map[string]any{"name": "p", "displayName": "edited", "actions": pieceVersionJSON()}); r["isError"] != false {
+		t.Fatalf("save edit isError = %v: %v", r["isError"], r)
+	}
+
+	result := callTool(t, h, toolRollbackPieceVersion, map[string]any{"name": "p", "versionId": originalVersionID})
+	if result["isError"] != false {
+		t.Fatalf("rollback isError = %v: %v", result["isError"], result)
+	}
+	var restored struct {
+		DisplayName string `json:"DisplayName"`
+	}
+	toolText(t, result, &restored)
+	if restored.DisplayName != "original" {
+		t.Fatalf("restored = %+v, want DisplayName=original", restored)
+	}
+
+	// Rollback goes through Save, so it recorded its OWN new version.
+	listResult = callTool(t, h, toolListPieceVersions, map[string]any{"name": "p"})
+	toolText(t, listResult, &list)
+	if len(list.Versions) != 3 {
+		t.Fatalf("versions = %+v, want exactly 3 (original, edit, rollback)", list.Versions)
+	}
+}
+
+func TestRollbackPieceVersion_UnknownID_IsErrorTrue(t *testing.T) {
+	h, _ := newHandlerWithFlowsAndCatalog(t)
+	if r := callTool(t, h, toolSavePiece, map[string]any{"name": "p", "displayName": "P", "actions": pieceVersionJSON()}); r["isError"] != false {
+		t.Fatalf("save isError = %v: %v", r["isError"], r)
+	}
+	result := callTool(t, h, toolRollbackPieceVersion, map[string]any{"name": "p", "versionId": "never-saved"})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true", result["isError"])
+	}
+}
+
+func TestListPieceVersions_NilStore_EmptyListNotPanic(t *testing.T) {
+	// Built directly (not via newHandlerWithFlowsAndCatalog, which always
+	// wires a real MemoryVersionStore) to leave PieceVersionStore nil — the
+	// nil-means-off case callListPieceVersions/callGetPieceVersion/
+	// callRollbackPieceVersion must handle without a panic.
+	fs, err := flowstore.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	h := &Handler{
+		FlowStore:     fs,
+		BuildRegistry: emptyRegistryBuilder,
+		CatalogStore:  catalog.NewMemoryStore(),
+	}
+	result := callTool(t, h, toolListPieceVersions, map[string]any{"name": "p"})
+	if result["isError"] != false {
+		t.Fatalf("isError = %v, want false when PieceVersionStore is nil", result["isError"])
+	}
+	getResult := callTool(t, h, toolGetPieceVersion, map[string]any{"name": "p", "versionId": "x"})
+	if getResult["isError"] != true {
+		t.Fatalf("get isError = %v, want true when PieceVersionStore is nil", getResult["isError"])
+	}
+	rollbackResult := callTool(t, h, toolRollbackPieceVersion, map[string]any{"name": "p", "versionId": "x"})
+	if rollbackResult["isError"] != true {
+		t.Fatalf("rollback isError = %v, want true when PieceVersionStore is nil", rollbackResult["isError"])
 	}
 }
 

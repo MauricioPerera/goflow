@@ -48,7 +48,8 @@ func newTestServer(t *testing.T) *Server {
 		t.Fatalf("runstore.NewFileStore: %v", err)
 	}
 	versionStore := flowstore.NewMemoryVersionStore()
-	return NewServer(&catalog.GatedStore{Underlying: fs}, credStore, flowStore, runStore, versionStore, "secret-token", "http://testserver")
+	pieceVersionStore := catalog.NewMemoryVersionStore()
+	return NewServer(&catalog.GatedStore{Underlying: fs, Versions: pieceVersionStore}, credStore, flowStore, runStore, versionStore, pieceVersionStore, "secret-token", "http://testserver")
 }
 
 // credDir returns the on-disk directory backing the server's credentials
@@ -204,6 +205,172 @@ func TestPostPieces_AcceptsValidDefinition(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "validpiece") {
 		t.Fatalf("saved piece not in catalog: %s", rec.Body.String())
+	}
+}
+
+func TestPieceVersions_ListReflectsEachSave_NewestFirst(t *testing.T) {
+	srv := newTestServer(t)
+	def := validPieceDef("versioned")
+	if rec := do(t, srv, "POST", "/pieces", def, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save 1: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	def.DisplayName = "v2"
+	if rec := do(t, srv, "POST", "/pieces", def, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save 2: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec := do(t, srv, "GET", "/pieces/versioned/versions", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	versions, _ := m["versions"].([]any)
+	if len(versions) != 2 {
+		t.Fatalf("versions = %+v, want exactly 2", versions)
+	}
+}
+
+func TestPieceVersions_UnknownPiece_EmptyListNot404(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/pieces/never-saved/versions", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	versions, ok := m["versions"].([]any)
+	if !ok || len(versions) != 0 {
+		t.Fatalf("versions = %v, want an empty array", m["versions"])
+	}
+}
+
+func TestPieceVersions_NoAuth_401(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/pieces/whatever/versions", nil, false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestPieceVersionGet_ReturnsFullDefinition(t *testing.T) {
+	srv := newTestServer(t)
+	def := validPieceDef("versioned-get")
+	if rec := do(t, srv, "POST", "/pieces", def, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	listRec := do(t, srv, "GET", "/pieces/versioned-get/versions", nil, true)
+	listBody := decode(t, listRec)
+	versions, _ := listBody["versions"].([]any)
+	if len(versions) != 1 {
+		t.Fatalf("versions = %+v, want exactly 1", versions)
+	}
+	first, _ := versions[0].(map[string]any)
+	id, _ := first["ID"].(string)
+	if id == "" {
+		t.Fatalf("version summary missing ID: %v", first)
+	}
+
+	rec := do(t, srv, "GET", "/pieces/versioned-get/versions/"+id, nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	full := decode(t, rec)
+	definition, ok := full["Definition"].(map[string]any)
+	if !ok || definition["Name"] != "versioned-get" {
+		t.Fatalf("body = %v, want Definition.Name=versioned-get", full)
+	}
+}
+
+func TestPieceVersionGet_UnknownID_404(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/pieces", validPieceDef("p"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d", rec.Code)
+	}
+	rec := do(t, srv, "GET", "/pieces/p/versions/never-saved", nil, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPieceVersionGet_WrongPieceName_404(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/pieces", validPieceDef("a"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save a: status = %d", rec.Code)
+	}
+	if rec := do(t, srv, "POST", "/pieces", validPieceDef("b"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save b: status = %d", rec.Code)
+	}
+	listRec := do(t, srv, "GET", "/pieces/a/versions", nil, true)
+	versions, _ := decode(t, listRec)["versions"].([]any)
+	first, _ := versions[0].(map[string]any)
+	id, _ := first["ID"].(string)
+
+	rec := do(t, srv, "GET", "/pieces/b/versions/"+id, nil, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPieceVersionRollback_RestoresPastVersion(t *testing.T) {
+	srv := newTestServer(t)
+	original := validPieceDef("rollback-me")
+	if rec := do(t, srv, "POST", "/pieces", original, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save original: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	listRec := do(t, srv, "GET", "/pieces/rollback-me/versions", nil, true)
+	versions, _ := decode(t, listRec)["versions"].([]any)
+	firstVersion, _ := versions[0].(map[string]any)
+	originalVersionID, _ := firstVersion["ID"].(string)
+
+	broken := original
+	broken.DisplayName = "Broken Edit"
+	if rec := do(t, srv, "POST", "/pieces", broken, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save broken edit: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec := do(t, srv, "POST", "/pieces/rollback-me/versions/"+originalVersionID+"/rollback", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rollback: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	restored := decode(t, rec)
+	if restored["DisplayName"] != "Valid Piece" {
+		t.Fatalf("rollback response = %v, want DisplayName=Valid Piece (the original)", restored)
+	}
+
+	// Confirm the CURRENT catalog state actually reflects the restore too
+	// (rollback response alone isn't proof it was persisted) — GET
+	// /pieces/export is the only bulk read surface pieces have.
+	exportRec := do(t, srv, "GET", "/pieces/export", nil, true)
+	var exported struct {
+		Pieces []catalog.Definition `json:"pieces"`
+	}
+	if err := json.Unmarshal(exportRec.Body.Bytes(), &exported); err != nil {
+		t.Fatalf("decode export: %v; body=%s", err, exportRec.Body.String())
+	}
+	found := false
+	for _, p := range exported.Pieces {
+		if p.Name == "rollback-me" && p.DisplayName == "Valid Piece" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("exported pieces = %+v, want \"rollback-me\" restored to DisplayName=Valid Piece", exported.Pieces)
+	}
+
+	listRec = do(t, srv, "GET", "/pieces/rollback-me/versions", nil, true)
+	versions, _ = decode(t, listRec)["versions"].([]any)
+	if len(versions) != 3 {
+		t.Fatalf("versions = %+v, want exactly 3 (original, broken edit, rollback)", versions)
+	}
+}
+
+func TestPieceVersionRollback_UnknownID_400(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/pieces", validPieceDef("p"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d", rec.Code)
+	}
+	rec := do(t, srv, "POST", "/pieces/p/versions/never-saved/rollback", nil, true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
 	}
 }
 
