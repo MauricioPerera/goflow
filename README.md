@@ -526,7 +526,7 @@ below for what a Go rewrite gets and gives up.
   OAuth access token) already has that exact same access on every httpapi
   route today — there's no scopes/permissions concept anywhere in this
   project to make MCP meaningfully narrower, so none of this is a new
-  privilege, only new reachability. Twenty fixed tools are always present
+  privilege, only new reachability. Twenty-one fixed tools are always present
   in `tools/list` alongside the per-flow ones, each with a real, precise
   `inputSchema` (unlike a per-flow tool's deliberately permissive one,
   since these have well-defined Go types behind them, not an untyped
@@ -588,10 +588,13 @@ below for what a Go rewrite gets and gives up.
     closes the one asymmetry left after the rest of this tier shipped: an
     MCP-only client could save/delete/run a *named* flow but had no way to
     try an inline one first, the way an HTTP caller already could before
-    ever committing to `goflow_save_flow`.
+    ever committing to `goflow_save_flow`. `goflow_replay_run` is the MCP
+    equivalent of `POST /runs/{id}/replay` — same "neither tier" shape
+    (real side effects, persists nothing new of its own beyond the run it
+    records); see the replay entry below.
 
   A saved flow (or, symmetrically, a credential name) that collides with
-  one of the twenty reserved names is excluded from `tools/list` — not
+  one of the twenty-one reserved names is excluded from `tools/list` — not
   deleted, not un-runnable/un-referenceable by name over HTTP — just
   shadowed in this one listing, and `tools/call` resolves that name to the
   fixed tool the same way, so the two methods never disagree about what a
@@ -894,6 +897,31 @@ below for what a Go rewrite gets and gives up.
   is "would removing this affect this flow," independent of whether
   resolution works today. Purely additive and non-blocking — `DELETE`
   itself is completely unchanged.
+- **Replay a past run against the current flow definition**
+  (`flowstore.ReplayRun` — `POST /runs/{id}/replay`, MCP's
+  `goflow_replay_run`): the natural complement to `FlowDefinition.
+  Examples` (hand-written cases) and flow versioning (undo an edit) —
+  this re-runs a past run's `Trigger`/`ExecuteTrigger` against the
+  flow's CURRENT definition, not the one it ran against originally,
+  proving whether an edit changed behavior against REAL historical
+  traffic instead of only cases someone thought to write down. Building
+  this surfaced a real gap: `runstore.Record` never stored
+  `ExecuteTrigger` — the flag controlling whether a `PIECE_TRIGGER`'s
+  `Run` hook was actually invoked — so a faithful replay was impossible
+  without it; now recorded on every run, organic or replayed alike.
+  Three ways `ReplayRun` refuses before ever reaching `Run`: the run id
+  doesn't resolve; the run was ad-hoc (`POST /flows/run`/
+  `goflow_run_flow` — no flow name to look a current definition up by);
+  or the flow was deleted since the original run. Otherwise behaves
+  exactly like any other named run — credentials resolved, `CALL_FLOW`
+  supported, recorded in history — except the new record's
+  `ReplayOfRunID` is set to the original run's id, so it's traceable as
+  a replay rather than looking organic; a `CALL_FLOW` sub-run triggered
+  *from inside* a replay is never itself marked as one — only the
+  top-level record `ReplayRun` directly produces carries it. No
+  automatic diff against the original run — the caller already has both
+  run ids and can compare them directly; a structural diff would be real
+  added scope nothing has asked for yet.
 
 ## Explicitly NOT in v1
 

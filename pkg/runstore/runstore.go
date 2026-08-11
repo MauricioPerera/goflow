@@ -62,6 +62,21 @@ type Record struct {
 	State      *model.ExecutionState
 	StartedAt  time.Time
 	FinishedAt time.Time
+	// ExecuteTrigger is the flag this run actually used — whether a
+	// PIECE_TRIGGER's Run hook was really invoked, or Trigger was passed
+	// straight through as the trigger step's output. Recorded so
+	// flowstore.ReplayRun can faithfully reproduce a past run's mode
+	// instead of guessing false (this run's own trigger step already
+	// tells you WHAT happened; this field is the only record of HOW).
+	ExecuteTrigger bool
+	// ReplayOfRunID, if set, is the id of the past run this one replayed
+	// — flowstore.ReplayRun's own trace of provenance, so a caller
+	// browsing history later can tell a replay apart from an organic
+	// run, rather than the two looking identical. Empty for every
+	// organic run, including a CALL_FLOW's own sub-run (a replay only
+	// ever marks its own top-level record — a sub-flow triggered from
+	// inside one is a normal run, not itself a replay).
+	ReplayOfRunID string
 }
 
 // Summary is the metadata-only projection List returns — mirrors
@@ -74,6 +89,11 @@ type Summary struct {
 	Status     model.FlowRunStatus
 	StartedAt  time.Time
 	FinishedAt time.Time
+	// ReplayOfRunID mirrors Record's own field — included here (unlike
+	// State, the one field List always omits) since it's a single small
+	// string, cheap enough that hiding it would only cost a caller an
+	// extra Get to tell a replay apart from an organic run while browsing.
+	ReplayOfRunID string
 }
 
 // Store is the surface a run-history store exposes. Save assigns rec a
@@ -119,7 +139,7 @@ func summarize(rec Record) Summary {
 	if rec.State != nil {
 		status = rec.State.Verdict.Status
 	}
-	return Summary{ID: rec.ID, FlowName: rec.FlowName, Status: status, StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt}
+	return Summary{ID: rec.ID, FlowName: rec.FlowName, Status: status, StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt, ReplayOfRunID: rec.ReplayOfRunID}
 }
 
 // sortNewestFirst orders by StartedAt descending — most recent run first,

@@ -1597,6 +1597,111 @@ func TestDeletePiece_MissingNameArgument_IsErrorTrue(t *testing.T) {
 
 // --- goflow_run_flow --------------------------------------------------------
 
+func TestReplayRun_RunsAgainstCurrentDefinition_MarkedInHistory(t *testing.T) {
+	h, hist := newHandlerWithFlowsAndHistory(t)
+	saveResult := callTool(t, h, toolSaveFlow, map[string]any{"name": "replay-me", "flow": flowVersionJSON()})
+	if saveResult["isError"] != false {
+		t.Fatalf("save isError = %v: %v", saveResult["isError"], saveResult)
+	}
+
+	runResult := callTool(t, h, "replay-me", map[string]any{"n": 21})
+	if runResult["isError"] != false {
+		t.Fatalf("run isError = %v: %v", runResult["isError"], runResult)
+	}
+
+	summaries, err := hist.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("summaries = %+v, want exactly 1", summaries)
+	}
+	originalRunID := summaries[0].ID
+	if summaries[0].ReplayOfRunID != "" {
+		t.Fatalf("original run's ReplayOfRunID = %q, want empty", summaries[0].ReplayOfRunID)
+	}
+
+	edited := map[string]any{
+		"id": "fv-mcp-saved",
+		"trigger": map[string]any{
+			"name": "trigger_1", "displayName": "Trigger", "type": "EMPTY",
+			"nextAction": map[string]any{
+				"name": "double", "displayName": "Double", "type": "CODE",
+				"code": map[string]any{
+					"input":  map[string]any{"n": "{{ trigger_1.output.n }}"},
+					"source": "(params) => ({ tripled: params.n * 3 })",
+				},
+			},
+		},
+	}
+	saveResult = callTool(t, h, toolSaveFlow, map[string]any{"name": "replay-me", "flow": edited})
+	if saveResult["isError"] != false {
+		t.Fatalf("save edited isError = %v: %v", saveResult["isError"], saveResult)
+	}
+
+	replayResult := callTool(t, h, toolReplayRun, map[string]any{"id": originalRunID})
+	if replayResult["isError"] != false {
+		t.Fatalf("replay isError = %v: %v", replayResult["isError"], replayResult)
+	}
+	var newState struct {
+		Steps map[string]struct {
+			Output map[string]any `json:"Output"`
+		} `json:"Steps"`
+	}
+	toolText(t, replayResult, &newState)
+	if newState.Steps["double"].Output["tripled"] == nil {
+		t.Fatalf("replay Output = %#v, want the EDITED definition's shape (tripled)", newState.Steps["double"].Output)
+	}
+
+	summaries, err = hist.List()
+	if err != nil {
+		t.Fatalf("List after replay: %v", err)
+	}
+	if len(summaries) != 2 {
+		t.Fatalf("summaries = %+v, want exactly 2 (original + replay)", summaries)
+	}
+	foundReplay := false
+	for _, s := range summaries {
+		if s.ID != originalRunID && s.ReplayOfRunID == originalRunID {
+			foundReplay = true
+		}
+	}
+	if !foundReplay {
+		t.Fatalf("summaries = %+v, want one entry with ReplayOfRunID = %q", summaries, originalRunID)
+	}
+}
+
+func TestReplayRun_AdHocRun_IsErrorTrue(t *testing.T) {
+	h, hist := newHandlerWithFlowsAndHistory(t)
+	runResult := callTool(t, h, toolRunFlow, map[string]any{"flow": flowVersionJSON(), "trigger": map[string]any{"n": 21}})
+	if runResult["isError"] != false {
+		t.Fatalf("run isError = %v: %v", runResult["isError"], runResult)
+	}
+	summaries, _ := hist.List()
+	runID := summaries[0].ID
+
+	result := callTool(t, h, toolReplayRun, map[string]any{"id": runID})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true — an ad-hoc run has no flow name to replay against", result["isError"])
+	}
+}
+
+func TestReplayRun_UnknownID_IsErrorTrue(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolReplayRun, map[string]any{"id": "never-existed"})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true", result["isError"])
+	}
+}
+
+func TestReplayRun_MissingID_IsErrorTrue(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolReplayRun, map[string]any{})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true when id is missing", result["isError"])
+	}
+}
+
 func TestRunFlow_SucceedsWithoutPersisting(t *testing.T) {
 	h := newHandlerWithFlows(t)
 	result := callTool(t, h, toolRunFlow, map[string]any{

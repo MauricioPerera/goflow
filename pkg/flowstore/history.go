@@ -55,7 +55,7 @@ func RunWithHistory(fv *model.FlowVersion, buildRegistry func() (*piece.Registry
 	if flowName != "" {
 		callPath = []string{flowName}
 	}
-	return runWithHistoryAndCallPath(fv, buildRegistry, credStore, historyStore, flowStore, flowName, trigger, executeTrigger, callPath)
+	return runWithHistoryAndCallPath(fv, buildRegistry, credStore, historyStore, flowStore, flowName, trigger, executeTrigger, callPath, "")
 }
 
 // runWithHistoryAndCallPath is RunWithHistory's actual implementation,
@@ -75,7 +75,12 @@ func RunWithHistory(fv *model.FlowVersion, buildRegistry func() (*piece.Registry
 // records, not one, so every level of the chain is independently
 // inspectable via GET /runs/{id}, the same as if each had been triggered
 // directly.
-func runWithHistoryAndCallPath(fv *model.FlowVersion, buildRegistry func() (*piece.Registry, error), credStore credentials.Store, historyStore runstore.Store, flowStore Store, flowName string, trigger any, executeTrigger bool, callPath []string) (*model.ExecutionState, []flowvalidate.ValidationError, error) {
+//
+// replayOfRunID is threaded through only by ReplayRun's own top-level
+// call — every recursive CALL_FLOW sub-call always passes "" (a sub-flow
+// triggered from inside a replay is a normal run, not itself a replay;
+// only the record ReplayRun directly produces carries this).
+func runWithHistoryAndCallPath(fv *model.FlowVersion, buildRegistry func() (*piece.Registry, error), credStore credentials.Store, historyStore runstore.Store, flowStore Store, flowName string, trigger any, executeTrigger bool, callPath []string, replayOfRunID string) (*model.ExecutionState, []flowvalidate.ValidationError, error) {
 	var callFlow engine.CallFlowFunc
 	if flowStore != nil {
 		callFlow = func(subFlowName string, subTrigger any) (*model.ExecutionState, error) {
@@ -98,7 +103,7 @@ func runWithHistoryAndCallPath(fv *model.FlowVersion, buildRegistry func() (*pie
 			copy(nextPath, callPath)
 			nextPath = append(nextPath, subFlowName)
 
-			subState, subValidationErrs, err := runWithHistoryAndCallPath(&def.Flow, buildRegistry, credStore, historyStore, flowStore, def.Name, subTrigger, false, nextPath)
+			subState, subValidationErrs, err := runWithHistoryAndCallPath(&def.Flow, buildRegistry, credStore, historyStore, flowStore, def.Name, subTrigger, false, nextPath, "")
 			if err != nil {
 				return nil, err
 			}
@@ -116,14 +121,60 @@ func runWithHistoryAndCallPath(fv *model.FlowVersion, buildRegistry func() (*pie
 	}
 
 	if _, saveErr := historyStore.Save(runstore.Record{
-		FlowName:   flowName,
-		Trigger:    trigger,
-		State:      state,
-		StartedAt:  started,
-		FinishedAt: time.Now(),
+		FlowName:       flowName,
+		Trigger:        trigger,
+		State:          state,
+		StartedAt:      started,
+		FinishedAt:     time.Now(),
+		ExecuteTrigger: executeTrigger,
+		ReplayOfRunID:  replayOfRunID,
 	}); saveErr != nil {
 		log.Printf("flowstore: recording run history: %v", saveErr)
 	}
 
 	return state, validationErrs, nil
+}
+
+// ReplayRun re-runs a past run's Trigger/ExecuteTrigger against
+// runID's flow's CURRENT definition — not the definition it ran against
+// originally, which is the whole point: proving whether an edit changed
+// behavior against real historical traffic, the natural complement to
+// FlowDefinition.Examples (hand-written cases) and flow versioning
+// (undo an edit) already shipped in this package. No automatic diff
+// against the original run — the caller already has both run ids (the
+// one it started with, and the new one this returns inside State) and
+// can compare them directly; building a structural diff here would be
+// real added scope nothing has asked for yet.
+//
+// Three ways this can fail before ever reaching Run:
+//   - runID doesn't resolve (runStore.Get ok=false), or resolving it errors.
+//   - the run has no FlowName (an ad-hoc POST /flows/run or
+//     goflow_run_flow run) — there is no "current definition" to replay
+//     against without a name to look one up by.
+//   - the flow was deleted since the original run — flowStore.Get
+//     ok=false.
+//
+// Otherwise behaves exactly like a normal named run through
+// RunWithHistory (credentials resolved, CALL_FLOW supported, recorded in
+// history), except the saved record's ReplayOfRunID is set to runID, so
+// it's traceable as a replay rather than looking like an organic run.
+func ReplayRun(runStore runstore.Store, flowStore Store, buildRegistry func() (*piece.Registry, error), credStore credentials.Store, historyStore runstore.Store, runID string) (*model.ExecutionState, []flowvalidate.ValidationError, error) {
+	rec, ok, err := runStore.Get(runID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("flowstore: resolving run %q: %w", runID, err)
+	}
+	if !ok {
+		return nil, nil, fmt.Errorf("flowstore: no run %q", runID)
+	}
+	if rec.FlowName == "" {
+		return nil, nil, fmt.Errorf("flowstore: run %q is ad-hoc (no flow name) and can't be replayed", runID)
+	}
+	def, ok, err := flowStore.Get(rec.FlowName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("flowstore: resolving flow %q: %w", rec.FlowName, err)
+	}
+	if !ok {
+		return nil, nil, fmt.Errorf("flowstore: flow %q no longer exists", rec.FlowName)
+	}
+	return runWithHistoryAndCallPath(&def.Flow, buildRegistry, credStore, historyStore, flowStore, rec.FlowName, rec.Trigger, rec.ExecuteTrigger, []string{rec.FlowName}, runID)
 }

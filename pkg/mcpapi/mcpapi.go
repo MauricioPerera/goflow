@@ -41,14 +41,21 @@
 // /credentials already allow over HTTP, through the exact same underlying
 // Store calls (including catalog.GatedStore's and flowstore.GatedStore's
 // validation gates — a tool call can't bypass either), just reachable
-// without HTTP. goflow_run_flow fits neither tier cleanly — it has the
-// same real side effects any flow run can (a PIECE action can call a real
-// API, use a credential, ...) but persists nothing of its own — so it's
-// described on its own terms: the MCP equivalent of POST /flows/run,
-// closing the one asymmetry left after the rest of this tier shipped —
-// an MCP-only client could save/delete/run a NAMED flow but had no way
-// to try an inline one first, the way POST /flows/run already lets an
-// HTTP caller do before ever committing to goflow_save_flow.
+// without HTTP. goflow_run_flow and goflow_replay_run fit neither tier
+// cleanly — both have the same real side effects any flow run can (a
+// PIECE action can call a real API, use a credential, ...) but persist
+// nothing of their own — so they're described on their own terms.
+// goflow_run_flow is the MCP equivalent of POST /flows/run, closing the
+// one asymmetry left after the rest of this tier shipped — an MCP-only
+// client could save/delete/run a NAMED flow but had no way to try an
+// inline one first, the way POST /flows/run already lets an HTTP caller
+// do before ever committing to goflow_save_flow. goflow_replay_run is
+// the MCP equivalent of POST /runs/{id}/replay — re-runs a past run's
+// trigger against its flow's CURRENT definition, the natural complement
+// to goflow_save_flow's "examples" (hand-written cases) and
+// goflow_rollback_flow_version (undo an edit): proving whether an edit
+// changed behavior against real historical traffic instead of only
+// hand-written ones.
 //
 // Everything here is encoding/json + net/http — JSON-RPC 2.0 is simple enough
 // that pulling in a library would add a dependency for nothing, matching the
@@ -148,6 +155,7 @@ const (
 	toolSaveFlow            = "goflow_save_flow"
 	toolDeleteFlow          = "goflow_delete_flow"
 	toolRunFlow             = "goflow_run_flow"
+	toolReplayRun           = "goflow_replay_run"
 	toolRollbackFlowVersion = "goflow_rollback_flow_version"
 	toolSavePiece           = "goflow_save_piece"
 	toolDeletePiece         = "goflow_delete_piece"
@@ -172,6 +180,7 @@ var reservedToolNames = map[string]bool{
 	toolSaveFlow:            true,
 	toolDeleteFlow:          true,
 	toolRunFlow:             true,
+	toolReplayRun:           true,
 	toolRollbackFlowVersion: true,
 	toolSavePiece:           true,
 	toolDeletePiece:         true,
@@ -339,6 +348,15 @@ func metaToolDescriptors() []map[string]any {
 					"executeTrigger": map[string]any{"type": "boolean", "description": "if true and the flow's trigger is a real (non-EMPTY) piece trigger, actually invoke its Run hook instead of passing \"trigger\" straight through as the trigger step's output — same default (false) as POST /flows/run"},
 				},
 				"required": []string{"flow"},
+			},
+		},
+		{
+			"name":        toolReplayRun,
+			"description": "Re-run a past run's trigger payload against its flow's CURRENT definition (not the one it ran against originally) — the MCP equivalent of POST /runs/{id}/replay, and the natural complement to goflow_save_flow's \"examples\" (hand-written cases) and goflow_rollback_flow_version (undo an edit): this proves whether an edit changed behavior against REAL historical traffic. No automatic diff against the original — the result carries its own new run id (visible via goflow_list_runs, with replayOfRunId set to the run you started from), so compare it against the original yourself. Fails if the run id doesn't exist, if it was an ad-hoc run (goflow_run_flow/POST /flows/run — no flow name to look a current definition up by), or if the flow was deleted since.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"id": map[string]any{"type": "string", "description": "the past run's id, e.g. from goflow_list_runs"}},
+				"required":   []string{"id"},
 			},
 		},
 		{
@@ -1106,6 +1124,9 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 	case toolRunFlow:
 		h.callRunFlow(w, req, params.Arguments)
 		return
+	case toolReplayRun:
+		h.callReplayRun(w, req, params.Arguments)
+		return
 	case toolRollbackFlowVersion:
 		h.callRollbackFlowVersion(w, req, params.Arguments)
 		return
@@ -1184,6 +1205,27 @@ func (h *Handler) callRunFlow(w http.ResponseWriter, req rawRequest, args map[st
 	}
 	state, validationErrs, runErr := flowstore.RunWithHistory(&body.Flow, h.BuildRegistry, h.CredStore, h.HistoryStore, h.FlowStore, "", body.Trigger, body.ExecuteTrigger)
 	writeFlowRunResult(w, req.ID, state, validationErrs, runErr)
+}
+
+// callReplayRun re-runs args["id"]'s past Trigger/ExecuteTrigger against
+// its flow's CURRENT definition via flowstore.ReplayRun — every
+// rejection ReplayRun can produce (run id not found, an ad-hoc run with
+// no flow name, or the flow deleted since) comes back as a tool RESULT
+// with isError:true via writeFlowRunResult's own err-handling — a
+// caller-supplied bad id is the same category as a broken flow
+// goflow_run_flow is asked to run, not a JSON-RPC protocol error.
+func (h *Handler) callReplayRun(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	id, _ := args["id"].(string)
+	if id == "" {
+		writeToolText(w, req.ID, true, "missing required argument: id")
+		return
+	}
+	state, validationErrs, err := flowstore.ReplayRun(h.HistoryStore, h.FlowStore, h.BuildRegistry, h.CredStore, h.HistoryStore, id)
+	if err != nil {
+		writeToolText(w, req.ID, true, err.Error())
+		return
+	}
+	writeFlowRunResult(w, req.ID, state, validationErrs, nil)
 }
 
 // writeResult sends a JSON-RPC success response: {"jsonrpc":"2.0","id":<id>,

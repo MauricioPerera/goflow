@@ -1169,6 +1169,106 @@ func TestPostFlowRun_ByName_Succeeds(t *testing.T) {
 	}
 }
 
+func TestRunReplay_RunsAgainstCurrentDefinition_MarkedInHistory(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", flowstore.FlowDefinition{Name: "replay-me", DisplayName: "Replay Me", Flow: doubleFlowVersion()}, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	rec := do(t, srv, "POST", "/flows/replay-me/run", flowRunRequest{Trigger: map[string]any{"n": 21}}, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	runs, _ := decode(t, listRec)["runs"].([]any)
+	if len(runs) != 1 {
+		t.Fatalf("runs = %+v, want exactly 1", runs)
+	}
+	first, _ := runs[0].(map[string]any)
+	originalRunID, _ := first["ID"].(string)
+	if originalRunID == "" {
+		t.Fatalf("run summary missing ID: %v", first)
+	}
+	if first["ReplayOfRunID"] != "" {
+		t.Fatalf("original run's ReplayOfRunID = %v, want empty", first["ReplayOfRunID"])
+	}
+
+	// Edit the flow's CURRENT definition — same trigger-driven shape, but
+	// a different output field name, so replay's result is distinguishable
+	// from what the original run actually produced.
+	edited := doubleFlowVersion()
+	edited.Trigger.NextAction.Code.Source = `(params) => ({ tripled: params.n * 3 })`
+	if rec := do(t, srv, "POST", "/flows", flowstore.FlowDefinition{Name: "replay-me", DisplayName: "Replay Me", Flow: edited}, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save edited: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = do(t, srv, "POST", "/runs/"+originalRunID+"/replay", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("replay: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var newState map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &newState); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, rec.Body.String())
+	}
+	steps, _ := newState["Steps"].(map[string]any)
+	double, _ := steps["double"].(map[string]any)
+	output, _ := double["Output"].(map[string]any)
+	if output["tripled"] == nil {
+		t.Fatalf("replay Output = %#v, want the EDITED definition's shape (tripled)", output)
+	}
+
+	listRec = do(t, srv, "GET", "/runs", nil, true)
+	runs, _ = decode(t, listRec)["runs"].([]any)
+	if len(runs) != 2 {
+		t.Fatalf("runs = %+v, want exactly 2 (original + replay)", runs)
+	}
+	foundReplay := false
+	for _, r := range runs {
+		rm, _ := r.(map[string]any)
+		if rm["ID"] != originalRunID && rm["ReplayOfRunID"] == originalRunID {
+			foundReplay = true
+		}
+	}
+	if !foundReplay {
+		t.Fatalf("runs = %+v, want one entry with ReplayOfRunID = %q", runs, originalRunID)
+	}
+}
+
+func TestRunReplay_AdHocRun_400(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows/run", runRequest{Flow: doubleFlowVersion(), Trigger: map[string]any{"n": 5}}, true); rec.Code != http.StatusOK {
+		t.Fatalf("run: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	runs, _ := decode(t, listRec)["runs"].([]any)
+	first, _ := runs[0].(map[string]any)
+	runID, _ := first["ID"].(string)
+
+	rec := do(t, srv, "POST", "/runs/"+runID+"/replay", nil, true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "ad-hoc") {
+		t.Fatalf("body = %s, want it to mention the run is ad-hoc", rec.Body.String())
+	}
+}
+
+func TestRunReplay_UnknownID_400(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "POST", "/runs/never-existed/replay", nil, true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRunReplay_NoAuth_401(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "POST", "/runs/whatever/replay", nil, false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
 func TestPostFlowRun_UnknownName_404(t *testing.T) {
 	srv := newTestServer(t)
 	rec := do(t, srv, "POST", "/flows/never-saved/run", flowRunRequest{}, true)
