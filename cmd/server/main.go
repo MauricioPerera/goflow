@@ -16,6 +16,7 @@ import (
 	"goflow/pkg/credentials"
 	"goflow/pkg/flowstore"
 	"goflow/pkg/httpapi"
+	"goflow/pkg/license"
 	"goflow/pkg/piece"
 	"goflow/pkg/runstore"
 	"goflow/pkg/scheduler"
@@ -57,6 +58,24 @@ func main() {
 	}
 	if len(credKey) != 32 {
 		log.Printf("GOFLOW_CREDENTIALS_KEY decodes to %d bytes, want 32 — refusing to start", len(credKey))
+		os.Exit(1)
+	}
+
+	// GOFLOW_LICENSE_FILE points at a signed license (pkg/license) — same
+	// hard-fail-at-startup treatment as the token and credentials key
+	// above: missing, unreadable, unsigned-by-us, or expired are all
+	// equally fatal. This gate is a deterrent for a binary run as
+	// distributed, not tamper-proof DRM — anyone with access to this
+	// (private) repo's source can delete it and rebuild; see
+	// pkg/license's own doc comment.
+	licenseFile := os.Getenv("GOFLOW_LICENSE_FILE")
+	if licenseFile == "" {
+		log.Println("GOFLOW_LICENSE_FILE is not set or is empty — refusing to start without a license configured")
+		os.Exit(1)
+	}
+	licenseClaims, err := license.LoadAndVerify(licenseFile, time.Now())
+	if err != nil {
+		log.Printf("license at %q failed verification: %v — refusing to start", licenseFile, err)
 		os.Exit(1)
 	}
 
@@ -171,6 +190,6 @@ func main() {
 	// it matches the HTTP server's own existing behavior.
 	go sched.Run(context.Background())
 
-	log.Printf("goflow-server listening on %s (catalog: %s, credentials: %s, flows: %s, runs: %s, flow versions: %s, piece versions: %s, oauth issuer: %s, scheduler tick: %s)", addr, catalogDir, credentialsDir, flowsDir, runsDir, flowVersionsDir, pieceVersionsDir, issuer, tick)
+	log.Printf("goflow-server listening on %s (catalog: %s, credentials: %s, flows: %s, runs: %s, flow versions: %s, piece versions: %s, oauth issuer: %s, scheduler tick: %s, license: %q expires %s)", addr, catalogDir, credentialsDir, flowsDir, runsDir, flowVersionsDir, pieceVersionsDir, issuer, tick, licenseClaims.Licensee, licenseClaims.ExpiresAt.Format(time.RFC3339))
 	log.Fatal(http.ListenAndServe(addr, srv.Handler()))
 }

@@ -960,6 +960,28 @@ below for what a Go rewrite gets and gives up.
   automatic diff against the original run — the caller already has both
   run ids and can compare them directly; a structural diff would be real
   added scope nothing has asked for yet.
+- **Signed, time-limited licenses for distributed binaries**
+  (`pkg/license`, `cmd/licensegen` — `GOFLOW_LICENSE_FILE`): for a
+  binary handed to someone outside this repo, the same hard-fail-at-
+  startup treatment `GOFLOW_API_TOKEN`/`GOFLOW_CREDENTIALS_KEY` already
+  get — missing, unsigned-by-us, or expired all refuse to start, never a
+  degraded/read-only mode. A license is an Ed25519-signed (stdlib
+  `crypto/ed25519`) `{licensee, issuedAt, expiresAt}`; the public half is
+  embedded in the binary at build time, the private half lives only with
+  whoever issues licenses (`cmd/licensegen`, never linked into
+  `cmd/server`) and must never be committed. **This is explicitly NOT
+  tamper-proof DRM** — anyone with access to this source can delete the
+  three lines that call `license.LoadAndVerify` and rebuild — so the
+  entire mechanism depends on this repository staying private; the
+  moment it's public, it's cosmetic. It exists to raise the bar for
+  someone running a distributed binary as-is past its license's expiry,
+  nothing more. Building this surfaced one real bug worth naming: `Save`
+  originally used `json.MarshalIndent`, which reformats the raw
+  `License.Claims` bytes it's asked to embed — since those exact bytes
+  are what `Sign` computed the signature over, a license written and
+  then immediately re-loaded failed its own `Verify`. Fixed by using
+  plain `json.Marshal` instead, which leaves an already-compact
+  `json.RawMessage` untouched.
 
 ## Explicitly NOT in v1
 
