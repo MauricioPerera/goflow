@@ -630,8 +630,8 @@ below for what a Go rewrite gets and gives up.
   wired in as `POST /flows/export/js`, `POST /flows/{name}/export/js`, and
   MCP's `goflow_export_flow_js` — see the MCP meta tools entry below):
   a flow made of an `EMPTY` trigger plus a linear chain of `CODE`-only
-  actions — no `ROUTER`, `LOOP_ON_ITEMS`, or `PIECE` action, no
-  `PIECE_TRIGGER` — can be exported to a single, self-contained `.js` file
+  actions — no `ROUTER`, `LOOP_ON_ITEMS`, `PIECE`, or `CALL_FLOW` action,
+  no `PIECE_TRIGGER` — can be exported to a single, self-contained `.js` file
   with no goflow/goja/Go dependency at all, runnable directly in Node or a
   browser. `exportjs.Supported` reports every unsupported trigger/action a
   flow has (not just the first), and `exportjs.Export` refuses to produce

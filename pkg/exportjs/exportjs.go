@@ -7,11 +7,13 @@
 //
 // Deliberately narrow, not a general flow-to-JS compiler: only an EMPTY
 // trigger followed by a linear chain of CODE actions is exportable (see
-// Supported). A ROUTER, a LOOP_ON_ITEMS, or a PIECE action all need either
-// engine control-flow this package doesn't reimplement, or a specific
-// piece's own logic (native Go code, or a JS-authored one whose source
-// isn't even passed to Export) re-hosted in the target runtime — real
-// added scope a "lightweight" exporter doesn't take on. Export rejects
+// Supported). A ROUTER, a LOOP_ON_ITEMS, a PIECE, or a CALL_FLOW action
+// all need either engine control-flow this package doesn't reimplement,
+// a specific piece's own logic (native Go code, or a JS-authored one
+// whose source isn't even passed to Export), or a flowstore.Store to
+// look another flow up in (CALL_FLOW) — none of it re-hostable in the
+// target runtime without real added scope a "lightweight" exporter
+// doesn't take on. Export rejects
 // anything outside the supported subset outright, with every violation
 // listed (mirroring flowvalidate.Validate's "report everything, not just
 // the first problem" convention) — never a partial or silently-wrong
