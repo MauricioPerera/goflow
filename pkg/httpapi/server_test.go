@@ -1579,6 +1579,206 @@ func TestRunResume_NoAuth_401(t *testing.T) {
 	}
 }
 
+// postPublicResume calls POST /public/runs/{id}/resume — deliberately NOT
+// via do(), which only ever sets the bearer Authorization header; this
+// route is reached WITHOUT one, presenting secretHeader as X-Resume-Secret
+// instead, mirroring postWebhook's own X-Webhook-Secret pattern.
+func postPublicResume(srv *Server, id string, resumePayload any, secretHeader string) *httptest.ResponseRecorder {
+	var r *http.Request
+	if resumePayload == nil {
+		r = httptest.NewRequest("POST", "/public/runs/"+id+"/resume", nil)
+	} else {
+		raw, _ := json.Marshal(map[string]any{"resumePayload": resumePayload})
+		r = httptest.NewRequest("POST", "/public/runs/"+id+"/resume", bytes.NewReader(raw))
+	}
+	if secretHeader != "" {
+		r.Header.Set("X-Resume-Secret", secretHeader)
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, r)
+	return rec
+}
+
+func TestPublicRunResume_CorrectSecret_ResumesWithoutBearerToken(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", flowstore.FlowDefinition{Name: "resume-me", DisplayName: "Resume Me", Flow: approvalFlowVersion()}, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	rec := do(t, srv, "POST", "/flows/resume-me/run", flowRunRequest{Trigger: map[string]any{}}, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	runs, _ := decode(t, listRec)["runs"].([]any)
+	first, _ := runs[0].(map[string]any)
+	pausedRunID, _ := first["ID"].(string)
+
+	getRec := do(t, srv, "GET", "/runs/"+pausedRunID, nil, true)
+	var fullRec map[string]any
+	if err := json.Unmarshal(getRec.Body.Bytes(), &fullRec); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, getRec.Body.String())
+	}
+	token, _ := fullRec["ResumeToken"].(string)
+	if token == "" {
+		t.Fatal("paused record has no ResumeToken")
+	}
+
+	// The whole point: NO Authorization header at all, only the token.
+	rec2 := postPublicResume(srv, pausedRunID, map[string]any{"approved": true, "comment": "approved via public link"}, token)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("public resume: status = %d, want 200; body=%s", rec2.Code, rec2.Body.String())
+	}
+	var ack map[string]string
+	if err := json.Unmarshal(rec2.Body.Bytes(), &ack); err != nil {
+		t.Fatalf("decode ack: %v; body=%s", err, rec2.Body.String())
+	}
+	if ack["status"] != "resumed" {
+		t.Fatalf("ack = %+v, want {status: resumed}", ack)
+	}
+	// The generic ack must NOT leak the full ExecutionState (Steps,
+	// Verdict, ...) to an unauthenticated caller — see
+	// handlePublicRunResume's own doc comment.
+	if _, hasSteps := ack["Steps"]; hasSteps {
+		t.Fatalf("ack = %+v, must not include Steps", ack)
+	}
+
+	// Confirm it actually resumed — checked via the AUTHENTICATED path,
+	// since the public response deliberately doesn't say.
+	listRec = do(t, srv, "GET", "/runs", nil, true)
+	runs, _ = decode(t, listRec)["runs"].([]any)
+	foundResume := false
+	for _, r := range runs {
+		rm, _ := r.(map[string]any)
+		if rm["ResumeOfRunID"] == pausedRunID {
+			foundResume = true
+		}
+	}
+	if !foundResume {
+		t.Fatalf("runs = %+v, want one entry with ResumeOfRunID = %q", runs, pausedRunID)
+	}
+}
+
+func TestPublicRunResume_WrongSecret_401(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", flowstore.FlowDefinition{Name: "resume-me", DisplayName: "Resume Me", Flow: approvalFlowVersion()}, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, srv, "POST", "/flows/resume-me/run", flowRunRequest{Trigger: map[string]any{}}, true); rec.Code != http.StatusOK {
+		t.Fatalf("run: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	runs, _ := decode(t, listRec)["runs"].([]any)
+	first, _ := runs[0].(map[string]any)
+	pausedRunID, _ := first["ID"].(string)
+
+	rec := postPublicResume(srv, pausedRunID, map[string]any{"approved": true}, "definitely-the-wrong-secret")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPublicRunResume_MissingSecretHeader_401(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", flowstore.FlowDefinition{Name: "resume-me", DisplayName: "Resume Me", Flow: approvalFlowVersion()}, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, srv, "POST", "/flows/resume-me/run", flowRunRequest{Trigger: map[string]any{}}, true); rec.Code != http.StatusOK {
+		t.Fatalf("run: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	runs, _ := decode(t, listRec)["runs"].([]any)
+	first, _ := runs[0].(map[string]any)
+	pausedRunID, _ := first["ID"].(string)
+
+	rec := postPublicResume(srv, pausedRunID, map[string]any{"approved": true}, "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPublicRunResume_UnknownRunID_401(t *testing.T) {
+	srv := newTestServer(t)
+	rec := postPublicResume(srv, "never-existed", map[string]any{"approved": true}, "any-secret-at-all")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (not 404 — must not let a caller distinguish \"wrong secret\" from \"no such run\"); body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPublicRunResume_RunNeverPaused_401EvenWithEmptyHeader(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", flowstore.FlowDefinition{Name: "not-paused", DisplayName: "Not Paused", Flow: doubleFlowVersion()}, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, srv, "POST", "/flows/not-paused/run", flowRunRequest{Trigger: map[string]any{"n": 5}}, true); rec.Code != http.StatusOK {
+		t.Fatalf("run: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	runs, _ := decode(t, listRec)["runs"].([]any)
+	first, _ := runs[0].(map[string]any)
+	runID, _ := first["ID"].(string)
+
+	// The record's own ResumeToken is "" (never paused) — an empty
+	// header must NOT "match" that via a naive comparison.
+	rec := postPublicResume(srv, runID, map[string]any{}, "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFlowRun_OnPause_TriggersNamedFlow_PayloadHasResumeToken(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", notifyFlowDef("notify"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save notify: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	def := flowstore.FlowDefinition{Name: "resume-me", DisplayName: "Resume Me", Flow: approvalFlowVersion(), OnPauseFlow: "notify"}
+	if rec := do(t, srv, "POST", "/flows", def, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save resume-me: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, srv, "POST", "/flows/resume-me/run", flowRunRequest{Trigger: map[string]any{}}, true); rec.Code != http.StatusOK {
+		t.Fatalf("run: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	listRec := do(t, srv, "GET", "/runs", nil, true)
+	runs, _ := decode(t, listRec)["runs"].([]any)
+	if len(runs) != 2 {
+		t.Fatalf("runs = %+v, want exactly 2 (\"resume-me\" paused + \"notify\" triggered on pause)", runs)
+	}
+	var pausedID string
+	var notifyID string
+	for _, r := range runs {
+		rm, _ := r.(map[string]any)
+		switch rm["FlowName"] {
+		case "resume-me":
+			pausedID, _ = rm["ID"].(string)
+		case "notify":
+			notifyID, _ = rm["ID"].(string)
+		}
+	}
+	if pausedID == "" || notifyID == "" {
+		t.Fatalf("runs = %+v, want one \"resume-me\" and one \"notify\"", runs)
+	}
+
+	pausedFull := do(t, srv, "GET", "/runs/"+pausedID, nil, true)
+	pausedBody := decode(t, pausedFull)
+	token, _ := pausedBody["ResumeToken"].(string)
+	if token == "" {
+		t.Fatal("paused record has no ResumeToken")
+	}
+
+	notifyFull := do(t, srv, "GET", "/runs/"+notifyID, nil, true)
+	notifyBody := decode(t, notifyFull)
+	trigger, _ := notifyBody["Trigger"].(map[string]any)
+	if trigger["runId"] != pausedID {
+		t.Fatalf("notify Trigger[runId] = %v, want %q", trigger["runId"], pausedID)
+	}
+	if trigger["resumeToken"] != token {
+		t.Fatalf("notify Trigger[resumeToken] = %v, want %q", trigger["resumeToken"], token)
+	}
+	if trigger["pausedStepName"] != "approve" {
+		t.Fatalf("notify Trigger[pausedStepName] = %v, want \"approve\"", trigger["pausedStepName"])
+	}
+}
+
 func TestPostFlowRun_UnknownName_404(t *testing.T) {
 	srv := newTestServer(t)
 	rec := do(t, srv, "POST", "/flows/never-saved/run", flowRunRequest{}, true)

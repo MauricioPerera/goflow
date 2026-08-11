@@ -29,7 +29,7 @@ func failingCodeFlow() model.FlowVersion {
 
 func TestRunWithHistory_NilHistoryStore_BehavesLikeRunWithCredentials(t *testing.T) {
 	fv := validCodeFlow()
-	state, vErrs, err := RunWithHistory(&fv, emptyRegistry, nil, nil, nil, "some-flow", nil, false)
+	state, vErrs, err := RunWithHistory(&fv, emptyRegistry, nil, nil, nil, "some-flow", nil, false, "")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -46,7 +46,7 @@ func TestRunWithHistory_SuccessfulRun_Recorded(t *testing.T) {
 	hist := runstore.NewMemoryStore()
 	trigger := map[string]any{"seed": "value"}
 
-	state, vErrs, err := RunWithHistory(&fv, emptyRegistry, nil, hist, nil, "double-it", trigger, false)
+	state, vErrs, err := RunWithHistory(&fv, emptyRegistry, nil, hist, nil, "double-it", trigger, false, "")
 	if err != nil || len(vErrs) != 0 {
 		t.Fatalf("err=%v vErrs=%v, want a clean successful run", err, vErrs)
 	}
@@ -88,7 +88,7 @@ func TestRunWithHistory_FailedRun_StillRecorded(t *testing.T) {
 	fv := failingCodeFlow()
 	hist := runstore.NewMemoryStore()
 
-	state, vErrs, err := RunWithHistory(&fv, emptyRegistry, nil, hist, nil, "flaky-flow", nil, false)
+	state, vErrs, err := RunWithHistory(&fv, emptyRegistry, nil, hist, nil, "flaky-flow", nil, false, "")
 	if err != nil || len(vErrs) != 0 {
 		t.Fatalf("err=%v vErrs=%v, want a clean call (the FLOW fails, not the call)", err, vErrs)
 	}
@@ -109,7 +109,7 @@ func TestRunWithHistory_ValidationFailure_NotRecorded(t *testing.T) {
 	fv := pieceReferencingFlow()
 	hist := runstore.NewMemoryStore()
 
-	state, vErrs, err := RunWithHistory(&fv, emptyRegistry, nil, hist, nil, "broken-flow", nil, false)
+	state, vErrs, err := RunWithHistory(&fv, emptyRegistry, nil, hist, nil, "broken-flow", nil, false, "")
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -133,7 +133,7 @@ func TestRunWithHistory_BuildRegistryFails_NotRecorded(t *testing.T) {
 	fv := validCodeFlow()
 	hist := runstore.NewMemoryStore()
 
-	_, _, err := RunWithHistory(&fv, failingRegistry, nil, hist, nil, "some-flow", nil, false)
+	_, _, err := RunWithHistory(&fv, failingRegistry, nil, hist, nil, "some-flow", nil, false, "")
 	if err == nil {
 		t.Fatal("err = nil, want the simulated registry-build failure")
 	}
@@ -151,7 +151,7 @@ func TestRunWithHistory_AdHocRun_RecordedWithEmptyFlowName(t *testing.T) {
 	fv := validCodeFlow()
 	hist := runstore.NewMemoryStore()
 
-	if _, _, err := RunWithHistory(&fv, emptyRegistry, nil, hist, nil, "", nil, false); err != nil {
+	if _, _, err := RunWithHistory(&fv, emptyRegistry, nil, hist, nil, "", nil, false, ""); err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
 
@@ -178,7 +178,7 @@ func TestRunWithHistory_CredentialRedactedInRecordedState(t *testing.T) {
 	fv := credMarkerFlow("use_cred", "api_key")
 	hist := runstore.NewMemoryStore()
 
-	state, vErrs, err := RunWithHistory(&fv, emptyRegistry, credStore, hist, nil, "cred-flow", nil, false)
+	state, vErrs, err := RunWithHistory(&fv, emptyRegistry, credStore, hist, nil, "cred-flow", nil, false, "")
 	if err != nil || len(vErrs) != 0 {
 		t.Fatalf("err=%v vErrs=%v, want a clean successful run", err, vErrs)
 	}

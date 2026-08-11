@@ -39,7 +39,7 @@ func TestCallFlow_ChainOfTwoFlows_Succeeds(t *testing.T) {
 	}
 	hist := runstore.NewMemoryStore()
 
-	state, vErrs, err := RunWithHistory(&root.Flow, emptyRegistry, nil, hist, store, "root", nil, false)
+	state, vErrs, err := RunWithHistory(&root.Flow, emptyRegistry, nil, hist, store, "root", nil, false, "")
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -89,7 +89,7 @@ func TestCallFlow_CycleDetected_FailsCleanlyNotInfinitely(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Get(a): ok=%v err=%v", ok, err)
 	}
-	state, vErrs, err := RunWithHistory(&aDef.Flow, emptyRegistry, nil, hist, store, "a", nil, false)
+	state, vErrs, err := RunWithHistory(&aDef.Flow, emptyRegistry, nil, hist, store, "a", nil, false, "")
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -139,7 +139,7 @@ func TestCallFlow_DepthLimitExceeded_StopsShortOfTheWholeChain(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Get(%q): ok=%v err=%v", names[0], ok, err)
 	}
-	state, vErrs, err := RunWithHistory(&rootDef.Flow, emptyRegistry, nil, hist, store, names[0], nil, false)
+	state, vErrs, err := RunWithHistory(&rootDef.Flow, emptyRegistry, nil, hist, store, names[0], nil, false, "")
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -173,7 +173,7 @@ func TestCallFlow_UnknownTarget_FailsCleanly(t *testing.T) {
 	}
 	hist := runstore.NewMemoryStore()
 
-	state, vErrs, err := RunWithHistory(&root.Flow, emptyRegistry, nil, hist, store, "root", nil, false)
+	state, vErrs, err := RunWithHistory(&root.Flow, emptyRegistry, nil, hist, store, "root", nil, false, "")
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -192,7 +192,7 @@ func TestCallFlow_FlowStoreNil_DisablesCallFlowCleanly(t *testing.T) {
 	root := callFlowFlow("fv-root", "leaf")
 	hist := runstore.NewMemoryStore()
 
-	state, vErrs, err := RunWithHistory(&root, emptyRegistry, nil, hist, nil, "root", nil, false)
+	state, vErrs, err := RunWithHistory(&root, emptyRegistry, nil, hist, nil, "root", nil, false, "")
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -243,7 +243,7 @@ func TestCallFlow_SubFlowCredentialResolved(t *testing.T) {
 	}
 	hist := runstore.NewMemoryStore()
 
-	state, _, err := RunWithHistory(&root.Flow, emptyRegistry, credStore, hist, store, "root", nil, false)
+	state, _, err := RunWithHistory(&root.Flow, emptyRegistry, credStore, hist, store, "root", nil, false, "")
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}

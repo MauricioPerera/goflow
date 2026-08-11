@@ -44,7 +44,7 @@ func TestResumeRun_ContinuesPausedRun_MarksResumeOfRunID(t *testing.T) {
 	if err := fs.Save(FlowDefinition{Name: "flow", Flow: fv}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	state, _, err := RunWithHistory(&fv, approvalRegistry, nil, hist, fs, "flow", map[string]any{}, false)
+	state, _, err := RunWithHistory(&fv, approvalRegistry, nil, hist, fs, "flow", map[string]any{}, false, "")
 	if err != nil {
 		t.Fatalf("RunWithHistory: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestResumeRun_RunsAgainstCurrentDefinition(t *testing.T) {
 	if err := fs.Save(FlowDefinition{Name: "flow", Flow: fv}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	if _, _, err := RunWithHistory(&fv, approvalRegistry, nil, hist, fs, "flow", map[string]any{}, false); err != nil {
+	if _, _, err := RunWithHistory(&fv, approvalRegistry, nil, hist, fs, "flow", map[string]any{}, false, ""); err != nil {
 		t.Fatalf("RunWithHistory: %v", err)
 	}
 	summaries, _ := hist.List()
@@ -139,7 +139,7 @@ func TestResumeRun_AdHocRun_Rejected(t *testing.T) {
 	}
 	hist := runstore.NewMemoryStore()
 	fv := approvalFlow()
-	if _, _, err := RunWithHistory(&fv, approvalRegistry, nil, hist, fs, "", map[string]any{}, false); err != nil {
+	if _, _, err := RunWithHistory(&fv, approvalRegistry, nil, hist, fs, "", map[string]any{}, false, ""); err != nil {
 		t.Fatalf("RunWithHistory: %v", err)
 	}
 	summaries, _ := hist.List()
@@ -173,7 +173,7 @@ func TestResumeRun_NotPaused_Rejected(t *testing.T) {
 	if err := fs.Save(FlowDefinition{Name: "flow", Flow: fv}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	if _, _, err := RunWithHistory(&fv, emptyRegistry, nil, hist, fs, "flow", map[string]any{"x": 1}, false); err != nil {
+	if _, _, err := RunWithHistory(&fv, emptyRegistry, nil, hist, fs, "flow", map[string]any{"x": 1}, false, ""); err != nil {
 		t.Fatalf("RunWithHistory: %v", err)
 	}
 	summaries, _ := hist.List()
@@ -205,7 +205,7 @@ func TestResumeRun_SameRunIDTwice_BothSucceed_NoIdempotencyGuard(t *testing.T) {
 	if err := fs.Save(FlowDefinition{Name: "flow", Flow: fv}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	if _, _, err := RunWithHistory(&fv, approvalRegistry, nil, hist, fs, "flow", map[string]any{}, false); err != nil {
+	if _, _, err := RunWithHistory(&fv, approvalRegistry, nil, hist, fs, "flow", map[string]any{}, false, ""); err != nil {
 		t.Fatalf("RunWithHistory: %v", err)
 	}
 	summaries, _ := hist.List()
@@ -234,7 +234,7 @@ func TestResumeRun_FlowDeletedSince_Rejected(t *testing.T) {
 	if err := fs.Save(FlowDefinition{Name: "gone", Flow: fv}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	if _, _, err := RunWithHistory(&fv, approvalRegistry, nil, hist, fs, "gone", map[string]any{}, false); err != nil {
+	if _, _, err := RunWithHistory(&fv, approvalRegistry, nil, hist, fs, "gone", map[string]any{}, false, ""); err != nil {
 		t.Fatalf("RunWithHistory: %v", err)
 	}
 	summaries, _ := hist.List()

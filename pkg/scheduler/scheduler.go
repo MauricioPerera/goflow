@@ -149,7 +149,7 @@ func (s *Scheduler) maybeRun(def flowstore.FlowDefinition) {
 			s.mu.Unlock()
 		}()
 		for _, item := range items {
-			state, _, err := flowstore.RunWithHistory(&flow, s.BuildRegistry, s.CredStore, s.HistoryStore, s.FlowStore, def.Name, item, false)
+			state, _, err := flowstore.RunWithHistory(&flow, s.BuildRegistry, s.CredStore, s.HistoryStore, s.FlowStore, def.Name, item, false, def.OnPauseFlow)
 			if err != nil {
 				log.Printf("scheduler: flow %q: run failed: %v", def.Name, err)
 				continue

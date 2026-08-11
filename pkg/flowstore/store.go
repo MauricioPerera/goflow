@@ -90,6 +90,22 @@ type FlowDefinition struct {
 	// never chain more than one hop deep).
 	OnFailureFlow string
 
+	// OnPauseFlow, if set, names ANOTHER saved flow to run whenever this
+	// one pauses (Verdict.Status PAUSED — e.g. the "approval" piece
+	// calling ctx.Run.WaitForWaitpoint). Mirrors OnFailureFlow's own
+	// reasoning: a webhook- or scheduler-fired run that pauses has no
+	// human watching it, so without this the only way to learn it's
+	// waiting is polling GET /runs. Empty (the default) disables it
+	// entirely. Unlike OnFailureFlow, the on-pause flow's trigger payload
+	// carries what's needed to actually ACT on the pause — the paused
+	// run's own id and its runstore.Record.ResumeToken — so a flow using
+	// this can build a one-click approval link (POST
+	// /public/runs/{runId}/resume with X-Resume-Secret: {resumeToken},
+	// no GOFLOW_API_TOKEN required) and email/notify it. See the
+	// unexported triggerOnPause for the exact contract and why it can
+	// never chain more than one hop deep, same as OnFailureFlow.
+	OnPauseFlow string
+
 	// Examples are worked trigger/expected-result cases GatedStore.Save
 	// actually RUNS against def.Flow before persisting — the flow-level
 	// analogue of catalog.ActionDefinition.Examples. Unlike a piece

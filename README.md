@@ -991,6 +991,60 @@ below for what a Go rewrite gets and gives up.
   has to enforce that itself today. `runstore.Record` gains a
   `ResumeOfRunID` field, mirroring `ReplayOfRunID`'s own provenance
   tracking.
+- **Resume a PAUSED run via a public link — no bearer token required**
+  (`FlowDefinition.OnPauseFlow`, `runstore.Record.ResumeToken` —
+  `POST /public/runs/{id}/resume`): resume shipping authenticated-only
+  turned out to be half a feature — a flow paused on an approval has no
+  human watching `GET /runs`, so something needs to actively NOTIFY
+  someone, and whoever gets that notification (an email, a Slack
+  message) can't attach `GOFLOW_API_TOKEN` to a link they click. Three
+  pieces close the loop, mirroring precedent already in this file
+  wherever one existed:
+  - `runstore.Record.ResumeToken`: `Save` now generates a fresh 128-bit
+    random secret whenever (and only whenever) the record it's given is
+    `PAUSED` — same generation code every other opaque id in this
+    project already uses, ignoring any value the caller supplied, the
+    same untrusted treatment `ID` itself gets. Deliberately excluded
+    from `Summary` (`GET /runs`'s list projection) so a caller with only
+    enough access to LIST runs can't bulk-harvest every paused run's
+    token in one call — reading it back requires a full `Get`, which
+    already needs the same `GOFLOW_API_TOKEN` this token exists to let
+    someone bypass.
+  - `FlowDefinition.OnPauseFlow` (+ MCP's `goflow_save_flow` schema):
+    mirrors `OnFailureFlow` almost exactly — names another saved flow to
+    run whenever this one pauses, trigger payload
+    `{flowName, runId, resumeToken, pausedStepName}`, capped at one hop.
+    One real difference from `OnFailureFlow`'s own wiring: triggering it
+    needs the record's own id, which only exists the instant
+    `historyStore.Save` returns inside `runWithHistoryAndCallPath` — so
+    it's threaded through as a parameter to `RunWithHistory` itself
+    (every call site now passes its `FlowDefinition.OnPauseFlow`, or
+    `""` for an ad-hoc run with no definition to read one from) rather
+    than left for each of the four call sites to invoke separately the
+    way `TriggerOnFailure` still is; a CALL_FLOW sub-flow gets its OWN
+    `OnPauseFlow` triggered on its own pause, for free, since each
+    recursion level already fetches its own `FlowDefinition`.
+  - `POST /public/runs/{id}/resume`: registered outside `s.auth`, same
+    as `POST /webhooks/{name}` — the caller presents `{id}`'s own
+    `ResumeToken` via `X-Resume-Secret`, constant-time compared exactly
+    like the webhook secret. Fails closed on every edge: an unknown id
+    is 401 (not 404 — a 404 would let a caller distinguish "wrong
+    secret" from "no such run" by probing ids), and a record with no
+    `ResumeToken` (never paused) is rejected even against an EMPTY
+    header — without that explicit check, comparing two empty strings
+    would report a false "match." On success, returns only a generic
+    `{"status":"resumed"}` ack, never the full `*model.ExecutionState`
+    the authenticated `POST /runs/{id}/resume` returns — leaking real
+    step Input/Output to a caller who only proved they hold one run's
+    token, not the master bearer token, would defeat the point.
+
+  Same disclosed limitation `ResumeRun` already has, now doubled: no
+  revocation once a token is issued (`runstore.Record` is append-only,
+  same as every other Record here — there's no "mark it consumed"
+  operation) and no idempotency guard, so a leaked or forwarded
+  approval link can resume the same run more than once, by more than
+  one person. Mitigated only by choosing POST (most email-prefetch bots
+  only ever issue GET), not solved.
 - **Signed, time-limited licenses for distributed binaries**
   (`pkg/license`, `cmd/licensegen` — `GOFLOW_LICENSE_FILE`): for a
   binary handed to someone outside this repo, the same hard-fail-at-
@@ -1026,7 +1080,8 @@ longer are, and should be stated plainly rather than left stale:
   real HTTP server (`/health`, `/catalog`, `/pieces*`, `/flows*`
   (including `/flows/export/js` and `/flows/{name}/export/js`),
   `/credentials*`, `/runs*`, `/mcp`, `/oauth/*`, `/.well-known/oauth-*`,
-  `/webhooks/{name}` (deliberately public — see "What's here" above),
+  `/webhooks/{name}` and `/public/runs/{id}/resume` (both deliberately
+  public — see "What's here" above),
   deployed and
   running on a real VPS as a systemd service. "No auth" is also no longer true, but
   stays narrow: every non-public route requires either the single shared

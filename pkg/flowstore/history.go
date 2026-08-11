@@ -50,12 +50,22 @@ const maxCallFlowDepth = 10
 // A CALL_FLOW action inside fv is what actually makes this function
 // recursive — see runWithHistoryAndCallPath below for the sub-flow lookup,
 // cycle detection, and per-sub-flow history recording that backs it.
-func RunWithHistory(fv *model.FlowVersion, buildRegistry func() (*piece.Registry, error), credStore credentials.Store, historyStore runstore.Store, flowStore Store, flowName string, trigger any, executeTrigger bool) (*model.ExecutionState, []flowvalidate.ValidationError, error) {
+//
+// onPauseFlow is flowName's own FlowDefinition.OnPauseFlow, if the
+// caller has one to pass (a named run does; an ad-hoc POST /flows/run
+// body has no FlowDefinition, so passes "") — see triggerOnPause for
+// what it does when the run pauses. Threaded as a parameter here
+// (unlike TriggerOnFailure, which callers invoke separately after the
+// fact) because triggering it needs the record's own id, which only
+// exists inside runWithHistoryAndCallPath at the moment historyStore.Save
+// returns — passing it in is simpler than threading that id back out
+// through every caller and CALL_FLOW recursion level.
+func RunWithHistory(fv *model.FlowVersion, buildRegistry func() (*piece.Registry, error), credStore credentials.Store, historyStore runstore.Store, flowStore Store, flowName string, trigger any, executeTrigger bool, onPauseFlow string) (*model.ExecutionState, []flowvalidate.ValidationError, error) {
 	var callPath []string
 	if flowName != "" {
 		callPath = []string{flowName}
 	}
-	return runWithHistoryAndCallPath(fv, buildRegistry, credStore, historyStore, flowStore, flowName, trigger, executeTrigger, callPath, "")
+	return runWithHistoryAndCallPath(fv, buildRegistry, credStore, historyStore, flowStore, flowName, trigger, executeTrigger, callPath, "", onPauseFlow)
 }
 
 // runWithHistoryAndCallPath is RunWithHistory's actual implementation,
@@ -80,7 +90,13 @@ func RunWithHistory(fv *model.FlowVersion, buildRegistry func() (*piece.Registry
 // call — every recursive CALL_FLOW sub-call always passes "" (a sub-flow
 // triggered from inside a replay is a normal run, not itself a replay;
 // only the record ReplayRun directly produces carries this).
-func runWithHistoryAndCallPath(fv *model.FlowVersion, buildRegistry func() (*piece.Registry, error), credStore credentials.Store, historyStore runstore.Store, flowStore Store, flowName string, trigger any, executeTrigger bool, callPath []string, replayOfRunID string) (*model.ExecutionState, []flowvalidate.ValidationError, error) {
+//
+// onPauseFlow is THIS call's own flowName's OnPauseFlow — a CALL_FLOW
+// sub-call passes the SUB-flow's own OnPauseFlow (subDef.OnPauseFlow,
+// fetched right there), not the caller's, so each level of a CALL_FLOW
+// chain notifies on its own terms if it pauses, same as each level
+// already gets recorded in history under its own name.
+func runWithHistoryAndCallPath(fv *model.FlowVersion, buildRegistry func() (*piece.Registry, error), credStore credentials.Store, historyStore runstore.Store, flowStore Store, flowName string, trigger any, executeTrigger bool, callPath []string, replayOfRunID string, onPauseFlow string) (*model.ExecutionState, []flowvalidate.ValidationError, error) {
 	var callFlow engine.CallFlowFunc
 	if flowStore != nil {
 		callFlow = func(subFlowName string, subTrigger any) (*model.ExecutionState, error) {
@@ -103,7 +119,7 @@ func runWithHistoryAndCallPath(fv *model.FlowVersion, buildRegistry func() (*pie
 			copy(nextPath, callPath)
 			nextPath = append(nextPath, subFlowName)
 
-			subState, subValidationErrs, err := runWithHistoryAndCallPath(&def.Flow, buildRegistry, credStore, historyStore, flowStore, def.Name, subTrigger, false, nextPath, "")
+			subState, subValidationErrs, err := runWithHistoryAndCallPath(&def.Flow, buildRegistry, credStore, historyStore, flowStore, def.Name, subTrigger, false, nextPath, "", def.OnPauseFlow)
 			if err != nil {
 				return nil, err
 			}
@@ -120,7 +136,7 @@ func runWithHistoryAndCallPath(fv *model.FlowVersion, buildRegistry func() (*pie
 		return state, validationErrs, err
 	}
 
-	if _, saveErr := historyStore.Save(runstore.Record{
+	id, saveErr := historyStore.Save(runstore.Record{
 		FlowName:       flowName,
 		Trigger:        trigger,
 		State:          state,
@@ -128,9 +144,13 @@ func runWithHistoryAndCallPath(fv *model.FlowVersion, buildRegistry func() (*pie
 		FinishedAt:     time.Now(),
 		ExecuteTrigger: executeTrigger,
 		ReplayOfRunID:  replayOfRunID,
-	}); saveErr != nil {
+	})
+	if saveErr != nil {
 		log.Printf("flowstore: recording run history: %v", saveErr)
+		return state, validationErrs, nil
 	}
+
+	triggerOnPause(flowStore, flowName, onPauseFlow, state, id, historyStore, buildRegistry, credStore)
 
 	return state, validationErrs, nil
 }
@@ -176,7 +196,7 @@ func ReplayRun(runStore runstore.Store, flowStore Store, buildRegistry func() (*
 	if !ok {
 		return nil, nil, fmt.Errorf("flowstore: flow %q no longer exists", rec.FlowName)
 	}
-	return runWithHistoryAndCallPath(&def.Flow, buildRegistry, credStore, historyStore, flowStore, rec.FlowName, rec.Trigger, rec.ExecuteTrigger, []string{rec.FlowName}, runID)
+	return runWithHistoryAndCallPath(&def.Flow, buildRegistry, credStore, historyStore, flowStore, rec.FlowName, rec.Trigger, rec.ExecuteTrigger, []string{rec.FlowName}, runID, def.OnPauseFlow)
 }
 
 // ResumeRun continues runID's PAUSED run — restoring its
@@ -267,7 +287,7 @@ func ResumeRun(runStore runstore.Store, flowStore Store, buildRegistry func() (*
 			if !ok {
 				return nil, fmt.Errorf("no flow named %q", subFlowName)
 			}
-			subState, subValidationErrs, err := runWithHistoryAndCallPath(&subDef.Flow, buildRegistry, credStore, historyStore, flowStore, subDef.Name, subTrigger, false, nextPath, "")
+			subState, subValidationErrs, err := runWithHistoryAndCallPath(&subDef.Flow, buildRegistry, credStore, historyStore, flowStore, subDef.Name, subTrigger, false, nextPath, "", subDef.OnPauseFlow)
 			if err != nil {
 				return nil, err
 			}
@@ -284,7 +304,7 @@ func ResumeRun(runStore runstore.Store, flowStore Store, buildRegistry func() (*
 		return state, validationErrs, err
 	}
 
-	if _, saveErr := historyStore.Save(runstore.Record{
+	newID, saveErr := historyStore.Save(runstore.Record{
 		FlowName:       rec.FlowName,
 		Trigger:        rec.Trigger,
 		State:          state,
@@ -292,9 +312,18 @@ func ResumeRun(runStore runstore.Store, flowStore Store, buildRegistry func() (*
 		FinishedAt:     time.Now(),
 		ExecuteTrigger: rec.ExecuteTrigger,
 		ResumeOfRunID:  runID,
-	}); saveErr != nil {
+	})
+	if saveErr != nil {
 		log.Printf("flowstore: recording resumed run history: %v", saveErr)
+		return state, validationErrs, nil
 	}
+
+	// A resumed run can itself pause again (e.g. two sequential approval
+	// steps) — same triggerOnPause call runWithHistoryAndCallPath makes,
+	// done here directly since ResumeRun doesn't go through that
+	// function for its OWN top-level save (only for CALL_FLOW sub-calls
+	// above).
+	triggerOnPause(flowStore, rec.FlowName, def.OnPauseFlow, state, newID, historyStore, buildRegistry, credStore)
 
 	return state, validationErrs, nil
 }

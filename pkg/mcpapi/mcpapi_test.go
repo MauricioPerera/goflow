@@ -2071,6 +2071,72 @@ func TestResumeRun_MissingID_IsErrorTrue(t *testing.T) {
 	}
 }
 
+func TestSaveFlow_OnPauseFlow_TriggersNamedFlow_PayloadHasResumeToken(t *testing.T) {
+	h, hist := newHandlerWithApprovalFlows(t)
+
+	saveNotify := callTool(t, h, toolSaveFlow, map[string]any{"name": "notify", "flow": flowVersionJSON()})
+	if saveNotify["isError"] != false {
+		t.Fatalf("save notify isError = %v: %v", saveNotify["isError"], saveNotify)
+	}
+	saveMain := callTool(t, h, toolSaveFlow, map[string]any{"name": "resume-me", "onPauseFlow": "notify", "flow": approvalFlowJSON()})
+	if saveMain["isError"] != false {
+		t.Fatalf("save resume-me isError = %v: %v", saveMain["isError"], saveMain)
+	}
+
+	// isError:true here reflects the PAUSED verdict, not a call failure —
+	// see TestResumeRun_ContinuesPausedRun_MarkedInHistory's own comment.
+	runResult := callTool(t, h, "resume-me", map[string]any{})
+	if runResult["isError"] != true {
+		t.Fatalf("run isError = %v, want true for a PAUSED verdict: %v", runResult["isError"], runResult)
+	}
+
+	summaries, err := hist.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(summaries) != 2 {
+		t.Fatalf("summaries = %+v, want exactly 2 (\"resume-me\" paused + \"notify\" triggered on pause)", summaries)
+	}
+	var pausedID, notifyID string
+	for _, s := range summaries {
+		switch s.FlowName {
+		case "resume-me":
+			pausedID = s.ID
+		case "notify":
+			notifyID = s.ID
+		}
+	}
+	if pausedID == "" || notifyID == "" {
+		t.Fatalf("summaries = %+v, want one \"resume-me\" and one \"notify\"", summaries)
+	}
+
+	pausedRec, ok, err := hist.Get(pausedID)
+	if err != nil || !ok {
+		t.Fatalf("Get(paused): ok=%v err=%v", ok, err)
+	}
+	if pausedRec.ResumeToken == "" {
+		t.Fatal("paused record has no ResumeToken")
+	}
+
+	notifyRec, ok, err := hist.Get(notifyID)
+	if err != nil || !ok {
+		t.Fatalf("Get(notify): ok=%v err=%v", ok, err)
+	}
+	payload, ok := notifyRec.Trigger.(map[string]any)
+	if !ok {
+		t.Fatalf("Trigger = %#v, want a map", notifyRec.Trigger)
+	}
+	if payload["runId"] != pausedID {
+		t.Fatalf("Trigger[runId] = %v, want %q", payload["runId"], pausedID)
+	}
+	if payload["resumeToken"] != pausedRec.ResumeToken {
+		t.Fatalf("Trigger[resumeToken] = %v, want %q", payload["resumeToken"], pausedRec.ResumeToken)
+	}
+	if payload["pausedStepName"] != "approve" {
+		t.Fatalf("Trigger[pausedStepName] = %v, want \"approve\"", payload["pausedStepName"])
+	}
+}
+
 func TestRunFlow_SucceedsWithoutPersisting(t *testing.T) {
 	h := newHandlerWithFlows(t)
 	result := callTool(t, h, toolRunFlow, map[string]any{

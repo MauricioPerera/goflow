@@ -84,6 +84,27 @@ type Record struct {
 	// own eventual completion history entries beyond the first (only the
 	// record ResumeRun directly produces carries it).
 	ResumeOfRunID string
+	// ResumeToken is a fresh 128-bit random secret Save assigns whenever
+	// (and only whenever) rec.State.Verdict.Status is PAUSED — any value
+	// the caller already set on rec is ignored and overwritten, the same
+	// "never trust caller input for something meant to be unforgeable"
+	// treatment ID itself already gets. It exists so a PAUSED run can be
+	// resumed by someone who holds only this token — e.g. clicking an
+	// approval link in an email — without the full GOFLOW_API_TOKEN; see
+	// pkg/httpapi's POST /public/runs/{id}/resume. Empty for every run
+	// that never paused. Never included in Summary (List's own
+	// projection) — deliberately: a caller with only enough access to
+	// LIST runs shouldn't also bulk-harvest every paused run's resume
+	// token in one call; a full Get (which already requires the same
+	// GOFLOW_API_TOKEN this token exists to let someone bypass) is the
+	// only way to read it back. No expiry and no revocation once issued
+	// — this project's runstore.Record is append-only/immutable like
+	// every other Record here, so there is no "mark it consumed"
+	// operation; the same lack-of-guard flowstore.ResumeRun's own doc
+	// comment already discloses for resuming a run id twice applies
+	// doubly here, since this is now reachable by anyone who has the
+	// token, not just an authenticated caller.
+	ResumeToken string
 }
 
 // Summary is the metadata-only projection List returns — mirrors
@@ -126,6 +147,37 @@ func newID() (string, error) {
 		return "", fmt.Errorf("runstore: generating id: %w", err)
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// newResumeToken generates a fresh 128-bit random hex secret — same
+// shape as newID, kept as its own function (not newID reused) since the
+// two mean different things: an id is not sensitive and appears freely
+// in URLs/logs (GET /runs/{id}), a resume token IS the credential a
+// caller without GOFLOW_API_TOKEN presents — see Record.ResumeToken's
+// own doc comment.
+func newResumeToken() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("runstore: generating resume token: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// assignResumeToken sets rec.ResumeToken to a fresh token whenever rec's
+// State says the run is PAUSED, and clears it (empty) otherwise —
+// called by both Save implementations below so a caller-supplied
+// ResumeToken is never trusted, the same treatment rec.ID already gets.
+func assignResumeToken(rec *Record) error {
+	if rec.State == nil || rec.State.Verdict.Status != model.FlowRunPaused {
+		rec.ResumeToken = ""
+		return nil
+	}
+	token, err := newResumeToken()
+	if err != nil {
+		return err
+	}
+	rec.ResumeToken = token
+	return nil
 }
 
 // validateID rejects an id that can't safely become a filename. Save's own
@@ -176,6 +228,9 @@ func (s *MemoryStore) Save(rec Record) (string, error) {
 		return "", err
 	}
 	rec.ID = id
+	if err := assignResumeToken(&rec); err != nil {
+		return "", err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.records[id] = rec
@@ -239,6 +294,9 @@ func (s *FileStore) Save(rec Record) (string, error) {
 		return "", err
 	}
 	rec.ID = id
+	if err := assignResumeToken(&rec); err != nil {
+		return "", err
+	}
 	p, err := s.path(id)
 	if err != nil {
 		return "", err

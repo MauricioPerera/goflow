@@ -181,3 +181,71 @@ func TestFileStore_ListSkipsUnrelatedFiles(t *testing.T) {
 		t.Fatalf("List() = %+v, want exactly 1 (the stray file must be skipped)", summaries)
 	}
 }
+
+// resumeTokenContract exercises Save's ResumeToken assignment against
+// both MemoryStore and FileStore, mirroring storeContract's own
+// "run the same checks against both implementations" shape.
+func resumeTokenContract(t *testing.T, store runstore.Store) {
+	t.Helper()
+
+	pausedID, err := store.Save(sampleRecord("paused-flow", model.FlowRunPaused))
+	if err != nil {
+		t.Fatalf("Save(paused): %v", err)
+	}
+	pausedRec, ok, err := store.Get(pausedID)
+	if err != nil || !ok {
+		t.Fatalf("Get(paused): ok=%v err=%v", ok, err)
+	}
+	if pausedRec.ResumeToken == "" {
+		t.Fatalf("ResumeToken = %q, want a generated token for a PAUSED record", pausedRec.ResumeToken)
+	}
+
+	succeededID, err := store.Save(sampleRecord("done-flow", model.FlowRunSucceeded))
+	if err != nil {
+		t.Fatalf("Save(succeeded): %v", err)
+	}
+	succeededRec, ok, err := store.Get(succeededID)
+	if err != nil || !ok {
+		t.Fatalf("Get(succeeded): ok=%v err=%v", ok, err)
+	}
+	if succeededRec.ResumeToken != "" {
+		t.Fatalf("ResumeToken = %q, want empty for a SUCCEEDED record", succeededRec.ResumeToken)
+	}
+
+	// A caller-supplied ResumeToken must never survive Save — it's
+	// always regenerated (PAUSED) or cleared (not PAUSED), the same
+	// "never trust caller input for this" treatment ID itself gets.
+	forged := sampleRecord("forged-flow", model.FlowRunPaused)
+	forged.ResumeToken = "attacker-supplied-token"
+	forgedID, err := store.Save(forged)
+	if err != nil {
+		t.Fatalf("Save(forged): %v", err)
+	}
+	forgedRec, ok, err := store.Get(forgedID)
+	if err != nil || !ok {
+		t.Fatalf("Get(forged): ok=%v err=%v", ok, err)
+	}
+	if forgedRec.ResumeToken == "attacker-supplied-token" {
+		t.Fatalf("ResumeToken = %q, want the caller-supplied value overwritten", forgedRec.ResumeToken)
+	}
+	if forgedRec.ResumeToken == "" {
+		t.Fatalf("ResumeToken = %q, want a freshly generated one (record is PAUSED)", forgedRec.ResumeToken)
+	}
+
+	// Two different PAUSED records must never collide on the same token.
+	if pausedRec.ResumeToken == forgedRec.ResumeToken {
+		t.Fatalf("two different records share ResumeToken %q, want unique per record", pausedRec.ResumeToken)
+	}
+}
+
+func TestMemoryStore_ResumeTokenContract(t *testing.T) {
+	resumeTokenContract(t, runstore.NewMemoryStore())
+}
+
+func TestFileStore_ResumeTokenContract(t *testing.T) {
+	store, err := runstore.NewFileStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	resumeTokenContract(t, store)
+}

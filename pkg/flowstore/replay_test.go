@@ -20,7 +20,7 @@ func TestReplayRun_RunsAgainstCurrentDefinition_MarksReplayOfRunID(t *testing.T)
 	if err := fs.Save(FlowDefinition{Name: "flow", Flow: original}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	state, _, err := RunWithHistory(&original, emptyRegistry, nil, hist, fs, "flow", map[string]any{"x": 1}, false)
+	state, _, err := RunWithHistory(&original, emptyRegistry, nil, hist, fs, "flow", map[string]any{"x": 1}, false, "")
 	if err != nil {
 		t.Fatalf("RunWithHistory: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestReplayRun_PreservesExecuteTrigger(t *testing.T) {
 
 	// Original run: ExecuteTrigger=true, so the payload passed in is
 	// IGNORED — the hook's own return value becomes the trigger output.
-	state, _, err := RunWithHistory(&fv, registry, nil, hist, fs, "probed", "payload-passed-in", true)
+	state, _, err := RunWithHistory(&fv, registry, nil, hist, fs, "probed", "payload-passed-in", true, "")
 	if err != nil {
 		t.Fatalf("RunWithHistory: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestReplayRun_AdHocRun_Rejected(t *testing.T) {
 	}
 	hist := runstore.NewMemoryStore()
 	fv := validCodeFlow()
-	if _, _, err := RunWithHistory(&fv, emptyRegistry, nil, hist, fs, "", nil, false); err != nil {
+	if _, _, err := RunWithHistory(&fv, emptyRegistry, nil, hist, fs, "", nil, false, ""); err != nil {
 		t.Fatalf("RunWithHistory: %v", err)
 	}
 	summaries, _ := hist.List()
@@ -191,7 +191,7 @@ func TestReplayRun_FlowDeletedSince_Rejected(t *testing.T) {
 	if err := fs.Save(FlowDefinition{Name: "gone", Flow: fv}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	if _, _, err := RunWithHistory(&fv, emptyRegistry, nil, hist, fs, "gone", nil, false); err != nil {
+	if _, _, err := RunWithHistory(&fv, emptyRegistry, nil, hist, fs, "gone", nil, false, ""); err != nil {
 		t.Fatalf("RunWithHistory: %v", err)
 	}
 	summaries, _ := hist.List()
@@ -219,7 +219,7 @@ func TestReplayRun_SubFlowCallsNotMarkedAsReplays(t *testing.T) {
 	if err := fs.Save(FlowDefinition{Name: "root", Flow: root}); err != nil {
 		t.Fatalf("Save root: %v", err)
 	}
-	if _, _, err := RunWithHistory(&root, emptyRegistry, nil, hist, fs, "root", nil, false); err != nil {
+	if _, _, err := RunWithHistory(&root, emptyRegistry, nil, hist, fs, "root", nil, false, ""); err != nil {
 		t.Fatalf("RunWithHistory: %v", err)
 	}
 	summaries, _ := hist.List()

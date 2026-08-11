@@ -159,6 +159,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /runs/{id}/replay", s.auth(http.HandlerFunc(s.handleRunReplay)))
 	// POST /runs/{id}/resume continues a PAUSED run — see handleRunResume.
 	mux.Handle("POST /runs/{id}/resume", s.auth(http.HandlerFunc(s.handleRunResume)))
+	// POST /public/runs/{id}/resume is deliberately NOT behind s.auth —
+	// see handlePublicRunResume's doc comment for why and what gates it
+	// instead.
+	mux.HandleFunc("POST /public/runs/{id}/resume", s.handlePublicRunResume)
 	// /mcp exposes the saved flows as MCP tools (JSON-RPC 2.0 over a single
 	// POST), behind the same auth as every other route (static token OR a
 	// live OAuth access token — see auth). authMCP additionally advertises
@@ -386,15 +390,16 @@ func (s *Server) handleFlowsRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	s.runFlowVersion(w, &req.Flow, "", "", req.Trigger, req.ExecuteTrigger)
+	s.runFlowVersion(w, &req.Flow, "", "", "", req.Trigger, req.ExecuteTrigger)
 }
 
 // runFlowVersion is the shared run path for both POST /flows/run (an ad-hoc
-// FlowVersion in the body — flowName "", onFailureFlow "": an ad-hoc run has
-// no FlowDefinition to read one from) and POST /flows/{name}/run (a
-// FlowVersion fetched from the store by name — flowName is that name,
-// recorded alongside the run in history; onFailureFlow is that
-// FlowDefinition's own OnFailureFlow, if set). The validate-then-execute
+// FlowVersion in the body — flowName "", onFailureFlow/onPauseFlow "": an
+// ad-hoc run has no FlowDefinition to read either from) and POST
+// /flows/{name}/run (a FlowVersion fetched from the store by name —
+// flowName is that name, recorded alongside the run in history;
+// onFailureFlow/onPauseFlow are that FlowDefinition's own fields, if
+// set). The validate-then-execute
 // logic itself lives in flowstore.RunWithHistory (shared with the MCP
 // tools/call path); this method only translates its three return values
 // into the HTTP response shape the two routes have always had: 400
@@ -405,8 +410,8 @@ func (s *Server) handleFlowsRun(w http.ResponseWriter, r *http.Request) {
 // FAILED verdict runs flowstore.TriggerOnFailure BEFORE the response is
 // written — deliberately synchronous, see that function's own doc comment
 // for why.
-func (s *Server) runFlowVersion(w http.ResponseWriter, fv *model.FlowVersion, flowName, onFailureFlow string, trigger any, executeTrigger bool) {
-	state, validationErrs, err := flowstore.RunWithHistory(fv, s.buildRegistry, s.credStore, s.runStore, s.flowStore, flowName, trigger, executeTrigger)
+func (s *Server) runFlowVersion(w http.ResponseWriter, fv *model.FlowVersion, flowName, onFailureFlow, onPauseFlow string, trigger any, executeTrigger bool) {
+	state, validationErrs, err := flowstore.RunWithHistory(fv, s.buildRegistry, s.credStore, s.runStore, s.flowStore, flowName, trigger, executeTrigger, onPauseFlow)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -619,7 +624,7 @@ func (s *Server) handleFlowRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.runFlowVersion(w, &def.Flow, name, def.OnFailureFlow, req.Trigger, req.ExecuteTrigger)
+	s.runFlowVersion(w, &def.Flow, name, def.OnFailureFlow, def.OnPauseFlow, req.Trigger, req.ExecuteTrigger)
 }
 
 // exportRequest is the body shape POST /flows/export/js expects — the same
@@ -736,7 +741,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	state, validationErrs, runErr := flowstore.RunWithHistory(&def.Flow, s.buildRegistry, s.credStore, s.runStore, s.flowStore, name, payload, true)
+	state, validationErrs, runErr := flowstore.RunWithHistory(&def.Flow, s.buildRegistry, s.credStore, s.runStore, s.flowStore, name, payload, true, def.OnPauseFlow)
 	if runErr != nil || len(validationErrs) > 0 {
 		// Never expose validation/internal-fault detail to an
 		// unauthenticated third party — that level of detail is for the
@@ -986,6 +991,68 @@ func (s *Server) handleRunResume(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(state)
+}
+
+// handlePublicRunResume handles POST /public/runs/{id}/resume — the same
+// operation as handleRunResume, reachable WITHOUT GOFLOW_API_TOKEN: the
+// caller instead presents {id}'s own runstore.Record.ResumeToken via the
+// X-Resume-Secret header, constant-time compared exactly like
+// handleWebhook already does for X-Webhook-Secret. Closes the gap left
+// after resume shipped authenticated-only: an approval flow's
+// FlowDefinition.OnPauseFlow can hand a notification flow {runId,
+// resumeToken}, which can build a one-click link ("click here to
+// approve") that works for someone who was never given the bearer
+// token — the actual point of this route existing.
+//
+// Fail-closed at every step, same posture handleWebhook already has
+// toward an unauthenticated caller:
+//   - id doesn't resolve, or resolving it errors: 401, not 404 — a 404
+//     would let a caller distinguish "wrong secret" from "no such run"
+//     by probing ids, which a bearer-token route doesn't need to avoid
+//     (a wrong id there is just as visible either way) but this one does.
+//   - rec.ResumeToken is empty (the run never paused, or predates this
+//     feature) — REJECTED even if the caller's header is also empty;
+//     without this check, ConstantTimeCompare("", "") would report a
+//     "match" and let an empty header resume a token-less record.
+//   - the header doesn't match — 401.
+//
+// On success, returns only a generic ack {"status":"resumed"} — NEVER
+// the full *model.ExecutionState handleRunResume returns, which can
+// carry every step's real Input/Output. Leaking that to a caller who
+// only proved they hold ONE run's resume token (not the master bearer
+// token) would defeat the narrower access this route is supposed to
+// grant; writeWebhookResult's own reasoning for staying generic applies
+// identically here.
+func (s *Server) handlePublicRunResume(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	rec, ok, err := s.runStore.Get(id)
+	if err != nil || !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	got := r.Header.Get("X-Resume-Secret")
+	if rec.ResumeToken == "" || subtle.ConstantTimeCompare([]byte(got), []byte(rec.ResumeToken)) != 1 {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+
+	var req resumeRequest
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body: " + err.Error()})
+			return
+		}
+	}
+
+	_, validationErrs, err := flowstore.ResumeRun(s.runStore, s.flowStore, s.buildRegistry, s.credStore, s.runStore, id, req.ResumePayload)
+	if err != nil || len(validationErrs) > 0 {
+		// Never expose validation/internal-fault detail to an
+		// unauthenticated third party — matching handleWebhook's own
+		// posture for the identical reason.
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
 }
 
 // --- middleware -------------------------------------------------------------

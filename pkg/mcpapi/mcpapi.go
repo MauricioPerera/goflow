@@ -353,6 +353,7 @@ func metaToolDescriptors() []map[string]any {
 					"webhookEnabled":          map[string]any{"type": "boolean", "description": "opt this flow into POST /webhooks/{name}, an unauthenticated ingress route — off by default"},
 					"webhookSecretCredential": map[string]any{"type": "string", "description": "name of a credential (see goflow_save_credential) whose value POST /webhooks/{name} then requires as the X-Webhook-Secret header; omit for no secret check"},
 					"onFailureFlow":           map[string]any{"type": "string", "description": "name of ANOTHER saved flow to run whenever this one's run ends FAILED — its trigger payload is {flowName, failedStepName, failedStepDisplayName, failedMessage}. Omit to disable (the default). Never chains more than one hop even if the on-failure flow also has its own onFailureFlow set."},
+					"onPauseFlow":             map[string]any{"type": "string", "description": "name of ANOTHER saved flow to run whenever this one PAUSES (e.g. the \"approval\" piece) — its trigger payload is {flowName, runId, resumeToken, pausedStepName}, enough to build a one-click approval link: POST /public/runs/{runId}/resume with header X-Resume-Secret: {resumeToken}, no GOFLOW_API_TOKEN required. Omit to disable (the default). Never chains more than one hop, same as onFailureFlow."},
 					"examples": map[string]any{
 						"type":        "array",
 						"description": "worked trigger/expected-result cases actually RUN against this flow before it's persisted — rejects the WHOLE save if any fails, the flow-level analogue of a piece's Examples. OPTIONAL, unlike a piece's (which are required): omit entirely for the exact same save behavior as before this existed. Each item: {description, trigger, executeTrigger, wantError, checkOutputs, wantStepOutputs}. wantError:true expects the run to FAIL; otherwise it must succeed. checkOutputs:true additionally requires every key in wantStepOutputs (a map of step name -> expected Output, deep-equal) to match — a name not found in the run's Steps is also a failure. No credentials.Store here (an auth value in trigger must be a literal, not a $credential reference) and no CALL_FLOW support (a CALL_FLOW action fails with \"not enabled\" unless the example sets wantError).",
@@ -1321,7 +1322,7 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 		return
 	}
 
-	state, validationErrs, runErr := flowstore.RunWithHistory(&def.Flow, h.BuildRegistry, h.CredStore, h.HistoryStore, h.FlowStore, def.Name, params.Arguments, false)
+	state, validationErrs, runErr := flowstore.RunWithHistory(&def.Flow, h.BuildRegistry, h.CredStore, h.HistoryStore, h.FlowStore, def.Name, params.Arguments, false, def.OnPauseFlow)
 	flowstore.TriggerOnFailure(h.FlowStore, def.Name, def.OnFailureFlow, state, h.BuildRegistry, h.CredStore, h.HistoryStore)
 	writeFlowRunResult(w, req.ID, state, validationErrs, runErr)
 }
@@ -1367,7 +1368,7 @@ func (h *Handler) callRunFlow(w http.ResponseWriter, req rawRequest, args map[st
 		writeToolText(w, req.ID, true, "invalid arguments: "+err.Error())
 		return
 	}
-	state, validationErrs, runErr := flowstore.RunWithHistory(&body.Flow, h.BuildRegistry, h.CredStore, h.HistoryStore, h.FlowStore, "", body.Trigger, body.ExecuteTrigger)
+	state, validationErrs, runErr := flowstore.RunWithHistory(&body.Flow, h.BuildRegistry, h.CredStore, h.HistoryStore, h.FlowStore, "", body.Trigger, body.ExecuteTrigger, "")
 	writeFlowRunResult(w, req.ID, state, validationErrs, runErr)
 }
 
