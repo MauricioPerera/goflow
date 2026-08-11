@@ -526,7 +526,7 @@ below for what a Go rewrite gets and gives up.
   OAuth access token) already has that exact same access on every httpapi
   route today — there's no scopes/permissions concept anywhere in this
   project to make MCP meaningfully narrower, so none of this is a new
-  privilege, only new reachability. Eighteen fixed tools are always present
+  privilege, only new reachability. Twenty fixed tools are always present
   in `tools/list` alongside the per-flow ones, each with a real, precise
   `inputSchema` (unlike a per-flow tool's deliberately permissive one,
   since these have well-defined Go types behind them, not an untyped
@@ -552,7 +552,10 @@ below for what a Go rewrite gets and gives up.
     MCP equivalents of `GET /flows/{name}/versions` and
     `GET /flows/{name}/versions/{id}` — they only ever READ what
     `GatedStore.Save` already recorded, see the flow-versioning entry
-    below).
+    below), `goflow_piece_usage` and `goflow_credential_usage` (the MCP
+    equivalents of `GET /pieces/{name}/usage` and
+    `GET /credentials/{name}/usage` — every saved flow referencing a
+    piece/credential by name; see the reference-checking entry below).
   - Write: `goflow_save_flow` and `goflow_delete_flow` (through the exact
     same `*flowstore.GatedStore` `POST`/`DELETE /flows` use — a flow
     referencing a missing piece is rejected, never partially saved);
@@ -588,7 +591,7 @@ below for what a Go rewrite gets and gives up.
     ever committing to `goflow_save_flow`.
 
   A saved flow (or, symmetrically, a credential name) that collides with
-  one of the eighteen reserved names is excluded from `tools/list` — not
+  one of the twenty reserved names is excluded from `tools/list` — not
   deleted, not un-runnable/un-referenceable by name over HTTP — just
   shadowed in this one listing, and `tools/call` resolves that name to the
   fixed tool the same way, so the two methods never disagree about what a
@@ -865,6 +868,32 @@ below for what a Go rewrite gets and gives up.
   real one; a deployment that doesn't configure one behaves exactly as it
   did before this existed. No pruning/TTL, matching the same accepted,
   disclosed tradeoff `runstore` already has.
+- **Reference checking before delete** (`flowstore.
+  FindFlowsReferencingCredential`, `flowstore.FindFlowsReferencingPiece`
+  — `GET /pieces/{name}/usage`, `GET /credentials/{name}/usage`, and
+  MCP's `goflow_piece_usage`/`goflow_credential_usage`): `DELETE
+  /pieces/{name}` and `DELETE /credentials/{name}` have always been, and
+  still are, gate-free — removal can't fail a quality check the way a
+  save can, the same reasoning documented elsewhere in this file — but
+  until now nothing could tell a caller what actually depends on a piece
+  or credential BEFORE deleting it. These two functions walk every saved
+  flow's whole action tree (`NextAction`/`Router.Children`/
+  `Loop.FirstLoopAction`/`CALL_FLOW`, the same three-edge recursion
+  `flowvalidate.walkChain` and `ResolveCredentials`'s own walker already
+  use) looking for a piece name match (a `PIECE` action's `pieceName`, or
+  a `PIECE_TRIGGER`'s own `pieceName`) or a `{"$credential": name}`
+  marker anywhere in an action's `Input`, plus
+  `FlowDefinition.WebhookSecretCredential` for the credential case.
+  Deliberately MORE thorough than `ResolveCredentials`'s own walk in one
+  way: it also scans a `CALL_FLOW` action's `Input`, which
+  `ResolveCredentials` currently never visits at all (that Input becomes
+  the SUB-flow's own trigger payload, never itself scanned for markers,
+  by design) — a `$credential` marker placed there is a real, separate,
+  currently-unresolved gap this doesn't fix, only surfaces: it still
+  counts as a reference here, since the actual question being answered
+  is "would removing this affect this flow," independent of whether
+  resolution works today. Purely additive and non-blocking — `DELETE`
+  itself is completely unchanged.
 
 ## Explicitly NOT in v1
 

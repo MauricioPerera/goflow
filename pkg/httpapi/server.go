@@ -95,6 +95,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/catalog", s.auth(http.HandlerFunc(s.handleCatalog)))
 	mux.Handle("/pieces", s.auth(http.HandlerFunc(s.handlePieces)))
 	mux.Handle("DELETE /pieces/{name}", s.auth(http.HandlerFunc(s.handlePieceDelete)))
+	// GET /pieces/{name}/usage — every saved flow referencing this piece,
+	// so a caller can check before DELETE, not just after — see
+	// handlePieceUsage. Read-only; DELETE itself is unaffected/unblocked.
+	mux.Handle("GET /pieces/{name}/usage", s.auth(http.HandlerFunc(s.handlePieceUsage)))
 	// GET /pieces/export returns every JS-authored piece's FULL Definition
 	// (source, examples — everything Save accepts), unlike GET /catalog's
 	// DescribeCombined text — see handlePiecesExport.
@@ -119,6 +123,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /webhooks/{name}", s.handleWebhook)
 	mux.Handle("/credentials", s.auth(http.HandlerFunc(s.handleCredentials)))
 	mux.Handle("DELETE /credentials/{name}", s.auth(http.HandlerFunc(s.handleCredentialDelete)))
+	// GET /credentials/{name}/usage mirrors GET /pieces/{name}/usage above,
+	// for credentials instead of pieces — see handleCredentialUsage.
+	mux.Handle("GET /credentials/{name}/usage", s.auth(http.HandlerFunc(s.handleCredentialUsage)))
 	// /runs exposes the run history flowstore.RunWithHistory records for
 	// every flow run — GET /runs lists metadata only (a run's full State can
 	// be large), GET /runs/{id} returns one full runstore.Record.
@@ -211,6 +218,23 @@ func (s *Server) handlePieceDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "name": name})
+}
+
+// handlePieceUsage handles GET /pieces/{name}/usage — the names of every
+// saved flow that references this piece (a PIECE action's PieceName, or a
+// PIECE_TRIGGER's own PieceName), via flowstore.FindFlowsReferencingPiece.
+// Read-only and proactive: this never blocks DELETE /pieces/{name}, which
+// stays exactly as gate-free as its own doc comment already says — this
+// exists so a caller can check what depends on a piece BEFORE deciding to
+// delete it, not discover it only after something breaks.
+func (s *Server) handlePieceUsage(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	flows, err := flowstore.FindFlowsReferencingPiece(s.flowStore, name)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"flows": flows})
 }
 
 // handlePiecesExport handles GET /pieces/export — every JS-authored piece
@@ -725,6 +749,21 @@ func (s *Server) handleCredentialDelete(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "name": name})
+}
+
+// handleCredentialUsage handles GET /credentials/{name}/usage — the names
+// of every saved flow that references this credential, via
+// flowstore.FindFlowsReferencingCredential. Read-only and proactive, same
+// reasoning as handlePieceUsage: DELETE /credentials/{name} stays exactly
+// as gate-free as it already is; this exists so a caller can check first.
+func (s *Server) handleCredentialUsage(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	flows, err := flowstore.FindFlowsReferencingCredential(s.flowStore, name)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"flows": flows})
 }
 
 // handleRunsList handles GET /runs — every recorded run, metadata only

@@ -1010,6 +1010,117 @@ func TestSaveFlow_ReferencesMissingPiece_IsErrorTrueNotPersisted(t *testing.T) {
 	}
 }
 
+func flowReferencingPieceDef(name, pieceName string) flowstore.FlowDefinition {
+	return flowstore.FlowDefinition{
+		Name: name,
+		Flow: model.FlowVersion{
+			ID: "fv-" + name,
+			Trigger: &model.FlowTrigger{
+				Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+				NextAction: &model.FlowAction{
+					Name: "call", DisplayName: "Call", Type: model.ActionPiece,
+					Piece: &model.PieceSettings{PieceName: pieceName, ActionName: "do"},
+				},
+			},
+		},
+	}
+}
+
+func TestPieceUsage_ListsReferencingFlows(t *testing.T) {
+	h := newHandlerWithFlows(t, flowReferencingPieceDef("uses-http", "http"), doublesArgFlow())
+	result := callTool(t, h, toolPieceUsage, map[string]any{"name": "http"})
+	if result["isError"] != false {
+		t.Fatalf("isError = %v: %v", result["isError"], result)
+	}
+	var body struct {
+		Flows []string `json:"flows"`
+	}
+	toolText(t, result, &body)
+	if len(body.Flows) != 1 || body.Flows[0] != "uses-http" {
+		t.Fatalf("flows = %v, want exactly [\"uses-http\"]", body.Flows)
+	}
+}
+
+func TestPieceUsage_NoMatches_EmptyList(t *testing.T) {
+	h := newHandlerWithFlows(t, doublesArgFlow())
+	result := callTool(t, h, toolPieceUsage, map[string]any{"name": "never-used"})
+	if result["isError"] != false {
+		t.Fatalf("isError = %v: %v", result["isError"], result)
+	}
+	var body struct {
+		Flows []string `json:"flows"`
+	}
+	toolText(t, result, &body)
+	if len(body.Flows) != 0 {
+		t.Fatalf("flows = %v, want empty", body.Flows)
+	}
+}
+
+func TestPieceUsage_MissingName_IsErrorTrue(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolPieceUsage, map[string]any{})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true when name is missing", result["isError"])
+	}
+}
+
+func flowReferencingCredentialDef(name, credentialName string) flowstore.FlowDefinition {
+	return flowstore.FlowDefinition{
+		Name: name,
+		Flow: model.FlowVersion{
+			ID: "fv-" + name,
+			Trigger: &model.FlowTrigger{
+				Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+				NextAction: &model.FlowAction{
+					Name: "use", DisplayName: "Use", Type: model.ActionCode,
+					Code: &model.CodeSettings{
+						Input:  map[string]any{"auth": map[string]any{"$credential": credentialName}},
+						Source: `(params) => params`,
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestCredentialUsage_ListsReferencingFlows(t *testing.T) {
+	h := newHandlerWithFlows(t, flowReferencingCredentialDef("uses-cred", "api-key"), doublesArgFlow())
+	result := callTool(t, h, toolCredentialUsage, map[string]any{"name": "api-key"})
+	if result["isError"] != false {
+		t.Fatalf("isError = %v: %v", result["isError"], result)
+	}
+	var body struct {
+		Flows []string `json:"flows"`
+	}
+	toolText(t, result, &body)
+	if len(body.Flows) != 1 || body.Flows[0] != "uses-cred" {
+		t.Fatalf("flows = %v, want exactly [\"uses-cred\"]", body.Flows)
+	}
+}
+
+func TestCredentialUsage_NoMatches_EmptyList(t *testing.T) {
+	h := newHandlerWithFlows(t, doublesArgFlow())
+	result := callTool(t, h, toolCredentialUsage, map[string]any{"name": "never-used"})
+	if result["isError"] != false {
+		t.Fatalf("isError = %v: %v", result["isError"], result)
+	}
+	var body struct {
+		Flows []string `json:"flows"`
+	}
+	toolText(t, result, &body)
+	if len(body.Flows) != 0 {
+		t.Fatalf("flows = %v, want empty", body.Flows)
+	}
+}
+
+func TestCredentialUsage_MissingName_IsErrorTrue(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolCredentialUsage, map[string]any{})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true when name is missing", result["isError"])
+	}
+}
+
 func TestListFlowVersions_ReflectsEachSave(t *testing.T) {
 	h := newHandlerWithFlows(t)
 	if r := callTool(t, h, toolSaveFlow, map[string]any{"name": "v", "flow": flowVersionJSON()}); r["isError"] != false {

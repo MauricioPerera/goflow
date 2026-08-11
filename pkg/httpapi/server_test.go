@@ -207,6 +207,61 @@ func TestPostPieces_AcceptsValidDefinition(t *testing.T) {
 	}
 }
 
+func TestPieceUsage_ListsReferencingFlows(t *testing.T) {
+	srv := newTestServer(t)
+	piece := catalog.Definition{
+		Name: "usedpiece", DisplayName: "Used Piece",
+		Actions: []catalog.ActionDefinition{{
+			Name: "ok", DisplayName: "OK", Source: "(params) => ({ ok: true })",
+			Examples: []catalog.Example{{Input: map[string]any{}, CheckOutput: true, WantOutput: map[string]any{"ok": true}}},
+		}},
+	}
+	if rec := do(t, srv, "POST", "/pieces", piece, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save piece: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	flow := flowstore.FlowDefinition{
+		Name: "uses-piece",
+		Flow: model.FlowVersion{
+			ID: "fv-uses-piece",
+			Trigger: &model.FlowTrigger{
+				Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+				NextAction: &model.FlowAction{
+					Name: "call", DisplayName: "Call", Type: model.ActionPiece,
+					Piece: &model.PieceSettings{PieceName: "usedpiece", ActionName: "ok"},
+				},
+			},
+		},
+	}
+	if rec := do(t, srv, "POST", "/flows", flow, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save flow: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec := do(t, srv, "GET", "/pieces/usedpiece/usage", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	flows, _ := m["flows"].([]any)
+	if len(flows) != 1 || flows[0] != "uses-piece" {
+		t.Fatalf("flows = %v, want exactly [\"uses-piece\"]", m["flows"])
+	}
+
+	rec = do(t, srv, "GET", "/pieces/never-used/usage", nil, true)
+	m = decode(t, rec)
+	flows, _ = m["flows"].([]any)
+	if len(flows) != 0 {
+		t.Fatalf("flows = %v, want empty for an unreferenced piece", m["flows"])
+	}
+}
+
+func TestPieceUsage_NoAuth_401(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/pieces/whatever/usage", nil, false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
 func TestPiecesExport_ReturnsFullDefinitionIncludingSourceAndExamples(t *testing.T) {
 	srv := newTestServer(t)
 	def := catalog.Definition{
@@ -566,6 +621,74 @@ func TestPostCredentials_Valid_SecretNotInRawFile(t *testing.T) {
 	}
 	if strings.Contains(string(raw), secret) {
 		t.Fatalf("plaintext secret in raw file:\n%s", raw)
+	}
+}
+
+func TestCredentialUsage_ListsReferencingFlows(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/credentials", map[string]any{"name": "api-key", "value": "secret"}, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save credential: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	flow := flowstore.FlowDefinition{
+		Name: "uses-cred",
+		Flow: model.FlowVersion{
+			ID: "fv-uses-cred",
+			Trigger: &model.FlowTrigger{
+				Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+				NextAction: &model.FlowAction{
+					Name: "use", DisplayName: "Use", Type: model.ActionCode,
+					Code: &model.CodeSettings{
+						Input:  map[string]any{"auth": map[string]any{"$credential": "api-key"}},
+						Source: `(params) => params`,
+					},
+				},
+			},
+		},
+	}
+	if rec := do(t, srv, "POST", "/flows", flow, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save flow: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec := do(t, srv, "GET", "/credentials/api-key/usage", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	flows, _ := m["flows"].([]any)
+	if len(flows) != 1 || flows[0] != "uses-cred" {
+		t.Fatalf("flows = %v, want exactly [\"uses-cred\"]", m["flows"])
+	}
+
+	rec = do(t, srv, "GET", "/credentials/never-used/usage", nil, true)
+	m = decode(t, rec)
+	flows, _ = m["flows"].([]any)
+	if len(flows) != 0 {
+		t.Fatalf("flows = %v, want empty for an unreferenced credential", m["flows"])
+	}
+}
+
+func TestCredentialUsage_MatchesWebhookSecretCredential(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/credentials", map[string]any{"name": "webhook-secret", "value": "shh"}, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save credential: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	def := webhookEchoFlowDef("hooked", true, "webhook-secret")
+	if rec := do(t, srv, "POST", "/flows", def, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save flow: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	rec := do(t, srv, "GET", "/credentials/webhook-secret/usage", nil, true)
+	m := decode(t, rec)
+	flows, _ := m["flows"].([]any)
+	if len(flows) != 1 || flows[0] != "hooked" {
+		t.Fatalf("flows = %v, want exactly [\"hooked\"]", m["flows"])
+	}
+}
+
+func TestCredentialUsage_NoAuth_401(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/credentials/whatever/usage", nil, false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
 	}
 }
 

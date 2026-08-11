@@ -21,14 +21,19 @@
 // initially a pure discoverability improvement: goflow_describe_catalog,
 // goflow_export_catalog, goflow_list_flows, goflow_get_flow,
 // goflow_list_runs, goflow_get_run, goflow_export_flow_js,
-// goflow_list_flow_versions, and goflow_get_flow_version are read-only
-// (export runs no code and persists nothing, whether given a saved
-// flow's name or an ad-hoc one — see toolExportFlowJS's own description;
-// goflow_export_catalog is the same idea for a JS-authored piece's full
-// Definition, since goflow_describe_catalog's own text is lossy on
-// purpose — see toolExportCatalog's own description; the two flow-version
-// tools only ever READ what GatedStore.Save already recorded, see
-// VersionRecord's own doc comment); goflow_save_flow, goflow_delete_flow,
+// goflow_list_flow_versions, goflow_get_flow_version, goflow_piece_usage,
+// and goflow_credential_usage are read-only (export runs no code and
+// persists nothing, whether given a saved flow's name or an ad-hoc one —
+// see toolExportFlowJS's own description; goflow_export_catalog is the
+// same idea for a JS-authored piece's full Definition, since
+// goflow_describe_catalog's own text is lossy on purpose — see
+// toolExportCatalog's own description; the two flow-version tools only
+// ever READ what GatedStore.Save already recorded, see VersionRecord's
+// own doc comment; the two usage tools only ever READ which flows
+// reference a piece/credential — they never block goflow_delete_piece/
+// goflow_delete_credential, which stay exactly as gate-free as those
+// always were, see FindFlowsReferencingCredential's own doc comment);
+// goflow_save_flow, goflow_delete_flow,
 // goflow_rollback_flow_version, goflow_save_piece, goflow_delete_piece,
 // goflow_list_credentials, goflow_save_credential, and
 // goflow_delete_credential mutate state — the exact same mutations
@@ -137,6 +142,8 @@ const (
 	toolExportCatalog    = "goflow_export_catalog"
 	toolListFlowVersions = "goflow_list_flow_versions"
 	toolGetFlowVersion   = "goflow_get_flow_version"
+	toolPieceUsage       = "goflow_piece_usage"
+	toolCredentialUsage  = "goflow_credential_usage"
 
 	toolSaveFlow            = "goflow_save_flow"
 	toolDeleteFlow          = "goflow_delete_flow"
@@ -159,6 +166,8 @@ var reservedToolNames = map[string]bool{
 	toolExportCatalog:    true,
 	toolListFlowVersions: true,
 	toolGetFlowVersion:   true,
+	toolPieceUsage:       true,
+	toolCredentialUsage:  true,
 
 	toolSaveFlow:            true,
 	toolDeleteFlow:          true,
@@ -244,6 +253,24 @@ func metaToolDescriptors() []map[string]any {
 					"versionId": map[string]any{"type": "string", "description": "a version id from goflow_list_flow_versions"},
 				},
 				"required": []string{"name", "versionId"},
+			},
+		},
+		{
+			"name":        toolPieceUsage,
+			"description": "List every saved flow that references a piece by name — a PIECE action's pieceName, or a PIECE_TRIGGER's own pieceName. Read-only and proactive: does NOT block goflow_delete_piece, which stays exactly as gate-free as it already is — call this FIRST to see what depends on a piece before deciding to delete it, rather than finding out only after something breaks.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"name": map[string]any{"type": "string", "description": "the piece's name"}},
+				"required":   []string{"name"},
+			},
+		},
+		{
+			"name":        toolCredentialUsage,
+			"description": "List every saved flow that references a credential by name — a webhookSecretCredential, or a {\"$credential\": name} marker anywhere in an action's Input (CODE, PIECE, or CALL_FLOW). Read-only and proactive, same reasoning as goflow_piece_usage: does NOT block goflow_delete_credential — call this first.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"name": map[string]any{"type": "string", "description": "the credential's name"}},
+				"required":   []string{"name"},
 			},
 		},
 		{
@@ -552,6 +579,39 @@ func (h *Handler) callGetFlowVersion(w http.ResponseWriter, req rawRequest, args
 		return
 	}
 	writeToolText(w, req.ID, false, rec)
+}
+
+// callPieceUsage lists every saved flow referencing args["name"] as a
+// piece, via flowstore.FindFlowsReferencingPiece against h.FlowStore.
+func (h *Handler) callPieceUsage(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	name, _ := args["name"].(string)
+	if name == "" {
+		writeToolText(w, req.ID, true, "missing required argument: name")
+		return
+	}
+	flows, err := flowstore.FindFlowsReferencingPiece(h.FlowStore, name)
+	if err != nil {
+		writeError(w, req.ID, -32603, "internal error: "+err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, map[string]any{"flows": flows})
+}
+
+// callCredentialUsage lists every saved flow referencing args["name"] as a
+// credential, via flowstore.FindFlowsReferencingCredential against
+// h.FlowStore.
+func (h *Handler) callCredentialUsage(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	name, _ := args["name"].(string)
+	if name == "" {
+		writeToolText(w, req.ID, true, "missing required argument: name")
+		return
+	}
+	flows, err := flowstore.FindFlowsReferencingCredential(h.FlowStore, name)
+	if err != nil {
+		writeError(w, req.ID, -32603, "internal error: "+err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, map[string]any{"flows": flows})
 }
 
 // callExportFlowJS resolves fv from exactly one of args["name"] (a saved
@@ -1027,6 +1087,12 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 		return
 	case toolGetFlowVersion:
 		h.callGetFlowVersion(w, req, params.Arguments)
+		return
+	case toolPieceUsage:
+		h.callPieceUsage(w, req, params.Arguments)
+		return
+	case toolCredentialUsage:
+		h.callCredentialUsage(w, req, params.Arguments)
 		return
 	case toolExportFlowJS:
 		h.callExportFlowJS(w, req, params.Arguments)
