@@ -526,7 +526,7 @@ below for what a Go rewrite gets and gives up.
   OAuth access token) already has that exact same access on every httpapi
   route today — there's no scopes/permissions concept anywhere in this
   project to make MCP meaningfully narrower, so none of this is a new
-  privilege, only new reachability. Fifteen fixed tools are always present
+  privilege, only new reachability. Eighteen fixed tools are always present
   in `tools/list` alongside the per-flow ones, each with a real, precise
   `inputSchema` (unlike a per-flow tool's deliberately permissive one,
   since these have well-defined Go types behind them, not an untyped
@@ -548,11 +548,20 @@ below for what a Go rewrite gets and gives up.
     `POST /flows/export/js` and `POST /flows/{name}/export/js` combined
     into one tool — takes exactly one of `name` or `flow`, since export
     runs no code and persists nothing either way, unlike `goflow_run_flow`
+    below), `goflow_list_flow_versions` and `goflow_get_flow_version` (the
+    MCP equivalents of `GET /flows/{name}/versions` and
+    `GET /flows/{name}/versions/{id}` — they only ever READ what
+    `GatedStore.Save` already recorded, see the flow-versioning entry
     below).
   - Write: `goflow_save_flow` and `goflow_delete_flow` (through the exact
     same `*flowstore.GatedStore` `POST`/`DELETE /flows` use — a flow
     referencing a missing piece is rejected, never partially saved);
-    `goflow_save_piece` and `goflow_delete_piece` (through the exact same
+    `goflow_rollback_flow_version` (the MCP equivalent of
+    `POST /flows/{name}/versions/{id}/rollback` — restores a past version
+    by fetching it and calling the exact same `GatedStore.Save` a live
+    edit goes through, so a version referencing a piece no longer in the
+    CURRENT registry fails to roll back rather than silently restoring
+    something broken now; see the flow-versioning entry below); `goflow_save_piece` and `goflow_delete_piece` (through the exact same
     `*catalog.GatedStore` `POST`/`DELETE /pieces` use — every
     action/trigger/dropdown's examples are actually RUN before a save
     persists, one failing example rejects the whole piece, and delete
@@ -579,7 +588,7 @@ below for what a Go rewrite gets and gives up.
     ever committing to `goflow_save_flow`.
 
   A saved flow (or, symmetrically, a credential name) that collides with
-  one of the fifteen reserved names is excluded from `tools/list` — not
+  one of the eighteen reserved names is excluded from `tools/list` — not
   deleted, not un-runnable/un-referenceable by name over HTTP — just
   shadowed in this one listing, and `tools/call` resolves that name to the
   fixed tool the same way, so the two methods never disagree about what a
@@ -826,6 +835,36 @@ below for what a Go rewrite gets and gives up.
   not a `$credential` reference) and no `CALL_FLOW` support (an example
   containing one fails with "not enabled" unless `WantError` is set) —
   real added scope this doesn't take on yet.
+- **Flow version history + rollback** (`flowstore.VersionRecord`,
+  `flowstore.VersionStore`, `GatedStore.Rollback` — `GET
+  /flows/{name}/versions`, `GET /flows/{name}/versions/{id}`,
+  `POST /flows/{name}/versions/{id}/rollback`, and MCP's
+  `goflow_list_flow_versions`/`goflow_get_flow_version`/
+  `goflow_rollback_flow_version`): the `Examples` gate stops a BROKEN
+  save, but does nothing for one that passes every check and still turns
+  out to break something the examples didn't cover — without this, the
+  only way back to a working flow was remembering (or re-authoring) its
+  previous definition by hand. Every successful `GatedStore.Save` now
+  also records an immutable snapshot, closely mirroring `pkg/runstore`'s
+  own "append-only immutable snapshot" shape (one JSON file per version,
+  atomic write, a caller-opaque random id `Save` assigns) — with one
+  deliberate divergence: `VersionStore.ListForFlow` takes a flow name and
+  filters server-side, since browsing versions is almost always "show me
+  THIS flow's history," unlike runs, where a global timeline across every
+  flow is a real, separate, legitimate view `GET /runs` already serves.
+  `Rollback` is deliberately NOT new storage logic: it fetches a past
+  `VersionRecord.Definition` and calls `Save` again — reusing the EXACT
+  SAME validation/example gate a live edit already goes through (a
+  version whose target piece no longer exists in the CURRENT registry
+  fails to roll back, rather than silently restoring something broken
+  right now), and recording ITS OWN new version entry too, so the history
+  is a strictly-growing log that never gets rewritten, the same
+  immutability `runstore`'s own records already have. Optional, nil-means-
+  off like every other Store in this project — `cmd/server`'s
+  `GOFLOW_FLOW_VERSIONS_DIR` (default `./data/flow_versions`) wires a
+  real one; a deployment that doesn't configure one behaves exactly as it
+  did before this existed. No pruning/TTL, matching the same accepted,
+  disclosed tradeoff `runstore` already has.
 
 ## Explicitly NOT in v1
 

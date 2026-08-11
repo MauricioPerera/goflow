@@ -47,7 +47,8 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatalf("runstore.NewFileStore: %v", err)
 	}
-	return NewServer(&catalog.GatedStore{Underlying: fs}, credStore, flowStore, runStore, "secret-token", "http://testserver")
+	versionStore := flowstore.NewMemoryVersionStore()
+	return NewServer(&catalog.GatedStore{Underlying: fs}, credStore, flowStore, runStore, versionStore, "secret-token", "http://testserver")
 }
 
 // credDir returns the on-disk directory backing the server's credentials
@@ -830,6 +831,160 @@ func TestPostFlows_Valid_201ListedMetadataOnly_GetFull(t *testing.T) {
 	trigger, _ := flow["trigger"].(map[string]any)
 	if trigger["type"] != string(model.TriggerEmpty) {
 		t.Fatalf("Flow.trigger.type = %v, want EMPTY", trigger["type"])
+	}
+}
+
+func TestFlowVersions_ListReflectsEachSave_NewestFirst(t *testing.T) {
+	srv := newTestServer(t)
+	def := validFlowDef("versioned")
+	if rec := do(t, srv, "POST", "/flows", def, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save 1: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	def.DisplayName = "Double It v2"
+	if rec := do(t, srv, "POST", "/flows", def, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save 2: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec := do(t, srv, "GET", "/flows/versioned/versions", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	versions, _ := m["versions"].([]any)
+	if len(versions) != 2 {
+		t.Fatalf("versions = %+v, want exactly 2", versions)
+	}
+}
+
+func TestFlowVersions_UnknownFlow_EmptyListNot404(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/flows/never-saved/versions", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	m := decode(t, rec)
+	versions, ok := m["versions"].([]any)
+	if !ok || len(versions) != 0 {
+		t.Fatalf("versions = %v, want an empty array", m["versions"])
+	}
+}
+
+func TestFlowVersions_NoAuth_401(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/flows/whatever/versions", nil, false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestFlowVersionGet_ReturnsFullDefinition(t *testing.T) {
+	srv := newTestServer(t)
+	def := validFlowDef("versioned-get")
+	if rec := do(t, srv, "POST", "/flows", def, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	listRec := do(t, srv, "GET", "/flows/versioned-get/versions", nil, true)
+	listBody := decode(t, listRec)
+	versions, _ := listBody["versions"].([]any)
+	if len(versions) != 1 {
+		t.Fatalf("versions = %+v, want exactly 1", versions)
+	}
+	first, _ := versions[0].(map[string]any)
+	id, _ := first["ID"].(string)
+	if id == "" {
+		t.Fatalf("version summary missing ID: %v", first)
+	}
+
+	rec := do(t, srv, "GET", "/flows/versioned-get/versions/"+id, nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	full := decode(t, rec)
+	definition, ok := full["Definition"].(map[string]any)
+	if !ok || definition["Name"] != "versioned-get" {
+		t.Fatalf("body = %v, want Definition.Name=versioned-get", full)
+	}
+}
+
+func TestFlowVersionGet_UnknownID_404(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", validFlowDef("v"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d", rec.Code)
+	}
+	rec := do(t, srv, "GET", "/flows/v/versions/never-saved", nil, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFlowVersionGet_WrongFlowName_404(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", validFlowDef("a"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save a: status = %d", rec.Code)
+	}
+	if rec := do(t, srv, "POST", "/flows", validFlowDef("b"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save b: status = %d", rec.Code)
+	}
+	listRec := do(t, srv, "GET", "/flows/a/versions", nil, true)
+	versions, _ := decode(t, listRec)["versions"].([]any)
+	first, _ := versions[0].(map[string]any)
+	id, _ := first["ID"].(string)
+
+	// a's version id, fetched through b's path — must 404, not leak a's version.
+	rec := do(t, srv, "GET", "/flows/b/versions/"+id, nil, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFlowVersionRollback_RestoresPastVersion(t *testing.T) {
+	srv := newTestServer(t)
+	original := validFlowDef("rollback-me")
+	if rec := do(t, srv, "POST", "/flows", original, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save original: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	listRec := do(t, srv, "GET", "/flows/rollback-me/versions", nil, true)
+	versions, _ := decode(t, listRec)["versions"].([]any)
+	firstVersion, _ := versions[0].(map[string]any)
+	originalVersionID, _ := firstVersion["ID"].(string)
+
+	broken := original
+	broken.DisplayName = "Broken Edit"
+	if rec := do(t, srv, "POST", "/flows", broken, true); rec.Code != http.StatusCreated {
+		t.Fatalf("save broken edit: status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec := do(t, srv, "POST", "/flows/rollback-me/versions/"+originalVersionID+"/rollback", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rollback: status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	restored := decode(t, rec)
+	if restored["DisplayName"] != "Double It" {
+		t.Fatalf("rollback response = %v, want DisplayName=Double It (the original)", restored)
+	}
+
+	getRec := do(t, srv, "GET", "/flows/rollback-me", nil, true)
+	current := decode(t, getRec)
+	if current["DisplayName"] != "Double It" {
+		t.Fatalf("current flow after rollback = %v, want DisplayName=Double It", current)
+	}
+
+	// Rollback goes through Save, so it recorded its OWN new version.
+	listRec = do(t, srv, "GET", "/flows/rollback-me/versions", nil, true)
+	versions, _ = decode(t, listRec)["versions"].([]any)
+	if len(versions) != 3 {
+		t.Fatalf("versions = %+v, want exactly 3 (original, broken edit, rollback)", versions)
+	}
+}
+
+func TestFlowVersionRollback_UnknownID_400(t *testing.T) {
+	srv := newTestServer(t)
+	if rec := do(t, srv, "POST", "/flows", validFlowDef("v"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("save: status = %d", rec.Code)
+	}
+	rec := do(t, srv, "POST", "/flows/v/versions/never-saved/rollback", nil, true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
 	}
 }
 

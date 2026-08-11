@@ -69,15 +69,19 @@ type Server struct {
 // Save/List/Delete are exposed; Get is for trusted Go callers. runStore may
 // be nil (recording disabled — see flowstore.RunWithHistory), though
 // cmd/server always supplies a real one, the same as it does for credStore
-// and flowStore. issuer is this server's externally-reachable base URL,
-// passed straight through to oauth.NewServer for its metadata.
-func NewServer(store catalog.Store, credStore credentials.Store, flowStore flowstore.Store, runStore runstore.Store, token, issuer string) *Server {
+// and flowStore. versionStore may ALSO be nil (version history disabled —
+// see flowstore.VersionRecord); wired onto the same *flowstore.GatedStore
+// this constructor already builds, so /flows (save) records a version the
+// exact same way it validates — one gate, not two independently-wired
+// concerns. issuer is this server's externally-reachable base URL, passed
+// straight through to oauth.NewServer for its metadata.
+func NewServer(store catalog.Store, credStore credentials.Store, flowStore flowstore.Store, runStore runstore.Store, versionStore flowstore.VersionStore, token, issuer string) *Server {
 	s := &Server{
 		store: store, credStore: credStore, runStore: runStore, token: token,
 		expectedBearer: []byte("Bearer " + token),
 		oauthSrv:       oauth.NewServer(token, issuer),
 	}
-	s.flowStore = &flowstore.GatedStore{Underlying: flowStore, BuildRegistry: s.buildRegistry}
+	s.flowStore = &flowstore.GatedStore{Underlying: flowStore, BuildRegistry: s.buildRegistry, Versions: versionStore}
 	return s
 }
 
@@ -105,6 +109,11 @@ func (s *Server) Handler() http.Handler {
 	// of pkg/engine — see handleFlowsExportJS.
 	mux.Handle("POST /flows/export/js", s.auth(http.HandlerFunc(s.handleFlowsExportJS)))
 	mux.Handle("POST /flows/{name}/export/js", s.auth(http.HandlerFunc(s.handleFlowExportJS)))
+	// /flows/{name}/versions* — every past version GatedStore.Save recorded
+	// for this flow, and rolling back to one — see handleFlowVersionsList.
+	mux.Handle("GET /flows/{name}/versions", s.auth(http.HandlerFunc(s.handleFlowVersionsList)))
+	mux.Handle("GET /flows/{name}/versions/{id}", s.auth(http.HandlerFunc(s.handleFlowVersionGet)))
+	mux.Handle("POST /flows/{name}/versions/{id}/rollback", s.auth(http.HandlerFunc(s.handleFlowVersionRollback)))
 	// POST /webhooks/{name} is deliberately NOT behind s.auth — see
 	// handleWebhook's doc comment for why and what gates it instead.
 	mux.HandleFunc("POST /webhooks/{name}", s.handleWebhook)
@@ -121,7 +130,7 @@ func (s *Server) Handler() http.Handler {
 	// where to find this resource's OAuth metadata on a 401, so a
 	// spec-compliant client discovers the flow below instead of just
 	// retrying the same bare token forever.
-	mux.Handle("POST /mcp", s.authMCP(mcpapi.NewHandler(s.flowStore, s.buildRegistry, s.credStore, s.runStore, s.store)))
+	mux.Handle("POST /mcp", s.authMCP(mcpapi.NewHandler(s.flowStore, s.buildRegistry, s.credStore, s.runStore, s.store, s.flowStore.Versions)))
 
 	// OAuth 2.1 endpoints (pkg/oauth) — deliberately NOT behind s.auth: they
 	// ARE the mechanism a client without a token yet uses to get one. See
@@ -364,6 +373,74 @@ func (s *Server) handleFlowDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "name": name})
+}
+
+// handleFlowVersionsList handles GET /flows/{name}/versions — every past
+// version GatedStore.Save recorded for this flow, metadata only (id,
+// flowName, savedAt — never the full Definition, same "listing stays
+// cheap" reasoning GET /runs already applies), newest first. Returns an
+// empty array both when the flow has no recorded versions yet and when
+// version history isn't configured on this server at all — a caller
+// can't distinguish the two from this response alone, matching how
+// goflow_list_runs/GET /runs already behave when historyStore is nil.
+func (s *Server) handleFlowVersionsList(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if s.flowStore.Versions == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"versions": []flowstore.VersionSummary{}})
+		return
+	}
+	versions, err := s.flowStore.Versions.ListForFlow(name)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"versions": versions})
+}
+
+// handleFlowVersionGet handles GET /flows/{name}/versions/{id} — the full
+// VersionRecord (including its complete Definition), so a caller can
+// inspect exactly what a past version looked like before deciding to roll
+// back to it. A missing id, or one belonging to a DIFFERENT flow than
+// {name}, both come back as 404 — the latter deliberately, so a caller
+// can't probe for another flow's version ids by guessing.
+func (s *Server) handleFlowVersionGet(w http.ResponseWriter, r *http.Request) {
+	name, id := r.PathValue("name"), r.PathValue("id")
+	if s.flowStore.Versions == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	rec, ok, err := s.flowStore.Versions.Get(id)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if !ok || rec.FlowName != name {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
+}
+
+// handleFlowVersionRollback handles POST /flows/{name}/versions/{id}/rollback
+// — restores {name} to version {id} via GatedStore.Rollback, which goes
+// through the exact same validation/example gate a live save already
+// does (a version whose target piece no longer exists in the CURRENT
+// registry is rejected, not silently restored) and records its OWN new
+// version entry (history only ever grows, never gets rewritten). Success
+// returns the restored FlowDefinition, the same shape GET /flows/{name}
+// already returns.
+func (s *Server) handleFlowVersionRollback(w http.ResponseWriter, r *http.Request) {
+	name, id := r.PathValue("name"), r.PathValue("id")
+	if err := s.flowStore.Rollback(name, id); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	def, ok, err := s.flowStore.Get(name)
+	if err != nil || !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, def)
 }
 
 // flowRunRequest is the body shape POST /flows/{name}/run expects. Both

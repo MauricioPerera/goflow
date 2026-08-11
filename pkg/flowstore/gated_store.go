@@ -2,7 +2,9 @@ package flowstore
 
 import (
 	"fmt"
+	"log"
 	"strings"
+	"time"
 
 	"goflow/pkg/flowvalidate"
 	"goflow/pkg/piece"
@@ -39,6 +41,13 @@ func FormatValidationErrors(errs []flowvalidate.ValidationError) string {
 type GatedStore struct {
 	Underlying    Store
 	BuildRegistry func() (*piece.Registry, error)
+	// Versions records an immutable snapshot of every successful Save,
+	// when configured — nil (the default) disables version history
+	// entirely, the same nil-means-off convention every optional Store
+	// in this project already uses. See VersionRecord's own doc comment
+	// for the full rationale and Rollback below for how a past version
+	// gets restored.
+	Versions VersionStore
 }
 
 // Save builds a fresh registry, runs ValidateExamples against def (which
@@ -51,6 +60,13 @@ type GatedStore struct {
 // Underlying.Save, with an error whose message is the formatted list of
 // every problem found — a flow with zero Examples behaves exactly as
 // before this field existed.
+//
+// On a successful Underlying.Save, if Versions is configured, def is
+// also recorded as a new VersionRecord — best-effort: a failure to WRITE
+// that record is logged and otherwise swallowed, the same
+// "already-completed operation must not become an error over an
+// audit-log hiccup" reasoning TriggerOnFailure's own history recording
+// already uses. The flow itself is already saved by that point regardless.
 func (s *GatedStore) Save(def FlowDefinition) error {
 	registry, err := s.BuildRegistry()
 	if err != nil {
@@ -59,7 +75,39 @@ func (s *GatedStore) Save(def FlowDefinition) error {
 	if errs := ValidateExamples(def, registry); len(errs) > 0 {
 		return fmt.Errorf("flowstore: flow %q failed validation: %s", def.Name, FormatValidationErrors(errs))
 	}
-	return s.Underlying.Save(def)
+	if err := s.Underlying.Save(def); err != nil {
+		return err
+	}
+	if s.Versions != nil {
+		if _, err := s.Versions.Save(VersionRecord{FlowName: def.Name, Definition: def, SavedAt: time.Now()}); err != nil {
+			log.Printf("flowstore: recording version of %q: %v", def.Name, err)
+		}
+	}
+	return nil
+}
+
+// Rollback restores flowName to a past version: fetches versionID from
+// Versions and calls Save with its Definition — reusing the EXACT same
+// validation/example gate a live edit already goes through (a version
+// whose target piece no longer exists in the CURRENT registry fails to
+// roll back, rather than silently restoring something broken right now),
+// and — since it goes through Save — recording its own new version entry
+// too, so rolling back never rewrites history, only extends it.
+func (s *GatedStore) Rollback(flowName, versionID string) error {
+	if s.Versions == nil {
+		return fmt.Errorf("flowstore: version history is not configured on this store")
+	}
+	rec, ok, err := s.Versions.Get(versionID)
+	if err != nil {
+		return fmt.Errorf("flowstore: resolving version %q: %w", versionID, err)
+	}
+	if !ok {
+		return fmt.Errorf("flowstore: no version %q", versionID)
+	}
+	if rec.FlowName != flowName {
+		return fmt.Errorf("flowstore: version %q belongs to flow %q, not %q", versionID, rec.FlowName, flowName)
+	}
+	return s.Save(rec.Definition)
 }
 
 // Get/List/Delete are pass-through to Underlying, without re-validating —

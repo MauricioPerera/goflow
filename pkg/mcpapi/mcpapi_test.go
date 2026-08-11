@@ -45,7 +45,7 @@ func gatedTestFlowStore(t *testing.T) (*flowstore.FileStore, *flowstore.GatedSto
 	if err != nil {
 		t.Fatalf("NewFileStore: %v", err)
 	}
-	return fs, &flowstore.GatedStore{Underlying: fs, BuildRegistry: emptyRegistryBuilder}
+	return fs, &flowstore.GatedStore{Underlying: fs, BuildRegistry: emptyRegistryBuilder, Versions: flowstore.NewMemoryVersionStore()}
 }
 
 // gatedTestCatalogStore is gatedTestFlowStore's counterpart for
@@ -78,7 +78,7 @@ func newHandlerWithFlows(t *testing.T, defs ...flowstore.FlowDefinition) *Handle
 			t.Fatalf("Save %q: %v", def.Name, err)
 		}
 	}
-	return NewHandler(gated, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), gatedTestCatalogStore())
+	return NewHandler(gated, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), gatedTestCatalogStore(), gated.Versions)
 }
 
 // newHandlerWithFlowsAndCreds is newHandlerWithFlows but also returns the
@@ -96,7 +96,7 @@ func newHandlerWithFlowsAndCreds(t *testing.T, defs ...flowstore.FlowDefinition)
 			t.Fatalf("Save %q: %v", def.Name, err)
 		}
 	}
-	return NewHandler(gated, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), gatedTestCatalogStore()), credStore
+	return NewHandler(gated, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), gatedTestCatalogStore(), gated.Versions), credStore
 }
 
 // newHandlerWithFlowsAndHistory is newHandlerWithFlows but also returns the
@@ -114,7 +114,7 @@ func newHandlerWithFlowsAndHistory(t *testing.T, defs ...flowstore.FlowDefinitio
 		}
 	}
 	historyStore := runstore.NewMemoryStore()
-	return NewHandler(gated, emptyRegistryBuilder, credStore, historyStore, gatedTestCatalogStore()), historyStore
+	return NewHandler(gated, emptyRegistryBuilder, credStore, historyStore, gatedTestCatalogStore(), gated.Versions), historyStore
 }
 
 // newHandlerWithFlowsAndCatalog is newHandlerWithFlows but also returns the
@@ -134,7 +134,7 @@ func newHandlerWithFlowsAndCatalog(t *testing.T, defs ...flowstore.FlowDefinitio
 		}
 	}
 	catalogStore := gatedTestCatalogStore()
-	return NewHandler(gated, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), catalogStore), catalogStore
+	return NewHandler(gated, emptyRegistryBuilder, credStore, runstore.NewMemoryStore(), catalogStore, gated.Versions), catalogStore
 }
 
 // doublesArgFlow is a "double it" flow that reads n from the TRIGGER payload
@@ -1007,6 +1007,154 @@ func TestSaveFlow_ReferencesMissingPiece_IsErrorTrueNotPersisted(t *testing.T) {
 	getResult := callTool(t, h, toolGetFlow, map[string]any{"name": "broken"})
 	if getResult["isError"] != true {
 		t.Fatalf("goflow_get_flow(broken) isError = %v, want true — a gate-rejected flow must never be persisted", getResult["isError"])
+	}
+}
+
+func TestListFlowVersions_ReflectsEachSave(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	if r := callTool(t, h, toolSaveFlow, map[string]any{"name": "v", "flow": flowVersionJSON()}); r["isError"] != false {
+		t.Fatalf("save 1 isError = %v: %v", r["isError"], r)
+	}
+	if r := callTool(t, h, toolSaveFlow, map[string]any{"name": "v", "displayName": "v2", "flow": flowVersionJSON()}); r["isError"] != false {
+		t.Fatalf("save 2 isError = %v: %v", r["isError"], r)
+	}
+
+	result := callTool(t, h, toolListFlowVersions, map[string]any{"name": "v"})
+	if result["isError"] != false {
+		t.Fatalf("isError = %v: %v", result["isError"], result)
+	}
+	var body struct {
+		Versions []map[string]any `json:"versions"`
+	}
+	toolText(t, result, &body)
+	if len(body.Versions) != 2 {
+		t.Fatalf("versions = %+v, want exactly 2", body.Versions)
+	}
+}
+
+func TestListFlowVersions_UnknownFlow_EmptyList(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolListFlowVersions, map[string]any{"name": "never-saved"})
+	if result["isError"] != false {
+		t.Fatalf("isError = %v: %v", result["isError"], result)
+	}
+	var body struct {
+		Versions []map[string]any `json:"versions"`
+	}
+	toolText(t, result, &body)
+	if len(body.Versions) != 0 {
+		t.Fatalf("versions = %+v, want empty", body.Versions)
+	}
+}
+
+func TestListFlowVersions_MissingName_IsErrorTrue(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolListFlowVersions, map[string]any{})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true when name is missing", result["isError"])
+	}
+}
+
+func TestGetFlowVersion_ReturnsFullDefinition(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	if r := callTool(t, h, toolSaveFlow, map[string]any{"name": "v", "flow": flowVersionJSON()}); r["isError"] != false {
+		t.Fatalf("save isError = %v: %v", r["isError"], r)
+	}
+	listResult := callTool(t, h, toolListFlowVersions, map[string]any{"name": "v"})
+	var list struct {
+		Versions []struct {
+			ID string `json:"ID"`
+		} `json:"versions"`
+	}
+	toolText(t, listResult, &list)
+	if len(list.Versions) != 1 {
+		t.Fatalf("versions = %+v, want exactly 1", list.Versions)
+	}
+
+	result := callTool(t, h, toolGetFlowVersion, map[string]any{"name": "v", "versionId": list.Versions[0].ID})
+	if result["isError"] != false {
+		t.Fatalf("isError = %v: %v", result["isError"], result)
+	}
+	var rec struct {
+		FlowName   string `json:"FlowName"`
+		Definition struct {
+			Name string `json:"Name"`
+		} `json:"Definition"`
+	}
+	toolText(t, result, &rec)
+	if rec.FlowName != "v" || rec.Definition.Name != "v" {
+		t.Fatalf("version record = %+v, want FlowName/Definition.Name = v", rec)
+	}
+}
+
+func TestGetFlowVersion_WrongFlowName_IsErrorTrue(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	if r := callTool(t, h, toolSaveFlow, map[string]any{"name": "a", "flow": flowVersionJSON()}); r["isError"] != false {
+		t.Fatalf("save a isError = %v: %v", r["isError"], r)
+	}
+	if r := callTool(t, h, toolSaveFlow, map[string]any{"name": "b", "flow": flowVersionJSON()}); r["isError"] != false {
+		t.Fatalf("save b isError = %v: %v", r["isError"], r)
+	}
+	listResult := callTool(t, h, toolListFlowVersions, map[string]any{"name": "a"})
+	var list struct {
+		Versions []struct {
+			ID string `json:"ID"`
+		} `json:"versions"`
+	}
+	toolText(t, listResult, &list)
+
+	result := callTool(t, h, toolGetFlowVersion, map[string]any{"name": "b", "versionId": list.Versions[0].ID})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true — a's version id fetched through b must not resolve", result["isError"])
+	}
+}
+
+func TestRollbackFlowVersion_RestoresPastVersion(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	if r := callTool(t, h, toolSaveFlow, map[string]any{"name": "v", "displayName": "original", "flow": flowVersionJSON()}); r["isError"] != false {
+		t.Fatalf("save original isError = %v: %v", r["isError"], r)
+	}
+	listResult := callTool(t, h, toolListFlowVersions, map[string]any{"name": "v"})
+	var list struct {
+		Versions []struct {
+			ID string `json:"ID"`
+		} `json:"versions"`
+	}
+	toolText(t, listResult, &list)
+	originalVersionID := list.Versions[0].ID
+
+	if r := callTool(t, h, toolSaveFlow, map[string]any{"name": "v", "displayName": "broken edit", "flow": flowVersionJSON()}); r["isError"] != false {
+		t.Fatalf("save broken edit isError = %v: %v", r["isError"], r)
+	}
+
+	result := callTool(t, h, toolRollbackFlowVersion, map[string]any{"name": "v", "versionId": originalVersionID})
+	if result["isError"] != false {
+		t.Fatalf("rollback isError = %v: %v", result["isError"], result)
+	}
+	var restored struct {
+		DisplayName string `json:"DisplayName"`
+	}
+	toolText(t, result, &restored)
+	if restored.DisplayName != "original" {
+		t.Fatalf("restored = %+v, want DisplayName=original", restored)
+	}
+
+	// Rollback goes through Save, so it recorded its OWN new version.
+	listResult = callTool(t, h, toolListFlowVersions, map[string]any{"name": "v"})
+	toolText(t, listResult, &list)
+	if len(list.Versions) != 3 {
+		t.Fatalf("versions = %+v, want exactly 3 (original, broken edit, rollback)", list.Versions)
+	}
+}
+
+func TestRollbackFlowVersion_UnknownID_IsErrorTrue(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	if r := callTool(t, h, toolSaveFlow, map[string]any{"name": "v", "flow": flowVersionJSON()}); r["isError"] != false {
+		t.Fatalf("save isError = %v: %v", r["isError"], r)
+	}
+	result := callTool(t, h, toolRollbackFlowVersion, map[string]any{"name": "v", "versionId": "never-saved"})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true", result["isError"])
 	}
 }
 

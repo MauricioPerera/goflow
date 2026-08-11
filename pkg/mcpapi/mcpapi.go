@@ -20,27 +20,30 @@
 // tiers on purpose, so mutating power didn't land bundled with what was
 // initially a pure discoverability improvement: goflow_describe_catalog,
 // goflow_export_catalog, goflow_list_flows, goflow_get_flow,
-// goflow_list_runs, goflow_get_run, and goflow_export_flow_js are
-// read-only (export runs no code and persists nothing, whether given a
-// saved flow's name or an ad-hoc one — see toolExportFlowJS's own
-// description; goflow_export_catalog is the same idea for a JS-authored
-// piece's full Definition, since goflow_describe_catalog's own text is
-// lossy on purpose — see toolExportCatalog's own description);
-// goflow_save_flow, goflow_delete_flow,
-// goflow_save_piece, goflow_delete_piece, goflow_list_credentials,
-// goflow_save_credential, and goflow_delete_credential mutate state — the
-// exact same mutations POST/DELETE /flows, POST/DELETE /pieces, and
-// POST/GET/DELETE /credentials already allow over HTTP, through the exact
-// same underlying Store calls (including catalog.GatedStore's and
-// flowstore.GatedStore's validation gates — a tool call can't bypass
-// either), just reachable without HTTP. goflow_run_flow fits neither tier
-// cleanly — it has the same real side effects any flow run can (a PIECE
-// action can call a real API, use a credential, ...) but persists nothing
-// of its own — so it's described on its own terms: the MCP equivalent of
-// POST /flows/run, closing the one asymmetry left after the rest of this
-// tier shipped — an MCP-only client could save/delete/run a NAMED flow but
-// had no way to try an inline one first, the way POST /flows/run already
-// lets an HTTP caller do before ever committing to goflow_save_flow.
+// goflow_list_runs, goflow_get_run, goflow_export_flow_js,
+// goflow_list_flow_versions, and goflow_get_flow_version are read-only
+// (export runs no code and persists nothing, whether given a saved
+// flow's name or an ad-hoc one — see toolExportFlowJS's own description;
+// goflow_export_catalog is the same idea for a JS-authored piece's full
+// Definition, since goflow_describe_catalog's own text is lossy on
+// purpose — see toolExportCatalog's own description; the two flow-version
+// tools only ever READ what GatedStore.Save already recorded, see
+// VersionRecord's own doc comment); goflow_save_flow, goflow_delete_flow,
+// goflow_rollback_flow_version, goflow_save_piece, goflow_delete_piece,
+// goflow_list_credentials, goflow_save_credential, and
+// goflow_delete_credential mutate state — the exact same mutations
+// POST/DELETE /flows, POST/DELETE /pieces, and POST/GET/DELETE
+// /credentials already allow over HTTP, through the exact same underlying
+// Store calls (including catalog.GatedStore's and flowstore.GatedStore's
+// validation gates — a tool call can't bypass either), just reachable
+// without HTTP. goflow_run_flow fits neither tier cleanly — it has the
+// same real side effects any flow run can (a PIECE action can call a real
+// API, use a credential, ...) but persists nothing of its own — so it's
+// described on its own terms: the MCP equivalent of POST /flows/run,
+// closing the one asymmetry left after the rest of this tier shipped —
+// an MCP-only client could save/delete/run a NAMED flow but had no way
+// to try an inline one first, the way POST /flows/run already lets an
+// HTTP caller do before ever committing to goflow_save_flow.
 //
 // Everything here is encoding/json + net/http — JSON-RPC 2.0 is simple enough
 // that pulling in a library would add a dependency for nothing, matching the
@@ -91,17 +94,27 @@ type Handler struct {
 	// Required, not nil-tolerant, matching how pkg/httpapi never treats its
 	// own catalog store as optional either.
 	CatalogStore catalog.Store
+	// VersionStore backs goflow_list_flow_versions/goflow_get_flow_version/
+	// goflow_rollback_flow_version — the same flowstore.VersionStore GET
+	// /flows/{name}/versions* reads and writes. A separate field (not
+	// reached through FlowStore, which is typed as the plain flowstore.Store
+	// interface — Save/Get/List/Delete only, no Rollback/Versions) rather
+	// than type-asserting FlowStore down to a *flowstore.GatedStore: this
+	// stays test-flexible the same way FlowStore's own interface typing
+	// already is. May be nil (version history disabled), matching every
+	// other optional Store in this Handler.
+	VersionStore flowstore.VersionStore
 }
 
 // NewHandler returns a Handler wired to flowStore, buildRegistry, credStore,
-// historyStore, and catalogStore. It is the caller's job to gate it with auth
-// (httpapi.Server mounts it behind its bearer-token middleware, same as
-// every other route); this package does not know about auth on purpose —
-// pkg/httpapi owns that concern.
-func NewHandler(flowStore flowstore.Store, buildRegistry func() (*piece.Registry, error), credStore credentials.Store, historyStore runstore.Store, catalogStore catalog.Store) *Handler {
+// historyStore, catalogStore, and versionStore. It is the caller's job to
+// gate it with auth (httpapi.Server mounts it behind its bearer-token
+// middleware, same as every other route); this package does not know about
+// auth on purpose — pkg/httpapi owns that concern.
+func NewHandler(flowStore flowstore.Store, buildRegistry func() (*piece.Registry, error), credStore credentials.Store, historyStore runstore.Store, catalogStore catalog.Store, versionStore flowstore.VersionStore) *Handler {
 	return &Handler{
 		FlowStore: flowStore, BuildRegistry: buildRegistry, CredStore: credStore,
-		HistoryStore: historyStore, CatalogStore: catalogStore,
+		HistoryStore: historyStore, CatalogStore: catalogStore, VersionStore: versionStore,
 	}
 }
 
@@ -115,41 +128,47 @@ func NewHandler(flowStore flowstore.Store, buildRegistry func() (*piece.Registry
 // MCP tool-name slot is shadowed), keeping tools/list and tools/call
 // consistent about what a reserved name resolves to.
 const (
-	toolDescribeCatalog = "goflow_describe_catalog"
-	toolListFlows       = "goflow_list_flows"
-	toolGetFlow         = "goflow_get_flow"
-	toolListRuns        = "goflow_list_runs"
-	toolGetRun          = "goflow_get_run"
-	toolExportFlowJS    = "goflow_export_flow_js"
-	toolExportCatalog   = "goflow_export_catalog"
+	toolDescribeCatalog  = "goflow_describe_catalog"
+	toolListFlows        = "goflow_list_flows"
+	toolGetFlow          = "goflow_get_flow"
+	toolListRuns         = "goflow_list_runs"
+	toolGetRun           = "goflow_get_run"
+	toolExportFlowJS     = "goflow_export_flow_js"
+	toolExportCatalog    = "goflow_export_catalog"
+	toolListFlowVersions = "goflow_list_flow_versions"
+	toolGetFlowVersion   = "goflow_get_flow_version"
 
-	toolSaveFlow         = "goflow_save_flow"
-	toolDeleteFlow       = "goflow_delete_flow"
-	toolRunFlow          = "goflow_run_flow"
-	toolSavePiece        = "goflow_save_piece"
-	toolDeletePiece      = "goflow_delete_piece"
-	toolListCredentials  = "goflow_list_credentials"
-	toolSaveCredential   = "goflow_save_credential"
-	toolDeleteCredential = "goflow_delete_credential"
+	toolSaveFlow            = "goflow_save_flow"
+	toolDeleteFlow          = "goflow_delete_flow"
+	toolRunFlow             = "goflow_run_flow"
+	toolRollbackFlowVersion = "goflow_rollback_flow_version"
+	toolSavePiece           = "goflow_save_piece"
+	toolDeletePiece         = "goflow_delete_piece"
+	toolListCredentials     = "goflow_list_credentials"
+	toolSaveCredential      = "goflow_save_credential"
+	toolDeleteCredential    = "goflow_delete_credential"
 )
 
 var reservedToolNames = map[string]bool{
-	toolDescribeCatalog: true,
-	toolListFlows:       true,
-	toolGetFlow:         true,
-	toolListRuns:        true,
-	toolGetRun:          true,
-	toolExportFlowJS:    true,
-	toolExportCatalog:   true,
+	toolDescribeCatalog:  true,
+	toolListFlows:        true,
+	toolGetFlow:          true,
+	toolListRuns:         true,
+	toolGetRun:           true,
+	toolExportFlowJS:     true,
+	toolExportCatalog:    true,
+	toolListFlowVersions: true,
+	toolGetFlowVersion:   true,
 
-	toolSaveFlow:         true,
-	toolDeleteFlow:       true,
-	toolRunFlow:          true,
-	toolSavePiece:        true,
-	toolDeletePiece:      true,
-	toolListCredentials:  true,
-	toolSaveCredential:   true,
-	toolDeleteCredential: true,
+	toolSaveFlow:            true,
+	toolDeleteFlow:          true,
+	toolRunFlow:             true,
+	toolRollbackFlowVersion: true,
+	toolSavePiece:           true,
+	toolDeletePiece:         true,
+	toolListCredentials:     true,
+	toolSaveCredential:      true,
+	toolDeleteCredential:    true,
 }
 
 // metaToolDescriptors is the tools/list entry for each reserved name above.
@@ -207,6 +226,27 @@ func metaToolDescriptors() []map[string]any {
 			},
 		},
 		{
+			"name":        toolListFlowVersions,
+			"description": "List every past version of a saved flow, metadata only (id, savedAt), newest first — one entry per time it was successfully saved (GatedStore.Save records one automatically). Returns an empty array both when the flow has none yet and when version history isn't configured on this server at all.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"name": map[string]any{"type": "string", "description": "the flow's name"}},
+				"required":   []string{"name"},
+			},
+		},
+		{
+			"name":        toolGetFlowVersion,
+			"description": "Get one past version's full FlowDefinition by id (from goflow_list_flow_versions) — exactly what that version looked like when it was saved, so you can inspect it before deciding whether to goflow_rollback_flow_version to it.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name":      map[string]any{"type": "string", "description": "the flow's name"},
+					"versionId": map[string]any{"type": "string", "description": "a version id from goflow_list_flow_versions"},
+				},
+				"required": []string{"name", "versionId"},
+			},
+		},
+		{
 			"name":        toolExportFlowJS,
 			"description": "Export a flow to a single, self-contained JavaScript file (pkg/exportjs) — runnable directly in Node or a browser with no goflow/goja/Go dependency at all. Only a flow made of an EMPTY trigger plus a linear chain of CODE-only actions can be exported (no ROUTER, LOOP_ON_ITEMS, PIECE action, or PIECE_TRIGGER); anything else is rejected with a message naming every unsupported trigger/action, not just the first. Provide exactly one of \"name\" (export a saved flow) or \"flow\" (export an ad-hoc one, without saving it — same shape as goflow_run_flow's \"flow\" argument). Runs no code and persists nothing either way.",
 			"inputSchema": map[string]any{
@@ -247,6 +287,18 @@ func metaToolDescriptors() []map[string]any {
 				"type":       "object",
 				"properties": map[string]any{"name": map[string]any{"type": "string"}},
 				"required":   []string{"name"},
+			},
+		},
+		{
+			"name":        toolRollbackFlowVersion,
+			"description": "Restore a flow to a past version (id from goflow_list_flow_versions) — fetches that version's Definition and saves it again, going through the EXACT SAME validation/example gate goflow_save_flow already applies (a version whose target piece no longer exists in the CURRENT catalog fails to roll back, rather than silently restoring something broken now). Records its own new version entry too, same as any other save — history only ever grows, a rollback never rewrites it. Fails if versionId belongs to a different flow than name.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name":      map[string]any{"type": "string", "description": "the flow's name"},
+					"versionId": map[string]any{"type": "string", "description": "a version id from goflow_list_flow_versions"},
+				},
+				"required": []string{"name", "versionId"},
 			},
 		},
 		{
@@ -454,6 +506,54 @@ func (h *Handler) callGetRun(w http.ResponseWriter, req rawRequest, args map[str
 	writeToolText(w, req.ID, false, rec)
 }
 
+// callListFlowVersions lists every past version recorded for args["name"],
+// metadata only, newest first. Returns an empty list both when the flow
+// has none yet and when h.VersionStore is nil — a caller can't
+// distinguish the two from this result alone, matching how
+// goflow_list_runs/GET /runs already behave when their own history store
+// is nil.
+func (h *Handler) callListFlowVersions(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	name, _ := args["name"].(string)
+	if name == "" {
+		writeToolText(w, req.ID, true, "missing required argument: name")
+		return
+	}
+	if h.VersionStore == nil {
+		writeToolText(w, req.ID, false, map[string]any{"versions": []flowstore.VersionSummary{}})
+		return
+	}
+	versions, err := h.VersionStore.ListForFlow(name)
+	if err != nil {
+		writeError(w, req.ID, -32603, "internal error: "+err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, map[string]any{"versions": versions})
+}
+
+// callGetFlowVersion returns one version's full VersionRecord (including
+// its complete Definition) by id. A missing id, or one belonging to a
+// DIFFERENT flow than args["name"], both come back as the same "no
+// version" tool error — the latter deliberately, so a caller can't probe
+// for another flow's version ids by guessing.
+func (h *Handler) callGetFlowVersion(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	name, _ := args["name"].(string)
+	versionID, _ := args["versionId"].(string)
+	if name == "" || versionID == "" {
+		writeToolText(w, req.ID, true, "missing required argument: name and versionId are both required")
+		return
+	}
+	if h.VersionStore == nil {
+		writeToolText(w, req.ID, true, "version history is not configured on this server")
+		return
+	}
+	rec, ok, err := h.VersionStore.Get(versionID)
+	if err != nil || !ok || rec.FlowName != name {
+		writeToolText(w, req.ID, true, fmt.Sprintf("no version %q for flow %q", versionID, name))
+		return
+	}
+	writeToolText(w, req.ID, false, rec)
+}
+
 // callExportFlowJS resolves fv from exactly one of args["name"] (a saved
 // flow, fetched through h.FlowStore — the same store goflow_get_flow reads)
 // or args["flow"] (an ad-hoc one, decoded the same way callRunFlow decodes
@@ -565,6 +665,43 @@ func (h *Handler) callDeleteFlow(w http.ResponseWriter, req rawRequest, args map
 		return
 	}
 	writeToolText(w, req.ID, false, map[string]any{"deleted": true, "name": name})
+}
+
+// callRollbackFlowVersion restores args["name"] to the version named by
+// args["versionId"]: fetches it from h.VersionStore and calls
+// h.FlowStore.Save with its Definition — h.FlowStore is a GatedStore in
+// production, so this goes through the EXACT SAME validation/example gate
+// goflow_save_flow already applies (a version referencing a piece no
+// longer in the CURRENT registry fails to roll back, rather than
+// silently restoring something broken now), and that same Save call
+// records its own new version entry too, so rolling back only ever
+// extends history, never rewrites it.
+func (h *Handler) callRollbackFlowVersion(w http.ResponseWriter, req rawRequest, args map[string]any) {
+	name, _ := args["name"].(string)
+	versionID, _ := args["versionId"].(string)
+	if name == "" || versionID == "" {
+		writeToolText(w, req.ID, true, "missing required argument: name and versionId are both required")
+		return
+	}
+	if h.VersionStore == nil {
+		writeToolText(w, req.ID, true, "version history is not configured on this server")
+		return
+	}
+	rec, ok, err := h.VersionStore.Get(versionID)
+	if err != nil || !ok || rec.FlowName != name {
+		writeToolText(w, req.ID, true, fmt.Sprintf("no version %q for flow %q", versionID, name))
+		return
+	}
+	if err := h.FlowStore.Save(rec.Definition); err != nil {
+		writeToolText(w, req.ID, true, err.Error())
+		return
+	}
+	def, ok, err := h.FlowStore.Get(name)
+	if err != nil || !ok {
+		writeError(w, req.ID, -32603, "internal error: "+err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, def)
 }
 
 // callSavePiece authors (creates or overwrites) a JS-authored piece through
@@ -885,6 +1022,12 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 	case toolGetRun:
 		h.callGetRun(w, req, params.Arguments)
 		return
+	case toolListFlowVersions:
+		h.callListFlowVersions(w, req, params.Arguments)
+		return
+	case toolGetFlowVersion:
+		h.callGetFlowVersion(w, req, params.Arguments)
+		return
 	case toolExportFlowJS:
 		h.callExportFlowJS(w, req, params.Arguments)
 		return
@@ -896,6 +1039,9 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 		return
 	case toolRunFlow:
 		h.callRunFlow(w, req, params.Arguments)
+		return
+	case toolRollbackFlowVersion:
+		h.callRollbackFlowVersion(w, req, params.Arguments)
 		return
 	case toolSavePiece:
 		h.callSavePiece(w, req, params.Arguments)
