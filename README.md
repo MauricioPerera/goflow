@@ -1584,7 +1584,7 @@ go run ./examples
   `pkg/jspiece`'s own isolated registry.** `pkg/jspiece`'s existing tests
   (including one full engine flow) all used a bare `piece.NewRegistry()`
   with only the JS piece in it — never proved a JS piece coexists safely
-  with `pieces.RegisterAll`'s thirteen Go pieces in the same registry, or
+  with `pieces.RegisterAll`'s seventeen Go pieces in the same registry, or
   that its output/input actually composes with real catalog pieces through
   `{{ }}` templating in both directions.
   `TestCatalog_JSPieceComposesWithRealCatalog`

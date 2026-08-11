@@ -795,7 +795,7 @@ func TestJSONDefinedFlow_ExecutesThroughRealCatalog(t *testing.T) {
 
 // TestCatalog_JSPieceComposesWithRealCatalog proves a JS-authored piece
 // (pkg/jspiece) coexists in the same registry as the full Go catalog with
-// no special-casing — registered alongside pieces.RegisterAll's thirteen
+// no special-casing — registered alongside pieces.RegisterAll's seventeen
 // Go pieces, chained through {{ }} templating both directions (a real
 // catalog trigger feeds it, its own output feeds a real catalog piece),
 // and persisted through pkg/pieces/storage. The pure-logic risk scoring
