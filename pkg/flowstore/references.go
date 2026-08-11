@@ -32,7 +32,7 @@ func FindFlowsReferencingCredential(store Store, credentialName string) ([]strin
 	if err != nil {
 		return nil, err
 	}
-	var names []string
+	names := []string{}
 	for _, def := range defs {
 		if def.WebhookSecretCredential == credentialName {
 			names = append(names, def.Name)
@@ -89,7 +89,7 @@ func FindFlowsReferencingPiece(store Store, pieceName string) ([]string, error) 
 	if err != nil {
 		return nil, err
 	}
-	var names []string
+	names := []string{}
 	for _, def := range defs {
 		if flowReferencesPiece(def.Flow, pieceName) {
 			names = append(names, def.Name)

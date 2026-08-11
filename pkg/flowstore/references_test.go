@@ -143,6 +143,9 @@ func TestFindFlowsReferencingCredential_NoMatches_EmptyNotError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindFlowsReferencingCredential: %v", err)
 	}
+	if names == nil {
+		t.Fatal("names = nil, want a non-nil empty slice — marshals as JSON null instead of [], which breaks a strictly-typed caller")
+	}
 	if len(names) != 0 {
 		t.Fatalf("names = %v, want empty", names)
 	}
@@ -278,6 +281,9 @@ func TestFindFlowsReferencingPiece_NoMatches_EmptyNotError(t *testing.T) {
 	names, err := FindFlowsReferencingPiece(store, "never-used")
 	if err != nil {
 		t.Fatalf("FindFlowsReferencingPiece: %v", err)
+	}
+	if names == nil {
+		t.Fatal("names = nil, want a non-nil empty slice — marshals as JSON null instead of [], which breaks a strictly-typed caller")
 	}
 	if len(names) != 0 {
 		t.Fatalf("names = %v, want empty", names)
