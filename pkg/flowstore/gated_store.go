@@ -41,17 +41,22 @@ type GatedStore struct {
 	BuildRegistry func() (*piece.Registry, error)
 }
 
-// Save builds a fresh registry, runs flowvalidate.Validate against def.Flow,
-// and — if it passes — delegates to Underlying.Save. A BuildRegistry failure
-// is propagated wrapped in context (never reaches Validate or Underlying). A
-// validation failure is rejected without calling Underlying.Save, with an
-// error whose message is the formatted list of every problem found.
+// Save builds a fresh registry, runs ValidateExamples against def (which
+// itself runs flowvalidate.Validate first, then actually EXECUTES every
+// def.Examples case if that passes — see ValidateExamples's own doc
+// comment for exactly what that does and doesn't cover), and — if it
+// passes — delegates to Underlying.Save. A BuildRegistry failure is
+// propagated wrapped in context (never reaches validation or Underlying).
+// A validation or example failure is rejected without calling
+// Underlying.Save, with an error whose message is the formatted list of
+// every problem found — a flow with zero Examples behaves exactly as
+// before this field existed.
 func (s *GatedStore) Save(def FlowDefinition) error {
 	registry, err := s.BuildRegistry()
 	if err != nil {
 		return fmt.Errorf("flowstore: building registry for %q: %w", def.Name, err)
 	}
-	if errs := flowvalidate.Validate(&def.Flow, registry); len(errs) > 0 {
+	if errs := ValidateExamples(def, registry); len(errs) > 0 {
 		return fmt.Errorf("flowstore: flow %q failed validation: %s", def.Name, FormatValidationErrors(errs))
 	}
 	return s.Underlying.Save(def)

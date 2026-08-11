@@ -794,6 +794,38 @@ below for what a Go rewrite gets and gives up.
   instead. `pkg/exportjs` rejects `CALL_FLOW` the same way it already
   rejects `ROUTER`/`LOOP_ON_ITEMS`/`PIECE` — a generated standalone JS
   file has no flow store to look another flow up in either.
+- **A quality gate for flows** (`flowstore.FlowDefinition.Examples`,
+  `flowstore.ValidateExamples`): catalog PIECES have always required at
+  least one worked `Example`, actually RUN before `GatedStore.Save`
+  persists them — but a FLOW had no equivalent: `flowvalidate.Validate`
+  only ever checked structure (JS syntax, well-formed templates, a
+  referenced piece exists), never behavior, so a broken flow only
+  surfaced the first time something actually ran it. `Examples` closes
+  that gap, but deliberately stays OPTIONAL — unlike a piece's mandatory
+  one, since every flow saved before this field existed (every flow
+  saved this whole project so far) has none, and requiring them now
+  would start rejecting flows that always saved fine; empty means
+  exactly the save behavior this project already had. Each
+  `FlowExample` — `{Description, Trigger, ExecuteTrigger, WantError,
+  CheckOutputs, WantStepOutputs}` — runs through the same `Run` path
+  everything else uses. Unlike a piece example (one action, one return
+  value), `WantStepOutputs` lets the author name WHICH step(s) to assert
+  on (deep JSON equality against that step's `Output` only — not the
+  whole `Steps` map, which would drag in per-run noise like `DurationMs`
+  that was never the point). `ValidateExamples` runs
+  `flowvalidate.Validate` first and, deliberately diverging from
+  `catalog.Validate`'s own precedent, skips every example entirely if
+  that reports anything — a piece example is still safe to attempt
+  against a merely mis-described piece, but actually EXECUTING a flow
+  with invalid JS or a malformed template is not safe, or even
+  meaningful, to attempt. Every example that IS attempted runs regardless
+  of an earlier one's failure (same "report everything" convention
+  `flowvalidate.Validate` itself already follows). Two disclosed
+  limits, matching `catalog.Example.Auth`'s own precedent: no
+  `credentials.Store` (an auth value inside `Trigger` must be a literal,
+  not a `$credential` reference) and no `CALL_FLOW` support (an example
+  containing one fails with "not enabled" unless `WantError` is set) —
+  real added scope this doesn't take on yet.
 
 ## Explicitly NOT in v1
 

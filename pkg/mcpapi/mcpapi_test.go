@@ -1010,6 +1010,52 @@ func TestSaveFlow_ReferencesMissingPiece_IsErrorTrueNotPersisted(t *testing.T) {
 	}
 }
 
+func TestSaveFlow_ExamplePasses_Saved(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolSaveFlow, map[string]any{
+		"name": "double-it", "flow": flowVersionJSON(),
+		"examples": []any{
+			map[string]any{
+				"description": "doubles 21", "trigger": map[string]any{"n": 21},
+				"checkOutputs": true,
+				"wantStepOutputs": map[string]any{
+					"double": map[string]any{"doubled": 42},
+				},
+			},
+		},
+	})
+	if result["isError"] != false {
+		t.Fatalf("save_flow isError = %v, want false: %v", result["isError"], result)
+	}
+	getResult := callTool(t, h, toolGetFlow, map[string]any{"name": "double-it"})
+	if getResult["isError"] != false {
+		t.Fatalf("get_flow after save isError = %v, want false", getResult["isError"])
+	}
+}
+
+func TestSaveFlow_ExampleFails_IsErrorTrueNotPersisted(t *testing.T) {
+	h := newHandlerWithFlows(t)
+	result := callTool(t, h, toolSaveFlow, map[string]any{
+		"name": "double-it-wrong", "flow": flowVersionJSON(),
+		"examples": []any{
+			map[string]any{
+				"description": "wrong expectation", "trigger": map[string]any{"n": 21},
+				"checkOutputs": true,
+				"wantStepOutputs": map[string]any{
+					"double": map[string]any{"doubled": 999},
+				},
+			},
+		},
+	})
+	if result["isError"] != true {
+		t.Fatalf("isError = %v, want true — the example's expectation doesn't match", result["isError"])
+	}
+	getResult := callTool(t, h, toolGetFlow, map[string]any{"name": "double-it-wrong"})
+	if getResult["isError"] != true {
+		t.Fatalf("goflow_get_flow after a rejected save isError = %v, want true — never persisted", getResult["isError"])
+	}
+}
+
 func TestSaveFlow_MissingName_IsErrorTrue(t *testing.T) {
 	h := newHandlerWithFlows(t)
 	result := callTool(t, h, toolSaveFlow, map[string]any{"flow": flowVersionJSON()})

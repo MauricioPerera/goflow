@@ -730,6 +730,58 @@ func TestPostFlows_ReferencesNonexistentPiece_400NotPersisted(t *testing.T) {
 	}
 }
 
+func doubleFlowVersion() model.FlowVersion {
+	return model.FlowVersion{
+		ID: "fv-double",
+		Trigger: &model.FlowTrigger{
+			Name: "trigger_1", DisplayName: "Trigger", Type: model.TriggerEmpty,
+			NextAction: &model.FlowAction{
+				Name: "double", DisplayName: "Double", Type: model.ActionCode,
+				Code: &model.CodeSettings{
+					Input:  map[string]any{"n": "{{ trigger_1.output.n }}"},
+					Source: `(params) => ({ doubled: params.n * 2 })`,
+				},
+			},
+		},
+	}
+}
+
+func TestPostFlows_ExamplePasses_201(t *testing.T) {
+	srv := newTestServer(t)
+	def := flowstore.FlowDefinition{
+		Name: "double-it", DisplayName: "Double It", Flow: doubleFlowVersion(),
+		Examples: []flowstore.FlowExample{{
+			Description: "doubles 21", Trigger: map[string]any{"n": 21},
+			CheckOutputs:    true,
+			WantStepOutputs: map[string]any{"double": map[string]any{"doubled": 42}},
+		}},
+	}
+	rec := do(t, srv, "POST", "/flows", def, true)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPostFlows_ExampleFails_400NotPersisted(t *testing.T) {
+	srv := newTestServer(t)
+	def := flowstore.FlowDefinition{
+		Name: "double-it-wrong", DisplayName: "Double It Wrong", Flow: doubleFlowVersion(),
+		Examples: []flowstore.FlowExample{{
+			Description: "wrong expectation", Trigger: map[string]any{"n": 21},
+			CheckOutputs:    true,
+			WantStepOutputs: map[string]any{"double": map[string]any{"doubled": 999}},
+		}},
+	}
+	rec := do(t, srv, "POST", "/flows", def, true)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, srv, "GET", "/flows/double-it-wrong", nil, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET after rejected save: status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestPostFlows_Valid_201ListedMetadataOnly_GetFull(t *testing.T) {
 	srv := newTestServer(t)
 	def := validFlowDef("double-it")

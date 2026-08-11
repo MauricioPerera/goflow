@@ -89,6 +89,53 @@ type FlowDefinition struct {
 	// on-failure flow receives as its trigger payload, and why it can
 	// never chain more than one hop deep).
 	OnFailureFlow string
+
+	// Examples are worked trigger/expected-result cases GatedStore.Save
+	// actually RUNS against def.Flow before persisting — the flow-level
+	// analogue of catalog.ActionDefinition.Examples. Unlike a piece
+	// example (one action, one return value), a flow example naturally
+	// has more than one place a result could matter, so WantStepOutputs
+	// lets the author pick WHICH step(s) to assert on by name, rather
+	// than compare the whole Steps map (which would also drag in
+	// per-step noise like DurationMs that varies every run).
+	//
+	// Deliberately OPTIONAL, unlike catalog pieces (which require at
+	// least one Example): every flow saved before this field existed —
+	// every flow saved in production today — has none, and requiring
+	// them now would reject flows that always saved fine. Empty (the
+	// default) means no gate at all, identical to this field never
+	// having existed. See ValidateExamples for the exact run contract
+	// (structural validation must already pass before any example runs;
+	// examples get no credentials.Store and no CALL_FLOW support).
+	Examples []FlowExample
+}
+
+// FlowExample is one worked case for FlowDefinition.Examples.
+type FlowExample struct {
+	Description string
+
+	// Trigger is the trigger payload this example runs with — the same
+	// shape POST /flows/{name}/run's own "trigger" field accepts.
+	Trigger any
+	// ExecuteTrigger mirrors POST /flows/{name}/run's own field: false
+	// (the default) passes Trigger straight through as the trigger
+	// step's output; true actually invokes a PIECE_TRIGGER's Run hook.
+	ExecuteTrigger bool
+
+	// WantError, if true, means this example is expected to end with a
+	// FAILED verdict — proving a flow correctly REJECTS certain input,
+	// the same "prove the failure path too" idea catalog.Example.WantError
+	// already covers for a single action.
+	WantError bool
+
+	// CheckOutputs, if true, requires every key in WantStepOutputs to
+	// match that step's actual Output (deep JSON equality, same
+	// comparison catalog.Example.CheckOutput already uses) — a step name
+	// missing from the run's Steps, or a value that doesn't match, is a
+	// failure. Ignored when WantError is true (a failed run's steps
+	// aren't the point of that example).
+	CheckOutputs    bool
+	WantStepOutputs map[string]any
 }
 
 // Store is the surface a flow store exposes: Save persists a FlowDefinition
