@@ -331,12 +331,12 @@
   .code-panel .c { color: var(--ink-dim); }
 
   /* --- comparison datasheet --- */
-  .datasheet-wrap { overflow-x: auto; }
+  .datasheet-wrap { overflow: visible; }
   table.datasheet {
     width: 100%;
     border-collapse: collapse;
     font-size: 0.94rem;
-    min-width: 720px;
+    table-layout: fixed;
   }
   table.datasheet caption {
     position: absolute;
@@ -428,6 +428,55 @@
     .footprint { grid-template-columns: 1fr; }
     .topnav { display: none; }
     .final-cta-panel { padding: 32px 24px; }
+  }
+
+  @media (max-width: 700px) {
+    table.datasheet, table.datasheet thead, table.datasheet tbody,
+    table.datasheet tr, table.datasheet th, table.datasheet td {
+      display: block;
+      width: auto;
+    }
+    table.datasheet thead {
+      position: absolute;
+      width: 1px; height: 1px;
+      padding: 0; margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+    table.datasheet tbody tr {
+      padding: 16px 0;
+      border-bottom: 1px solid var(--line-strong);
+    }
+    table.datasheet tbody tr:last-child { border-bottom: none; }
+    table.datasheet tbody th {
+      padding: 0 0 10px;
+      border-bottom: none;
+      font-size: 1rem;
+    }
+    table.datasheet tbody td {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 16px;
+      padding: 8px 10px;
+      border-bottom: none;
+      border-left: 2px solid var(--line);
+    }
+    table.datasheet tbody td.col-goflow {
+      border-left: 2px solid var(--signal);
+      border-right: none;
+    }
+    table.datasheet tbody td::before {
+      content: attr(data-label);
+      flex: 0 0 auto;
+      font-family: var(--font-mono);
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--ink-dim);
+    }
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -565,45 +614,45 @@
           <tbody>
             <tr>
               <th scope="row" data-i18n="compare.row1.h">Runs where</th>
-              <td class="col-goflow" data-i18n="compare.row1.goflow">Your own server — one Go binary</td>
-              <td data-i18n="compare.row1.n8n">Self-host (Node.js) or their cloud</td>
-              <td data-i18n="compare.row1.zapier">Their cloud only</td>
+              <td class="col-goflow" data-label="goflow" data-i18n="compare.row1.goflow">Your own server — one Go binary</td>
+              <td data-label="n8n" data-i18n="compare.row1.n8n">Self-host (Node.js) or their cloud</td>
+              <td data-label="Zapier / Make" data-i18n="compare.row1.zapier">Their cloud only</td>
             </tr>
             <tr>
               <th scope="row" data-i18n="compare.row2.h">Primary operator</th>
-              <td class="col-goflow" data-i18n="compare.row2.goflow">An agent, over MCP — same access a human gets</td>
-              <td data-i18n="compare.row2.n8n">A human, via a visual canvas</td>
-              <td data-i18n="compare.row2.zapier">A human, via a visual canvas</td>
+              <td class="col-goflow" data-label="goflow" data-i18n="compare.row2.goflow">An agent, over MCP — same access a human gets</td>
+              <td data-label="n8n" data-i18n="compare.row2.n8n">A human, via a visual canvas</td>
+              <td data-label="Zapier / Make" data-i18n="compare.row2.zapier">A human, via a visual canvas</td>
             </tr>
             <tr>
               <th scope="row" data-i18n="compare.row3.h">Adding an integration</th>
-              <td class="col-goflow" data-i18n="compare.row3.goflow">JSON + JS, imported in one API call</td>
-              <td data-i18n="compare.row3.n8n">Write a TypeScript node, build, publish</td>
-              <td data-i18n="compare.row3.zapier">Request it, or wire raw HTTP yourself</td>
+              <td class="col-goflow" data-label="goflow" data-i18n="compare.row3.goflow">JSON + JS, imported in one API call</td>
+              <td data-label="n8n" data-i18n="compare.row3.n8n">Write a TypeScript node, build, publish</td>
+              <td data-label="Zapier / Make" data-i18n="compare.row3.zapier">Request it, or wire raw HTTP yourself</td>
             </tr>
             <tr>
               <th scope="row" data-i18n="compare.row4.h">Before a save is accepted</th>
-              <td class="col-goflow" data-i18n-html="compare.row4.goflow">Worked examples actually <em>execute</em></td>
-              <td data-i18n="compare.row4.n8n">Structural validation only</td>
-              <td data-i18n="compare.row4.zapier">Structural validation only</td>
+              <td class="col-goflow" data-label="goflow" data-i18n-html="compare.row4.goflow">Worked examples actually <em>execute</em></td>
+              <td data-label="n8n" data-i18n="compare.row4.n8n">Structural validation only</td>
+              <td data-label="Zapier / Make" data-i18n="compare.row4.zapier">Structural validation only</td>
             </tr>
             <tr>
               <th scope="row" data-i18n="compare.row5.h">Version history + rollback</th>
-              <td class="col-goflow" data-i18n-html="compare.row5.goflow">Flows <em>and</em> individual pieces</td>
-              <td data-i18n="compare.row5.n8n">Flows, on paid tiers</td>
-              <td data-i18n="compare.row5.zapier">Limited or none</td>
+              <td class="col-goflow" data-label="goflow" data-i18n-html="compare.row5.goflow">Flows <em>and</em> individual pieces</td>
+              <td data-label="n8n" data-i18n="compare.row5.n8n">Flows, on paid tiers</td>
+              <td data-label="Zapier / Make" data-i18n="compare.row5.zapier">Limited or none</td>
             </tr>
             <tr>
               <th scope="row" data-i18n="compare.row6.h">Replay a past run</th>
-              <td class="col-goflow" data-i18n="compare.row6.goflow">Against the current definition, to prove an edit is safe</td>
-              <td>—</td>
-              <td>—</td>
+              <td class="col-goflow" data-label="goflow" data-i18n="compare.row6.goflow">Against the current definition, to prove an edit is safe</td>
+              <td data-label="n8n">—</td>
+              <td data-label="Zapier / Make">—</td>
             </tr>
             <tr>
               <th scope="row" data-i18n="compare.row7.h">License</th>
-              <td class="col-goflow" data-i18n="compare.row7.goflow">Apache 2.0 — fully open source</td>
-              <td data-i18n="compare.row7.n8n">Source-available, use-restricted</td>
-              <td data-i18n="compare.row7.zapier">Closed</td>
+              <td class="col-goflow" data-label="goflow" data-i18n="compare.row7.goflow">Apache 2.0 — fully open source</td>
+              <td data-label="n8n" data-i18n="compare.row7.n8n">Source-available, use-restricted</td>
+              <td data-label="Zapier / Make" data-i18n="compare.row7.zapier">Closed</td>
             </tr>
           </tbody>
         </table>
