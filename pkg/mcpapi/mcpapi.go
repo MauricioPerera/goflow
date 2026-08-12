@@ -75,6 +75,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"goflow/pkg/catalog"
 	"goflow/pkg/credentials"
@@ -82,6 +83,7 @@ import (
 	"goflow/pkg/flowstore"
 	"goflow/pkg/flowvalidate"
 	"goflow/pkg/model"
+	"goflow/pkg/okf"
 	"goflow/pkg/piece"
 	"goflow/pkg/pieces"
 	"goflow/pkg/runstore"
@@ -171,6 +173,7 @@ const (
 	toolCredentialUsage   = "goflow_credential_usage"
 	toolListPieceVersions = "goflow_list_piece_versions"
 	toolGetPieceVersion   = "goflow_get_piece_version"
+	toolExportOkf         = "goflow_export_okf"
 
 	toolSaveFlow             = "goflow_save_flow"
 	toolDeleteFlow           = "goflow_delete_flow"
@@ -200,6 +203,7 @@ var reservedToolNames = map[string]bool{
 	toolCredentialUsage:   true,
 	toolListPieceVersions: true,
 	toolGetPieceVersion:   true,
+	toolExportOkf:         true,
 
 	toolSaveFlow:             true,
 	toolDeleteFlow:           true,
@@ -239,6 +243,11 @@ func metaToolDescriptors() []map[string]any {
 		{
 			"name":        toolExportCatalog,
 			"description": "Export every JS-authored catalog piece as its full Definition — name, actions/triggers with their real source code and examples — unlike goflow_describe_catalog, whose text is for reading, not re-importing. Feed any one entry straight back into goflow_save_piece (or POST /pieces) to recreate it elsewhere. Built-in Go pieces have no Definition (they're native code, not data) and never appear here — goflow_describe_catalog still covers them in its own text.",
+			"inputSchema": emptySchema,
+		},
+		{
+			"name":        toolExportOkf,
+			"description": "Export goflow's live catalog (every piece, Go and JS), every saved flow, and every credential NAME (never a decrypted value) as an Open Knowledge Format v0.2 bundle — https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md — a plain directory of markdown files with YAML frontmatter, meant to be browsed by any agent or human tool that already understands OKF, no goflow-specific tooling required. Returns the WHOLE bundle in one call as {path: content} (e.g. \"pieces/stripe.md\", \"flows/my-flow.md\", \"index.md\"), generated fresh from the live stores every call, never a second stored copy that could drift. Each piece/credential concept's own \"Used by\" section links the flows referencing it, via the same data goflow_piece_usage/goflow_credential_usage already read. Every concept's generated.by is process:goflow-okf-export — goflow has no per-caller identity (a single shared token, no accounts), so this honestly names what generated the DOCUMENT, not a claim about who authored the underlying piece or flow; verified is omitted entirely for the same reason, since nothing in goflow records a human confirming one.",
 			"inputSchema": emptySchema,
 		},
 		{
@@ -549,6 +558,22 @@ func (h *Handler) callExportCatalog(w http.ResponseWriter, req rawRequest) {
 		return
 	}
 	writeToolText(w, req.ID, false, map[string]any{"pieces": defs})
+}
+
+// callExportOkf renders the current OKF bundle (see pkg/okf) and returns
+// it as one tool result — the same "everything in one shot" shape
+// callExportCatalog already uses, rather than a crawl-one-file-at-a-time
+// design; pkg/httpapi's own /okf/* routes instead serve it one file at a
+// time for a static-site-style consumer, matching OKF's own progressive-
+// disclosure philosophy, but a single tools/call round trip is the
+// better fit for an MCP client.
+func (h *Handler) callExportOkf(w http.ResponseWriter, req rawRequest) {
+	bundle, err := okf.ExportBundle(h.CatalogStore, h.FlowStore, h.CredStore, time.Now())
+	if err != nil {
+		writeError(w, req.ID, -32603, "internal error: "+err.Error())
+		return
+	}
+	writeToolText(w, req.ID, false, bundle)
 }
 
 // flowSummary mirrors pkg/httpapi's own flowSummary — metadata only, never
@@ -1240,6 +1265,9 @@ func (h *Handler) handleToolsCall(w http.ResponseWriter, req rawRequest) {
 		return
 	case toolExportCatalog:
 		h.callExportCatalog(w, req)
+		return
+	case toolExportOkf:
+		h.callExportOkf(w, req)
 		return
 	case toolListFlows:
 		h.callListFlows(w, req)

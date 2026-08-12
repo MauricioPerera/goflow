@@ -22,6 +22,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"goflow/pkg/catalog"
 	"goflow/pkg/credentials"
@@ -30,6 +31,7 @@ import (
 	"goflow/pkg/mcpapi"
 	"goflow/pkg/model"
 	"goflow/pkg/oauth"
+	"goflow/pkg/okf"
 	"goflow/pkg/piece"
 	"goflow/pkg/pieces"
 	"goflow/pkg/runstore"
@@ -163,6 +165,19 @@ func (s *Server) Handler() http.Handler {
 	// see handlePublicRunResume's doc comment for why and what gates it
 	// instead.
 	mux.HandleFunc("POST /public/runs/{id}/resume", s.handlePublicRunResume)
+	// /okf/* serves goflow's live catalog/flows/credentials as an Open
+	// Knowledge Format v0.2 bundle — see pkg/okf's own package doc for
+	// why every document is generated fresh per request, never a
+	// second stored copy. Same auth as every other route: this is a
+	// read view over the same privileged data GET /pieces, GET /flows,
+	// and GET /credentials already require a token for.
+	mux.Handle("GET /okf/index.md", s.auth(http.HandlerFunc(s.handleOkfRootIndex)))
+	mux.Handle("GET /okf/pieces/index.md", s.auth(http.HandlerFunc(s.handleOkfPiecesIndex)))
+	mux.Handle("GET /okf/pieces/{name}", s.auth(http.HandlerFunc(s.handleOkfPiece)))
+	mux.Handle("GET /okf/flows/index.md", s.auth(http.HandlerFunc(s.handleOkfFlowsIndex)))
+	mux.Handle("GET /okf/flows/{name}", s.auth(http.HandlerFunc(s.handleOkfFlow)))
+	mux.Handle("GET /okf/credentials/index.md", s.auth(http.HandlerFunc(s.handleOkfCredentialsIndex)))
+	mux.Handle("GET /okf/credentials/{name}", s.auth(http.HandlerFunc(s.handleOkfCredential)))
 	// /mcp exposes the saved flows as MCP tools (JSON-RPC 2.0 over a single
 	// POST), behind the same auth as every other route (static token OR a
 	// live OAuth access token — see auth). authMCP additionally advertises
@@ -1053,6 +1068,123 @@ func (s *Server) handlePublicRunResume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
+}
+
+// writeMarkdown sends body as a text/markdown response — every /okf/*
+// route's own response shape, distinct from writeJSON since an OKF
+// concept or index document IS the response body verbatim, not a value
+// to wrap in a JSON envelope.
+func writeMarkdown(w http.ResponseWriter, status int, body string) {
+	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(body))
+}
+
+// okfBundle assembles the current OKF bundle fresh — called by every
+// /okf/* handler below rather than cached, same "must reflect what's
+// true right now" reasoning buildRegistry's own doc comment gives for
+// the identical choice; okf.ExportBundle is cheap at this project's
+// scale (the same List() calls GET /catalog's DescribeCombined and
+// GET /pieces/export already make on every request).
+func (s *Server) okfBundle() (okf.Bundle, error) {
+	return okf.ExportBundle(s.store, s.flowStore, s.credStore, time.Now())
+}
+
+func (s *Server) handleOkfRootIndex(w http.ResponseWriter, r *http.Request) {
+	bundle, err := s.okfBundle()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeMarkdown(w, http.StatusOK, bundle["index.md"])
+}
+
+func (s *Server) handleOkfPiecesIndex(w http.ResponseWriter, r *http.Request) {
+	bundle, err := s.okfBundle()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeMarkdown(w, http.StatusOK, bundle["pieces/index.md"])
+}
+
+// handleOkfPiece handles GET /okf/pieces/{name} — {name} is expected to
+// carry the literal ".md" suffix (e.g. "stripe.md"), matching an OKF
+// bundle's own on-disk file naming; a request missing it is treated the
+// same as an unknown concept, a 404, rather than silently stripping it.
+func (s *Server) handleOkfPiece(w http.ResponseWriter, r *http.Request) {
+	name, ok := strings.CutSuffix(r.PathValue("name"), ".md")
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	bundle, err := s.okfBundle()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	doc, ok := bundle["pieces/"+name+".md"]
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	writeMarkdown(w, http.StatusOK, doc)
+}
+
+func (s *Server) handleOkfFlowsIndex(w http.ResponseWriter, r *http.Request) {
+	bundle, err := s.okfBundle()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeMarkdown(w, http.StatusOK, bundle["flows/index.md"])
+}
+
+func (s *Server) handleOkfFlow(w http.ResponseWriter, r *http.Request) {
+	name, ok := strings.CutSuffix(r.PathValue("name"), ".md")
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	bundle, err := s.okfBundle()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	doc, ok := bundle["flows/"+name+".md"]
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	writeMarkdown(w, http.StatusOK, doc)
+}
+
+func (s *Server) handleOkfCredentialsIndex(w http.ResponseWriter, r *http.Request) {
+	bundle, err := s.okfBundle()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeMarkdown(w, http.StatusOK, bundle["credentials/index.md"])
+}
+
+func (s *Server) handleOkfCredential(w http.ResponseWriter, r *http.Request) {
+	name, ok := strings.CutSuffix(r.PathValue("name"), ".md")
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	bundle, err := s.okfBundle()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	doc, ok := bundle["credentials/"+name+".md"]
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	writeMarkdown(w, http.StatusOK, doc)
 }
 
 // --- middleware -------------------------------------------------------------

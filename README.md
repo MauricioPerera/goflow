@@ -560,7 +560,9 @@ below for what a Go rewrite gets and gives up.
     equivalents of `GET /pieces/{name}/versions` and
     `GET /pieces/{name}/versions/{id}` — they only ever READ what
     `GatedStore.Save` already recorded, see the piece-versioning entry
-    below).
+    below), `goflow_export_okf` (the MCP equivalent of `GET /okf/*` —
+    every piece/flow/credential-name as an Open Knowledge Format v0.2
+    bundle in one call; see the OKF entry below).
   - Write: `goflow_save_flow` and `goflow_delete_flow` (through the exact
     same `*flowstore.GatedStore` `POST`/`DELETE /flows` use — a flow
     referencing a missing piece is rejected, never partially saved);
@@ -606,7 +608,7 @@ below for what a Go rewrite gets and gives up.
     resume entry below.
 
   A saved flow (or, symmetrically, a credential name) that collides with
-  one of the twenty-five reserved names is excluded from `tools/list` — not
+  one of the twenty-six reserved names is excluded from `tools/list` — not
   deleted, not un-runnable/un-referenceable by name over HTTP — just
   shadowed in this one listing, and `tools/call` resolves that name to the
   fixed tool the same way, so the two methods never disagree about what a
@@ -1067,6 +1069,40 @@ below for what a Go rewrite gets and gives up.
   then immediately re-loaded failed its own `Verify`. Fixed by using
   plain `json.Marshal` instead, which leaves an already-compact
   `json.RawMessage` untouched.
+- **The live catalog/flows/credentials as an Open Knowledge Format v0.2
+  bundle** (`pkg/okf` — `GET /okf/*`, MCP's `goflow_export_okf`): OKF
+  (https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
+  is a minimal, git-friendly convention — a directory of markdown files
+  with YAML frontmatter — for representing knowledge so both humans and
+  agents can read it with no bespoke tooling. This renders every piece
+  (built-in Go and JS-authored alike), every saved flow, and every
+  credential NAME (never a decrypted value — `credentials.Store.Get` is
+  never wired to this, or any, transport) as OKF concepts, generated
+  fresh from the live stores on every request — never a second, storable
+  copy that could drift from the actual catalog/flowstore/credentials
+  data. Each piece/credential concept's own "Used by" section is built
+  from the exact same `flowstore.FindFlowsReferencing{Piece,Credential}`
+  functions already backing `GET /pieces/{name}/usage` and
+  `GET /credentials/{name}/usage`, so it can never disagree with those
+  routes about what "used by" means. `GET /okf/*` serves one file at a
+  time (`/okf/index.md`, `/okf/pieces/stripe.md`, ...), matching OKF's
+  own progressive-disclosure philosophy for a static-site-style
+  consumer; `goflow_export_okf` returns the WHOLE bundle in one MCP call
+  instead, matching `goflow_export_catalog`'s own "everything in one
+  shot" precedent — better fit for a single tool-call round trip. One
+  real, disclosed limitation: OKF's trust-tier mechanism (`generated.by`,
+  `verified.by`) is built around knowing WHO produced or confirmed a
+  concept, and this project has no per-caller identity at all (a single
+  shared bearer token, no accounts). Every concept's `generated.by` is
+  set to `process:goflow-okf-export` — an honest statement about what
+  generated THIS DOCUMENT, not a claim about who authored the underlying
+  piece or flow — and `verified` is omitted entirely, since nothing in
+  goflow records a human confirming one; that absence is accurate, not a
+  placeholder. Hand-rolled YAML frontmatter emission (always-double-
+  quoted scalars, no bare values to second-guess) rather than a new
+  dependency — the same "simple enough not to need a library" reasoning
+  `pkg/license`'s Ed25519 choice and `pkg/mcpapi`'s hand-written
+  JSON-RPC already apply to their own cases.
 
 ## Explicitly NOT in v1
 
@@ -1079,9 +1115,9 @@ longer are, and should be stated plainly rather than left stale:
 - **"No server/API" is no longer true.** `pkg/httpapi` + `cmd/server` is a
   real HTTP server (`/health`, `/catalog`, `/pieces*`, `/flows*`
   (including `/flows/export/js` and `/flows/{name}/export/js`),
-  `/credentials*`, `/runs*`, `/mcp`, `/oauth/*`, `/.well-known/oauth-*`,
-  `/webhooks/{name}` and `/public/runs/{id}/resume` (both deliberately
-  public — see "What's here" above),
+  `/credentials*`, `/runs*`, `/okf/*`, `/mcp`, `/oauth/*`,
+  `/.well-known/oauth-*`, `/webhooks/{name}` and `/public/runs/{id}/resume`
+  (both deliberately public — see "What's here" above),
   deployed and
   running on a real VPS as a systemd service. "No auth" is also no longer true, but
   stays narrow: every non-public route requires either the single shared

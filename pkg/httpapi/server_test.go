@@ -2644,3 +2644,136 @@ func TestDeletePiece_Missing_404(t *testing.T) {
 		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+// --- /okf/* -----------------------------------------------------------
+
+func TestOkfRootIndex_ListsSections(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/okf/index.md", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/markdown") {
+		t.Fatalf("Content-Type = %q, want text/markdown", ct)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"# Pieces", "# Flows", "# Credentials"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("body missing %q: %s", want, body)
+		}
+	}
+}
+
+func TestOkfRootIndex_NoAuth_401(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/okf/index.md", nil, false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestOkfPiece_BuiltInGoPiece_ReturnsConformantDoc(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/okf/pieces/webhook.md", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.HasPrefix(body, "---\ntype: \"goflow Piece\"") {
+		t.Fatalf("body missing conformant frontmatter: %s", body)
+	}
+}
+
+func TestOkfPiece_JSPiece_IncludesDescription(t *testing.T) {
+	srv := newTestServer(t)
+	saveRec := do(t, srv, "POST", "/pieces", catalog.Definition{
+		Name: "stripe-okf-test", DisplayName: "Stripe", Description: "Create charges.",
+		Actions: []catalog.ActionDefinition{{
+			Name: "run", DisplayName: "Run", Description: "runs it",
+			InputSchema: "x (number, required)",
+			Source:      "(ctx) => ({ doubled: Number(ctx.input.x) * 2 })",
+			Examples:    []catalog.Example{{Description: "doubles 5", Input: map[string]any{"x": 5}, CheckOutput: true, WantOutput: map[string]any{"doubled": float64(10)}}},
+		}},
+	}, true)
+	if saveRec.Code != http.StatusCreated {
+		t.Fatalf("save piece: status = %d; body=%s", saveRec.Code, saveRec.Body.String())
+	}
+
+	rec := do(t, srv, "GET", "/okf/pieces/stripe-okf-test.md", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Create charges.") {
+		t.Fatalf("body missing piece description: %s", rec.Body.String())
+	}
+}
+
+func TestOkfPiece_UnknownName_404(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/okf/pieces/never-existed.md", nil, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOkfPiece_MissingMdSuffix_404(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/okf/pieces/webhook", nil, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (no .md suffix); body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOkfFlow_SavedFlow_ReturnsDescription(t *testing.T) {
+	srv := newTestServer(t)
+	def := flowstore.FlowDefinition{Name: "okf-test-flow", DisplayName: "OKF Test Flow", Description: "a flow used to test OKF export", Flow: doubleFlowVersion()}
+	saveRec := do(t, srv, "POST", "/flows", def, true)
+	if saveRec.Code != http.StatusCreated {
+		t.Fatalf("save flow: status = %d; body=%s", saveRec.Code, saveRec.Body.String())
+	}
+
+	rec := do(t, srv, "GET", "/okf/flows/okf-test-flow.md", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "a flow used to test OKF export") {
+		t.Fatalf("body missing flow description: %s", rec.Body.String())
+	}
+}
+
+func TestOkfFlow_UnknownName_404(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/okf/flows/never-existed.md", nil, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOkfCredential_NeverLeaksValue(t *testing.T) {
+	srv := newTestServer(t)
+	saveRec := do(t, srv, "POST", "/credentials", map[string]any{"name": "okf-test-cred", "value": "super-secret-value-must-not-leak"}, true)
+	if saveRec.Code != http.StatusCreated {
+		t.Fatalf("save credential: status = %d; body=%s", saveRec.Code, saveRec.Body.String())
+	}
+
+	rec := do(t, srv, "GET", "/okf/credentials/okf-test-cred.md", nil, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "super-secret-value-must-not-leak") {
+		t.Fatalf("body leaks the credential's value: %s", rec.Body.String())
+	}
+
+	indexRec := do(t, srv, "GET", "/okf/credentials/index.md", nil, true)
+	if !strings.Contains(indexRec.Body.String(), "okf-test-cred") {
+		t.Fatalf("credentials index missing okf-test-cred: %s", indexRec.Body.String())
+	}
+}
+
+func TestOkfCredential_UnknownName_404(t *testing.T) {
+	srv := newTestServer(t)
+	rec := do(t, srv, "GET", "/okf/credentials/never-existed.md", nil, true)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}

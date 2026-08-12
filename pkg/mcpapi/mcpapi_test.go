@@ -1605,6 +1605,69 @@ func TestExportCatalog_ReturnsFullDefinitionIncludingSourceAndExamples(t *testin
 	}
 }
 
+// --- goflow_export_okf ---------------------------------------------
+
+func TestExportOkf_ReturnsBundleWithPiecesFlowsCredentials(t *testing.T) {
+	h, catStore := newHandlerWithFlowsAndCatalog(t)
+	def := catalog.Definition{
+		Name: "risk_score", DisplayName: "Risk Score", Description: "classifies risk",
+		Actions: []catalog.ActionDefinition{{
+			Name: "run", DisplayName: "Run", Source: "(ctx) => ({ doubled: Number(ctx.input.x) * 2 })",
+			Examples: []catalog.Example{{
+				Input: map[string]any{"x": float64(5)}, CheckOutput: true,
+				WantOutput: map[string]any{"doubled": float64(10)},
+			}},
+		}},
+	}
+	if err := catStore.Save(def); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	result := callTool(t, h, toolExportOkf, nil)
+	if result["isError"] != false {
+		t.Fatalf("isError = %v, want false: %v", result["isError"], result)
+	}
+	var bundle map[string]string
+	toolText(t, result, &bundle)
+
+	if _, ok := bundle["index.md"]; !ok {
+		t.Fatalf("bundle missing index.md; bundle=%v", bundle)
+	}
+	doc, ok := bundle["pieces/risk_score.md"]
+	if !ok {
+		t.Fatalf("bundle missing pieces/risk_score.md; bundle=%v", bundle)
+	}
+	if !strings.Contains(doc, "classifies risk") {
+		t.Fatalf("doc missing piece description: %s", doc)
+	}
+	if !strings.HasPrefix(doc, "---\ntype: \"goflow Piece\"") {
+		t.Fatalf("doc missing conformant frontmatter: %s", doc)
+	}
+}
+
+func TestExportOkf_CredentialConcept_NeverLeaksValue(t *testing.T) {
+	h, credStore := newHandlerWithFlowsAndCreds(t)
+	if err := credStore.Save("okf-mcp-cred", "super-secret-value-must-not-leak"); err != nil {
+		t.Fatalf("Save credential: %v", err)
+	}
+
+	result := callTool(t, h, toolExportOkf, nil)
+	if result["isError"] != false {
+		t.Fatalf("isError = %v, want false: %v", result["isError"], result)
+	}
+	var bundle map[string]string
+	toolText(t, result, &bundle)
+
+	if _, ok := bundle["credentials/okf-mcp-cred.md"]; !ok {
+		t.Fatalf("bundle missing credentials/okf-mcp-cred.md; bundle=%v", bundle)
+	}
+	for path, content := range bundle {
+		if strings.Contains(content, "super-secret-value-must-not-leak") {
+			t.Fatalf("bundle path %q leaks the credential's value", path)
+		}
+	}
+}
+
 func TestExportCatalog_IncludesRequiresAuthSetViaSavePiece(t *testing.T) {
 	h, _ := newHandlerWithFlowsAndCatalog(t)
 	saveResult := callTool(t, h, toolSavePiece, map[string]any{
