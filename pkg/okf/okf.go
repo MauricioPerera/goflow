@@ -59,9 +59,8 @@ type Concept struct {
 // this package itself controls, well within what a minimal, always-
 // double-quoted-scalar emitter can encode correctly without a general
 // YAML implementation (matching this project's stdlib-only stance the
-// same way pkg/license's Ed25519 choice and pkg/mcpapi's hand-written
-// JSON-RPC already do for their own "simple enough not to need a
-// dependency" cases).
+// same way pkg/mcpapi's hand-written JSON-RPC already does for its own
+// "simple enough not to need a dependency" case).
 func (c Concept) Render() string {
 	var b strings.Builder
 	b.WriteString("---\n")
