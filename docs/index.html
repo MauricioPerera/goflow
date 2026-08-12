@@ -1,0 +1,1125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>goflow — automation built to be operated by agents</title>
+<meta name="description" content="goflow is a self-hosted, Apache-2.0 workflow engine an AI agent can read, extend, and run through MCP — instead of a drag-and-drop canvas it can only watch." />
+<style>
+  :root {
+    --paper: #0E2038;
+    --paper-raised: #142B4A;
+    --paper-raised-2: #1B3A63;
+    --ink: #EAF3F8;
+    --ink-dim: #8FA8BE;
+    --line: rgba(234, 243, 248, 0.14);
+    --line-strong: rgba(234, 243, 248, 0.28);
+    --signal: #E8A33D;
+    --signal-dim: #B87F2C;
+    --signal-wash: rgba(232, 163, 61, 0.12);
+    --ok: #4FAE8C;
+    --no: #7A8CA0;
+    --grid-line: rgba(234, 243, 248, 0.055);
+
+    --font-display: "Arial Black", "Arial Bold", "Helvetica Neue", Impact, sans-serif;
+    --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    --font-mono: "SF Mono", "Cascadia Code", "Cascadia Mono", Consolas, "Liberation Mono", Menlo, monospace;
+
+    --fs-eyebrow: 0.72rem;
+    --fs-small: 0.875rem;
+    --fs-body: 1.0625rem;
+    --fs-h3: 1.375rem;
+    --fs-h2: clamp(1.75rem, 3.4vw, 2.5rem);
+    --fs-h1: clamp(2.35rem, 5.6vw, 4.25rem);
+
+    --content-w: 1120px;
+    --radius: 2px;
+  }
+
+  :root[data-theme="light"] {
+    --paper: #EEF2F5;
+    --paper-raised: #FFFFFF;
+    --paper-raised-2: #E4EAEF;
+    --ink: #122439;
+    --ink-dim: #52657A;
+    --line: rgba(18, 36, 57, 0.14);
+    --line-strong: rgba(18, 36, 57, 0.28);
+    --signal: #C97E1D;
+    --signal-dim: #E3A855;
+    --signal-wash: rgba(201, 126, 29, 0.10);
+    --ok: #237A57;
+    --no: #93A2B2;
+    --grid-line: rgba(18, 36, 57, 0.05);
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --paper: #EEF2F5;
+      --paper-raised: #FFFFFF;
+      --paper-raised-2: #E4EAEF;
+      --ink: #122439;
+      --ink-dim: #52657A;
+      --line: rgba(18, 36, 57, 0.14);
+      --line-strong: rgba(18, 36, 57, 0.28);
+      --signal: #C97E1D;
+      --signal-dim: #E3A855;
+      --signal-wash: rgba(201, 126, 29, 0.10);
+      --ok: #237A57;
+      --no: #93A2B2;
+      --grid-line: rgba(18, 36, 57, 0.05);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: var(--fs-body);
+    line-height: 1.6;
+    background-image:
+      linear-gradient(var(--grid-line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+
+  ::selection { background: var(--signal); color: var(--paper); }
+
+  a { color: inherit; }
+  a:focus-visible, button:focus-visible, .theme-toggle:focus-visible {
+    outline: 2px solid var(--signal);
+    outline-offset: 3px;
+  }
+
+  h1, h2, h3 {
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.01em;
+    text-wrap: balance;
+    margin: 0;
+    color: var(--ink);
+  }
+
+  p { margin: 0; }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: var(--fs-eyebrow);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--signal);
+    display: flex;
+    align-items: center;
+    gap: 0.6em;
+  }
+  .eyebrow::before {
+    content: "";
+    width: 1.4em;
+    height: 1px;
+    background: var(--signal);
+    display: inline-block;
+  }
+
+  .wrap {
+    max-width: var(--content-w);
+    margin: 0 auto;
+    padding: 0 28px;
+  }
+
+  code, .mono { font-family: var(--font-mono); }
+  .tnum { font-variant-numeric: tabular-nums; }
+
+  /* --- registration-mark panel treatment (replaces rounded cards) --- */
+  .panel {
+    position: relative;
+    border: 1px solid var(--line);
+    background: var(--paper-raised);
+    padding: 28px;
+  }
+  .panel::before, .panel::after,
+  .panel .tick-br, .panel .tick-bl {
+    content: "";
+    position: absolute;
+    width: 10px;
+    height: 10px;
+    pointer-events: none;
+  }
+  .panel::before { top: -1px; left: -1px; border-top: 2px solid var(--signal); border-left: 2px solid var(--signal); }
+  .panel::after { top: -1px; right: -1px; border-top: 2px solid var(--signal); border-right: 2px solid var(--signal); }
+  .panel .tick-bl { bottom: -1px; left: -1px; border-bottom: 2px solid var(--line-strong); border-left: 2px solid var(--line-strong); }
+  .panel .tick-br { bottom: -1px; right: -1px; border-bottom: 2px solid var(--line-strong); border-right: 2px solid var(--line-strong); }
+
+  /* --- top bar --- */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: color-mix(in srgb, var(--paper) 88%, transparent);
+    backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--line);
+  }
+  .topbar .wrap {
+    height: 60px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+  }
+  .brand {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 1.05rem;
+    letter-spacing: 0.02em;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    text-decoration: none;
+  }
+  .brand .dot { width: 9px; height: 9px; background: var(--signal); display: inline-block; }
+  .topnav { display: flex; align-items: center; gap: 28px; }
+  .topnav a {
+    text-decoration: none;
+    font-family: var(--font-mono);
+    font-size: var(--fs-small);
+    color: var(--ink-dim);
+    letter-spacing: 0.02em;
+  }
+  .topnav a:hover { color: var(--ink); }
+  .controls { display: flex; align-items: center; gap: 10px; }
+  .theme-toggle {
+    font-family: var(--font-mono);
+    font-size: var(--fs-small);
+    background: transparent;
+    color: var(--ink-dim);
+    border: 1px solid var(--line);
+    padding: 6px 10px;
+    cursor: pointer;
+  }
+  .theme-toggle:hover { color: var(--ink); border-color: var(--line-strong); }
+
+  .lang-switch {
+    display: flex;
+    border: 1px solid var(--line);
+  }
+  .lang-switch button {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.04em;
+    background: transparent;
+    color: var(--ink-dim);
+    border: none;
+    border-right: 1px solid var(--line);
+    padding: 6px 9px;
+    cursor: pointer;
+  }
+  .lang-switch button:last-child { border-right: none; }
+  .lang-switch button:hover { color: var(--ink); }
+  .lang-switch button[aria-current="true"] { color: var(--paper); background: var(--signal); }
+
+  /* --- hero --- */
+  .hero { padding: 84px 0 56px; }
+  .hero-grid {
+    display: grid;
+    grid-template-columns: 1.05fr 0.95fr;
+    gap: 56px;
+    align-items: center;
+  }
+  .hero h1 { font-size: var(--fs-h1); line-height: 1.02; margin: 18px 0 22px; }
+  .hero h1 .accent { color: var(--signal); }
+  .hero-sub {
+    font-size: 1.15rem;
+    color: var(--ink-dim);
+    max-width: 46ch;
+    line-height: 1.55;
+  }
+  .cta-row { display: flex; gap: 14px; margin-top: 32px; flex-wrap: wrap; }
+  .btn {
+    font-family: var(--font-mono);
+    font-size: var(--fs-small);
+    letter-spacing: 0.02em;
+    text-decoration: none;
+    padding: 13px 22px;
+    border: 1px solid var(--line-strong);
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+  }
+  .btn-primary { background: var(--signal); color: var(--paper); border-color: var(--signal); font-weight: 700; }
+  .btn-primary:hover { background: var(--signal-dim); border-color: var(--signal-dim); }
+  .btn-ghost { color: var(--ink); }
+  .btn-ghost:hover { border-color: var(--signal); color: var(--signal); }
+
+  .stat-strip {
+    display: flex;
+    gap: 28px;
+    margin-top: 40px;
+    flex-wrap: wrap;
+  }
+  .stat { font-family: var(--font-mono); }
+  .stat .n { font-size: 1.5rem; color: var(--signal); font-weight: 700; display: block; }
+  .stat .l { font-size: 0.75rem; color: var(--ink-dim); text-transform: uppercase; letter-spacing: 0.08em; }
+
+  .hero-diagram { position: relative; }
+  .hero-diagram canvas {
+    width: 100%;
+    height: 360px;
+    display: block;
+  }
+  .hero-diagram-caption {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--ink-dim);
+    text-align: center;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-top: 10px;
+  }
+
+  /* --- section shell --- */
+  section { padding: 72px 0; border-top: 1px solid var(--line); }
+  .section-head { max-width: 62ch; margin-bottom: 40px; }
+  .section-head h2 { margin-top: 14px; }
+  .section-head .lede { margin-top: 16px; color: var(--ink-dim); font-size: 1.05rem; line-height: 1.6; }
+
+  /* --- positioning --- */
+  .positioning-body { max-width: 68ch; font-size: 1.1rem; line-height: 1.7; color: var(--ink); }
+  .positioning-body strong { color: var(--signal); font-weight: 700; }
+  .positioning-body p + p { margin-top: 18px; }
+
+  /* --- how it works --- */
+  .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
+  .step { padding-left: 0; }
+  .step .step-n {
+    font-family: var(--font-mono);
+    color: var(--signal);
+    font-size: 0.8rem;
+    letter-spacing: 0.1em;
+  }
+  .step h3 { font-size: 1.05rem; margin: 10px 0 10px; letter-spacing: 0; }
+  .step p { color: var(--ink-dim); font-size: 0.96rem; line-height: 1.55; }
+
+  .code-panel {
+    margin-top: 44px;
+    background: var(--paper-raised);
+    border: 1px solid var(--line);
+  }
+  .code-panel-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 18px;
+    border-bottom: 1px solid var(--line);
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--ink-dim);
+    letter-spacing: 0.06em;
+  }
+  .code-panel pre {
+    margin: 0;
+    padding: 20px 22px 24px;
+    overflow-x: auto;
+    font-family: var(--font-mono);
+    font-size: 0.86rem;
+    line-height: 1.65;
+  }
+  .code-panel .k { color: var(--signal); }
+  .code-panel .s { color: var(--ok); }
+  .code-panel .c { color: var(--ink-dim); }
+
+  /* --- comparison datasheet --- */
+  .datasheet-wrap { overflow-x: auto; }
+  table.datasheet {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.94rem;
+    min-width: 720px;
+  }
+  table.datasheet caption {
+    position: absolute;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  table.datasheet th, table.datasheet td {
+    text-align: left;
+    padding: 15px 16px;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  table.datasheet thead th {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--ink-dim);
+    border-bottom: 1px solid var(--line-strong);
+    font-weight: 400;
+  }
+  table.datasheet thead th.col-goflow { color: var(--signal); }
+  table.datasheet tbody th {
+    font-weight: 600;
+    color: var(--ink);
+    width: 22%;
+  }
+  table.datasheet td { color: var(--ink-dim); line-height: 1.5; }
+  table.datasheet td.col-goflow { color: var(--ink); background: var(--signal-wash); border-left: 2px solid var(--signal); border-right: 2px solid var(--signal); }
+  table.datasheet tbody tr:last-child th,
+  table.datasheet tbody tr:last-child td { border-bottom: none; }
+
+  /* --- trust / quality-gate strip --- */
+  .trust-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); }
+  .trust-card { background: var(--paper); padding: 30px 26px; }
+  .trust-card .mark { font-family: var(--font-mono); color: var(--signal); font-size: 0.8rem; }
+  .trust-card h3 { font-size: 1rem; letter-spacing: 0; margin: 12px 0 10px; }
+  .trust-card p { color: var(--ink-dim); font-size: 0.94rem; line-height: 1.55; }
+
+  /* --- footprint --- */
+  .footprint { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 48px; align-items: start; }
+  .footprint-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0; }
+  .footprint-list li {
+    display: flex;
+    justify-content: space-between;
+    gap: 20px;
+    padding: 14px 0;
+    border-bottom: 1px solid var(--line);
+    font-size: 0.96rem;
+  }
+  .footprint-list li span:first-child { color: var(--ink-dim); }
+  .footprint-list li span:last-child { font-family: var(--font-mono); color: var(--ink); text-align: right; }
+
+  /* --- final CTA --- */
+  .final-cta { text-align: left; }
+  .final-cta-panel {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 32px;
+    flex-wrap: wrap;
+    padding: 44px 40px;
+  }
+  .final-cta-panel h2 { font-size: var(--fs-h2); }
+  .final-cta-panel .lede { color: var(--ink-dim); margin-top: 10px; max-width: 46ch; }
+
+  footer { border-top: 1px solid var(--line); padding: 32px 0 48px; }
+  .footer-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+  .footer-row .mono { font-size: 0.8rem; color: var(--ink-dim); }
+  .footer-links { display: flex; gap: 22px; }
+  .footer-links a { font-family: var(--font-mono); font-size: 0.8rem; text-decoration: none; color: var(--ink-dim); }
+  .footer-links a:hover { color: var(--signal); }
+
+  @media (max-width: 880px) {
+    .hero-grid { grid-template-columns: 1fr; }
+    .hero-diagram { order: -1; }
+    .steps { grid-template-columns: 1fr; }
+    .trust-grid { grid-template-columns: 1fr; }
+    .footprint { grid-template-columns: 1fr; }
+    .topnav { display: none; }
+    .final-cta-panel { padding: 32px 24px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
+  }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="wrap">
+    <a class="brand" href="#top"><span class="dot"></span>goflow</a>
+    <nav class="topnav">
+      <a href="#compare" data-i18n="nav.compare">Compare</a>
+      <a href="#how" data-i18n="nav.how">How it works</a>
+      <a href="#trust" data-i18n="nav.trust">Guarantees</a>
+      <a href="#footprint" data-i18n="nav.footprint">Footprint</a>
+      <a href="https://github.com/MauricioPerera/goflow">GitHub ↗</a>
+    </nav>
+    <div class="controls">
+      <div class="lang-switch" id="langSwitch" role="group" aria-label="Language">
+        <button type="button" data-lang-btn="en">EN</button>
+        <button type="button" data-lang-btn="es">ES</button>
+        <button type="button" data-lang-btn="pt">PT</button>
+      </div>
+      <button class="theme-toggle" id="themeToggle" type="button" aria-label="Toggle color theme">☾/☀</button>
+    </div>
+  </div>
+</header>
+
+<main id="top">
+  <section class="hero" style="border-top:none; padding-top: 56px;">
+    <div class="wrap hero-grid">
+      <div>
+        <p class="eyebrow" data-i18n="hero.eyebrow">Self-hosted · MCP-native · Apache 2.0</p>
+        <h1 data-i18n-html="hero.h1">Automation built to be <span class="accent">operated by agents</span>, not clicked through by humans.</h1>
+        <p class="hero-sub" data-i18n="hero.sub">goflow is a workflow engine an AI agent reads, extends, and runs through one protocol — MCP — with the same power a human gets from a UI. No canvas required. No canvas at all.</p>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="https://github.com/MauricioPerera/goflow" data-i18n="hero.ctaPrimary">View source on GitHub</a>
+          <a class="btn btn-ghost" href="https://github.com/MauricioPerera/goflow#readme" data-i18n="hero.ctaGhost">Read the full spec ↗</a>
+        </div>
+        <div class="stat-strip">
+          <div class="stat"><span class="n tnum">28</span><span class="l" data-i18n="hero.stat.tools">MCP tools, agent-callable</span></div>
+          <div class="stat"><span class="n tnum">17</span><span class="l" data-i18n="hero.stat.pieces">built-in pieces</span></div>
+          <div class="stat"><span class="n tnum">1</span><span class="l" data-i18n="hero.stat.binary">binary, ~22 MB</span></div>
+          <div class="stat"><span class="n">0</span><span class="l" data-i18n="hero.stat.services">required external services</span></div>
+        </div>
+      </div>
+      <div class="hero-diagram">
+        <canvas id="flowCanvas" width="640" height="360" role="img" aria-label="Animated diagram of a trigger flowing through three connected actions"></canvas>
+        <p class="hero-diagram-caption">webhook.trigger → hash.hmac → http.post → notion.create_page</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="positioning">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow" data-i18n="positioning.eyebrow">Position</p>
+        <h2 data-i18n-html="positioning.h2">n8n and Zapier were built for a person to click through.<br>goflow was built for an agent to operate.</h2>
+      </div>
+      <div class="positioning-body">
+        <p data-i18n-html="positioning.p1">Most automation platforms added an AI node to an existing canvas. That gets you a chatbot that can <em>configure</em> the canvas for you — it still ends at a UI a human has to open, inspect, and click "activate" in.</p>
+        <p data-i18n-html="positioning.p2">goflow has <strong>no canvas</strong>. A flow is JSON. A piece is JSON with a JavaScript function inside it. Both are created, versioned, run, and rolled back through the same MCP tool surface a human would use over HTTP — which means an agent doesn't need permission to act differently than a person; it already has the identical surface a person has.</p>
+        <p data-i18n-html="positioning.p3">That's the actual bet: not "AI-assisted automation," but automation where the agent <strong>is</strong> the primary operator, and the API was designed for that from the first line of code, not retrofitted onto a drag-and-drop tool built for a different audience.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="how">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow" data-i18n="how.eyebrow">How it actually works</p>
+        <h2 data-i18n="how.h2">An agent builds and runs a flow in one exchange</h2>
+        <p class="lede" data-i18n="how.lede">No screen to open, no node to drag. This is the entire round trip — describe the catalog, save a piece, run it.</p>
+      </div>
+      <div class="steps">
+        <div class="step">
+          <p class="step-n" data-i18n="how.step1.n">01 — Discover</p>
+          <h3>goflow_describe_catalog</h3>
+          <p data-i18n="how.step1.p">The agent asks what's available — every built-in piece and every JS-authored one, with real input schemas — before it writes a single line.</p>
+        </div>
+        <div class="step">
+          <p class="step-n" data-i18n="how.step2.n">02 — Author</p>
+          <h3>goflow_save_piece</h3>
+          <p data-i18n-html="how.step2.p">A new integration is a name, a JS function, and at least one worked example. goflow actually <em>runs</em> every example before it accepts the piece — no example, no save.</p>
+        </div>
+        <div class="step">
+          <p class="step-n" data-i18n="how.step3.n">03 — Run</p>
+          <h3>goflow_save_flow · goflow_run_flow</h3>
+          <p data-i18n="how.step3.p">The flow is saved, validated against the live registry, and executed — recorded in history, replayable later against whatever the flow looks like by then.</p>
+        </div>
+      </div>
+      <div class="code-panel">
+        <div class="code-panel-head"><span>tools/call — goflow_save_piece</span><span>JSON-RPC 2.0 over HTTP</span></div>
+        <pre><span class="c">// the agent's entire tool call — no build step, no publish step</span>
+{
+  <span class="k">"name"</span>: <span class="k">"tools/call"</span>,
+  <span class="k">"arguments"</span>: {
+    <span class="k">"name"</span>: <span class="k">"goflow_save_piece"</span>,
+    <span class="k">"arguments"</span>: {
+      <span class="k">"name"</span>: <span class="s">"acme_billing"</span>,
+      <span class="k">"actions"</span>: [{
+        <span class="k">"name"</span>: <span class="s">"refund"</span>,
+        <span class="k">"source"</span>: <span class="s">"(ctx) => ctx.fetch({ ... })"</span>,
+        <span class="k">"examples"</span>: [{ <span class="k">"description"</span>: <span class="s">"dry run"</span>, <span class="k">"checkOutput"</span>: <span class="k">true</span> }]
+      }]
+    }
+  }
+}
+<span class="c">// goflow runs the example for real before this piece is ever persisted</span></pre>
+      </div>
+    </div>
+  </section>
+
+  <section id="compare">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow" data-i18n="compare.eyebrow">Datasheet</p>
+        <h2 data-i18n="compare.h2">What actually differs, side by side</h2>
+        <p class="lede" data-i18n="compare.lede">Not a marketing checklist — the concrete mechanics that change what an agent, or a team, can rely on.</p>
+      </div>
+      <div class="datasheet-wrap panel">
+        <span class="tick-bl"></span><span class="tick-br"></span>
+        <table class="datasheet">
+          <caption data-i18n="compare.caption">Comparison of goflow, n8n, and Zapier/Make</caption>
+          <thead>
+            <tr>
+              <th scope="col" data-i18n="compare.col.capability">Capability</th>
+              <th scope="col" class="col-goflow">goflow</th>
+              <th scope="col">n8n</th>
+              <th scope="col">Zapier / Make</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th scope="row" data-i18n="compare.row1.h">Runs where</th>
+              <td class="col-goflow" data-i18n="compare.row1.goflow">Your own server — one Go binary</td>
+              <td data-i18n="compare.row1.n8n">Self-host (Node.js) or their cloud</td>
+              <td data-i18n="compare.row1.zapier">Their cloud only</td>
+            </tr>
+            <tr>
+              <th scope="row" data-i18n="compare.row2.h">Primary operator</th>
+              <td class="col-goflow" data-i18n="compare.row2.goflow">An agent, over MCP — same access a human gets</td>
+              <td data-i18n="compare.row2.n8n">A human, via a visual canvas</td>
+              <td data-i18n="compare.row2.zapier">A human, via a visual canvas</td>
+            </tr>
+            <tr>
+              <th scope="row" data-i18n="compare.row3.h">Adding an integration</th>
+              <td class="col-goflow" data-i18n="compare.row3.goflow">JSON + JS, imported in one API call</td>
+              <td data-i18n="compare.row3.n8n">Write a TypeScript node, build, publish</td>
+              <td data-i18n="compare.row3.zapier">Request it, or wire raw HTTP yourself</td>
+            </tr>
+            <tr>
+              <th scope="row" data-i18n="compare.row4.h">Before a save is accepted</th>
+              <td class="col-goflow" data-i18n-html="compare.row4.goflow">Worked examples actually <em>execute</em></td>
+              <td data-i18n="compare.row4.n8n">Structural validation only</td>
+              <td data-i18n="compare.row4.zapier">Structural validation only</td>
+            </tr>
+            <tr>
+              <th scope="row" data-i18n="compare.row5.h">Version history + rollback</th>
+              <td class="col-goflow" data-i18n-html="compare.row5.goflow">Flows <em>and</em> individual pieces</td>
+              <td data-i18n="compare.row5.n8n">Flows, on paid tiers</td>
+              <td data-i18n="compare.row5.zapier">Limited or none</td>
+            </tr>
+            <tr>
+              <th scope="row" data-i18n="compare.row6.h">Replay a past run</th>
+              <td class="col-goflow" data-i18n="compare.row6.goflow">Against the current definition, to prove an edit is safe</td>
+              <td>—</td>
+              <td>—</td>
+            </tr>
+            <tr>
+              <th scope="row" data-i18n="compare.row7.h">License</th>
+              <td class="col-goflow" data-i18n="compare.row7.goflow">Apache 2.0 — fully open source</td>
+              <td data-i18n="compare.row7.n8n">Source-available, use-restricted</td>
+              <td data-i18n="compare.row7.zapier">Closed</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="trust">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow" data-i18n="trust.eyebrow">Guarantees, not vibes</p>
+        <h2 data-i18n="trust.h2">Every save is verified. Every edit is reversible.</h2>
+      </div>
+      <div class="trust-grid panel" style="padding:0; border: 1px solid var(--line);">
+        <div class="trust-card">
+          <p class="mark" data-i18n="trust.card1.mark">// examples run for real</p>
+          <h3 data-i18n="trust.card1.h">Nothing is saved untested</h3>
+          <p data-i18n="trust.card1.p">A piece's worked examples aren't schema hints — goflow executes each one before persisting. A broken piece never reaches the catalog.</p>
+        </div>
+        <div class="trust-card">
+          <p class="mark" data-i18n="trust.card2.mark">// nothing is ever overwritten</p>
+          <h3 data-i18n="trust.card2.h">Full history, one rollback away</h3>
+          <p data-i18n="trust.card2.p">Every save of a flow — or a single piece — records an immutable version. Roll back through the same gate a live edit goes through, no exceptions.</p>
+        </div>
+        <div class="trust-card">
+          <p class="mark" data-i18n="trust.card3.mark">// prove it before you trust it</p>
+          <h3 data-i18n="trust.card3.h">Replay real traffic against an edit</h3>
+          <p data-i18n="trust.card3.p">Take any past run and re-fire its exact trigger against the flow's current definition — see whether your change actually altered behavior, before anyone else finds out.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="footprint">
+    <div class="wrap footprint">
+      <div>
+        <div class="section-head" style="margin-bottom:28px;">
+          <p class="eyebrow" data-i18n="footprint.eyebrow">Footprint</p>
+          <h2 data-i18n="footprint.h2">Small enough to read, honest about what it isn't</h2>
+          <p class="lede" data-i18n="footprint.lede">stdlib-heavy by design. One real dependency for the JS sandbox. No queue, no cache, no database service required to start.</p>
+        </div>
+      </div>
+      <ul class="footprint-list">
+        <li><span data-i18n="footprint.language">Language</span><span>Go</span></li>
+        <li><span data-i18n="footprint.binary">Binary size</span><span>~22 MB, single file</span></li>
+        <li><span data-i18n="footprint.services">Required external services</span><span data-i18n="footprint.none">none</span></li>
+        <li><span data-i18n="footprint.sandbox">JS sandbox</span><span>goja (pure Go)</span></li>
+        <li><span data-i18n="footprint.transport">Transport</span><span>HTTP + MCP (JSON-RPC 2.0)</span></li>
+        <li><span data-i18n="footprint.auth">Auth</span><span data-i18n="footprint.authval">bearer token or OAuth 2.1</span></li>
+        <li><span data-i18n="footprint.license">License</span><span>Apache 2.0</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="final-cta" style="padding-bottom: 88px;">
+    <div class="wrap">
+      <div class="final-cta-panel panel">
+        <span class="tick-bl"></span><span class="tick-br"></span>
+        <div>
+          <h2 data-i18n="cta.h2">Read the code before you take our word for it.</h2>
+          <p class="lede" data-i18n="cta.lede">It's a public repo, Apache 2.0, one binary to build. Clone it, point an MCP client at it, and see what it actually does.</p>
+        </div>
+        <a class="btn btn-primary" href="https://github.com/MauricioPerera/goflow">github.com/MauricioPerera/goflow</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap footer-row">
+    <span class="mono">goflow — Apache License 2.0</span>
+    <div class="footer-links">
+      <a href="https://github.com/MauricioPerera/goflow" data-i18n="footer.source">Source</a>
+      <a href="https://github.com/MauricioPerera/goflow#readme" data-i18n="footer.docs">Docs</a>
+      <a href="https://github.com/MauricioPerera/goflow/issues" data-i18n="footer.issues">Issues</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  // theme toggle
+  var root = document.documentElement;
+  var btn = document.getElementById('themeToggle');
+  function currentTheme() {
+    var stamped = root.getAttribute('data-theme');
+    if (stamped === 'dark' || stamped === 'light') return stamped;
+    return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  }
+  btn.addEventListener('click', function () {
+    var next = currentTheme() === 'dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+  });
+
+  // hero diagram: trigger -> action -> action -> action, pulse traveling the path
+  var canvas = document.getElementById('flowCanvas');
+  var ctx = canvas.getContext('2d');
+  var reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+  var labels = ['webhook.trigger', 'hash.hmac', 'http.post', 'notion.create_page'];
+
+  function resize() {
+    var rect = canvas.getBoundingClientRect();
+    canvas.width = Math.max(1, rect.width * dpr);
+    canvas.height = Math.max(1, rect.height * dpr);
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  function readVar(name) {
+    return getComputedStyle(root).getPropertyValue(name).trim();
+  }
+
+  function nodePositions() {
+    var w = canvas.width, h = canvas.height;
+    var n = labels.length;
+    var marginX = w * 0.09;
+    var usable = w - marginX * 2;
+    var pts = [];
+    for (var i = 0; i < n; i++) {
+      var x = marginX + (usable * i) / (n - 1);
+      var y = h * 0.5 + (i % 2 === 0 ? -1 : 1) * h * 0.11;
+      pts.push({ x: x, y: y });
+    }
+    return pts;
+  }
+
+  var t0 = null;
+  function draw(ts) {
+    if (t0 === null) t0 = ts;
+    var elapsed = (ts - t0) / 1000;
+
+    var ink = readVar('--ink-dim');
+    var inkStrong = readVar('--ink');
+    var signal = readVar('--signal');
+    var line = readVar('--line-strong');
+
+    var w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
+    var pts = nodePositions();
+
+    // connecting path
+    ctx.strokeStyle = line;
+    ctx.lineWidth = Math.max(1, 1.4 * dpr);
+    ctx.beginPath();
+    for (var i = 0; i < pts.length; i++) {
+      var p = pts[i];
+      if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+
+    // nodes
+    for (var j = 0; j < pts.length; j++) {
+      var pj = pts[j];
+      ctx.beginPath();
+      ctx.arc(pj.x, pj.y, 6 * dpr, 0, Math.PI * 2);
+      ctx.fillStyle = readVar('--paper-raised');
+      ctx.fill();
+      ctx.lineWidth = 2 * dpr;
+      ctx.strokeStyle = j === 0 ? signal : inkStrong;
+      ctx.stroke();
+
+      ctx.font = (11 * dpr) + 'px "SF Mono", Consolas, monospace';
+      ctx.fillStyle = ink;
+      ctx.textAlign = 'center';
+      var above = (j % 2 === 0);
+      ctx.fillText(labels[j], pj.x, above ? pj.y - 16 * dpr : pj.y + 26 * dpr);
+    }
+
+    // traveling pulse
+    var cycle = 3.2;
+    var progress = reduceMotion ? 0.62 : (elapsed % cycle) / cycle;
+    var seg = progress * (pts.length - 1);
+    var idx = Math.min(Math.floor(seg), pts.length - 2);
+    var localT = seg - idx;
+    var a = pts[idx], b = pts[idx + 1];
+    var px = a.x + (b.x - a.x) * localT;
+    var py = a.y + (b.y - a.y) * localT;
+
+    var glow = ctx.createRadialGradient(px, py, 0, px, py, 16 * dpr);
+    glow.addColorStop(0, signal);
+    glow.addColorStop(1, 'transparent');
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(px, py, 16 * dpr, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.arc(px, py, 4 * dpr, 0, Math.PI * 2);
+    ctx.fillStyle = signal;
+    ctx.fill();
+
+    if (!reduceMotion) requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+})();
+</script>
+<script>
+(function () {
+  var I18N = {
+    en: {
+      "nav.compare": "Compare",
+      "nav.how": "How it works",
+      "nav.trust": "Guarantees",
+      "nav.footprint": "Footprint",
+      "hero.eyebrow": "Self-hosted · MCP-native · Apache 2.0",
+      "hero.h1": "Automation built to be <span class=\"accent\">operated by agents</span>, not clicked through by humans.",
+      "hero.sub": "goflow is a workflow engine an AI agent reads, extends, and runs through one protocol — MCP — with the same power a human gets from a UI. No canvas required. No canvas at all.",
+      "hero.ctaPrimary": "View source on GitHub",
+      "hero.ctaGhost": "Read the full spec ↗",
+      "hero.stat.tools": "MCP tools, agent-callable",
+      "hero.stat.pieces": "built-in pieces",
+      "hero.stat.binary": "binary, ~22 MB",
+      "hero.stat.services": "required external services",
+      "positioning.eyebrow": "Position",
+      "positioning.h2": "n8n and Zapier were built for a person to click through.<br>goflow was built for an agent to operate.",
+      "positioning.p1": "Most automation platforms added an AI node to an existing canvas. That gets you a chatbot that can <em>configure</em> the canvas for you — it still ends at a UI a human has to open, inspect, and click \"activate\" in.",
+      "positioning.p2": "goflow has <strong>no canvas</strong>. A flow is JSON. A piece is JSON with a JavaScript function inside it. Both are created, versioned, run, and rolled back through the same MCP tool surface a human would use over HTTP — which means an agent doesn't need permission to act differently than a person; it already has the identical surface a person has.",
+      "positioning.p3": "That's the actual bet: not \"AI-assisted automation,\" but automation where the agent <strong>is</strong> the primary operator, and the API was designed for that from the first line of code, not retrofitted onto a drag-and-drop tool built for a different audience.",
+      "how.eyebrow": "How it actually works",
+      "how.h2": "An agent builds and runs a flow in one exchange",
+      "how.lede": "No screen to open, no node to drag. This is the entire round trip — describe the catalog, save a piece, run it.",
+      "how.step1.n": "01 — Discover",
+      "how.step1.p": "The agent asks what's available — every built-in piece and every JS-authored one, with real input schemas — before it writes a single line.",
+      "how.step2.n": "02 — Author",
+      "how.step2.p": "A new integration is a name, a JS function, and at least one worked example. goflow actually <em>runs</em> every example before it accepts the piece — no example, no save.",
+      "how.step3.n": "03 — Run",
+      "how.step3.p": "The flow is saved, validated against the live registry, and executed — recorded in history, replayable later against whatever the flow looks like by then.",
+      "compare.eyebrow": "Datasheet",
+      "compare.h2": "What actually differs, side by side",
+      "compare.lede": "Not a marketing checklist — the concrete mechanics that change what an agent, or a team, can rely on.",
+      "compare.caption": "Comparison of goflow, n8n, and Zapier/Make",
+      "compare.col.capability": "Capability",
+      "compare.row1.h": "Runs where",
+      "compare.row1.goflow": "Your own server — one Go binary",
+      "compare.row1.n8n": "Self-host (Node.js) or their cloud",
+      "compare.row1.zapier": "Their cloud only",
+      "compare.row2.h": "Primary operator",
+      "compare.row2.goflow": "An agent, over MCP — same access a human gets",
+      "compare.row2.n8n": "A human, via a visual canvas",
+      "compare.row2.zapier": "A human, via a visual canvas",
+      "compare.row3.h": "Adding an integration",
+      "compare.row3.goflow": "JSON + JS, imported in one API call",
+      "compare.row3.n8n": "Write a TypeScript node, build, publish",
+      "compare.row3.zapier": "Request it, or wire raw HTTP yourself",
+      "compare.row4.h": "Before a save is accepted",
+      "compare.row4.goflow": "Worked examples actually <em>execute</em>",
+      "compare.row4.n8n": "Structural validation only",
+      "compare.row4.zapier": "Structural validation only",
+      "compare.row5.h": "Version history + rollback",
+      "compare.row5.goflow": "Flows <em>and</em> individual pieces",
+      "compare.row5.n8n": "Flows, on paid tiers",
+      "compare.row5.zapier": "Limited or none",
+      "compare.row6.h": "Replay a past run",
+      "compare.row6.goflow": "Against the current definition, to prove an edit is safe",
+      "compare.row7.h": "License",
+      "compare.row7.goflow": "Apache 2.0 — fully open source",
+      "compare.row7.n8n": "Source-available, use-restricted",
+      "compare.row7.zapier": "Closed",
+      "trust.eyebrow": "Guarantees, not vibes",
+      "trust.h2": "Every save is verified. Every edit is reversible.",
+      "trust.card1.mark": "// examples run for real",
+      "trust.card1.h": "Nothing is saved untested",
+      "trust.card1.p": "A piece's worked examples aren't schema hints — goflow executes each one before persisting. A broken piece never reaches the catalog.",
+      "trust.card2.mark": "// nothing is ever overwritten",
+      "trust.card2.h": "Full history, one rollback away",
+      "trust.card2.p": "Every save of a flow — or a single piece — records an immutable version. Roll back through the same gate a live edit goes through, no exceptions.",
+      "trust.card3.mark": "// prove it before you trust it",
+      "trust.card3.h": "Replay real traffic against an edit",
+      "trust.card3.p": "Take any past run and re-fire its exact trigger against the flow's current definition — see whether your change actually altered behavior, before anyone else finds out.",
+      "footprint.eyebrow": "Footprint",
+      "footprint.h2": "Small enough to read, honest about what it isn't",
+      "footprint.lede": "stdlib-heavy by design. One real dependency for the JS sandbox. No queue, no cache, no database service required to start.",
+      "footprint.language": "Language",
+      "footprint.binary": "Binary size",
+      "footprint.services": "Required external services",
+      "footprint.none": "none",
+      "footprint.sandbox": "JS sandbox",
+      "footprint.transport": "Transport",
+      "footprint.auth": "Auth",
+      "footprint.authval": "bearer token or OAuth 2.1",
+      "footprint.license": "License",
+      "cta.h2": "Read the code before you take our word for it.",
+      "cta.lede": "It's a public repo, Apache 2.0, one binary to build. Clone it, point an MCP client at it, and see what it actually does.",
+      "footer.source": "Source",
+      "footer.docs": "Docs",
+      "footer.issues": "Issues",
+      "meta.title": "goflow — automation built to be operated by agents",
+      "meta.description": "goflow is a self-hosted, Apache-2.0 workflow engine an AI agent can read, extend, and run through MCP — instead of a drag-and-drop canvas it can only watch."
+    },
+    es: {
+      "nav.compare": "Comparativa",
+      "nav.how": "Cómo funciona",
+      "nav.trust": "Garantías",
+      "nav.footprint": "Ficha técnica",
+      "hero.eyebrow": "Autoalojado · Nativo en MCP · Apache 2.0",
+      "hero.h1": "Automatización pensada para que la <span class=\"accent\">opere un agente</span>, no para que un humano la vaya clickeando.",
+      "hero.sub": "goflow es un motor de workflows que un agente de IA puede leer, extender y ejecutar a través de un solo protocolo — MCP — con el mismo poder que tiene un humano desde una interfaz. Sin canvas. Directamente no hay canvas.",
+      "hero.ctaPrimary": "Ver código fuente en GitHub",
+      "hero.ctaGhost": "Leer la spec completa ↗",
+      "hero.stat.tools": "herramientas MCP invocables por un agente",
+      "hero.stat.pieces": "piezas incorporadas",
+      "hero.stat.binary": "binario, ~22 MB",
+      "hero.stat.services": "servicios externos requeridos",
+      "positioning.eyebrow": "Posicionamiento",
+      "positioning.h2": "n8n y Zapier se diseñaron para que una persona los fuera clickeando.<br>goflow se diseñó para que un agente los opere.",
+      "positioning.p1": "La mayoría de las plataformas de automatización le agregaron un nodo de IA a un canvas ya existente. Eso te da un chatbot que puede <em>configurar</em> el canvas por vos — pero igual termina en una interfaz que un humano tiene que abrir, revisar y clickear \"activar\".",
+      "positioning.p2": "goflow no tiene <strong>canvas</strong>. Un flow es JSON. Una pieza es JSON con una función de JavaScript adentro. Ambos se crean, versionan, ejecutan y revierten a través de la misma superficie de herramientas MCP que usaría un humano por HTTP — es decir, un agente no necesita permiso especial para actuar distinto de una persona; ya tiene exactamente la misma superficie que tiene una persona.",
+      "positioning.p3": "Esa es la apuesta real: no \"automatización asistida por IA\", sino automatización donde el agente <strong>es</strong> el operador principal, con una API diseñada para eso desde la primera línea de código — no adaptada después sobre una herramienta de arrastrar y soltar pensada para otro público.",
+      "how.eyebrow": "Cómo funciona en la práctica",
+      "how.h2": "Un agente construye y ejecuta un flow en un solo intercambio",
+      "how.lede": "Sin pantalla que abrir, sin nodo que arrastrar. Este es el recorrido completo — describir el catálogo, guardar una pieza, ejecutarla.",
+      "how.step1.n": "01 — Descubrir",
+      "how.step1.p": "El agente pregunta qué hay disponible — cada pieza incorporada y cada una escrita en JS, con sus esquemas de entrada reales — antes de escribir una sola línea.",
+      "how.step2.n": "02 — Crear",
+      "how.step2.p": "Una integración nueva es un nombre, una función JS y al menos un ejemplo funcional. goflow realmente <em>ejecuta</em> cada ejemplo antes de aceptar la pieza — sin ejemplo, no se guarda.",
+      "how.step3.n": "03 — Ejecutar",
+      "how.step3.p": "El flow se guarda, se valida contra el registro en vivo y se ejecuta — queda registrado en el historial, y se puede volver a reproducir más adelante contra lo que sea que el flow sea en ese momento.",
+      "compare.eyebrow": "Ficha técnica",
+      "compare.h2": "Qué cambia realmente, en paralelo",
+      "compare.lede": "No es una lista de marketing — son los mecanismos concretos que cambian con qué puede contar un agente, o un equipo.",
+      "compare.caption": "Comparación entre goflow, n8n y Zapier/Make",
+      "compare.col.capability": "Capacidad",
+      "compare.row1.h": "Dónde corre",
+      "compare.row1.goflow": "En tu propio servidor — un solo binario en Go",
+      "compare.row1.n8n": "Autoalojado (Node.js) o su nube",
+      "compare.row1.zapier": "Solo su nube",
+      "compare.row2.h": "Operador principal",
+      "compare.row2.goflow": "Un agente, vía MCP — el mismo acceso que tiene un humano",
+      "compare.row2.n8n": "Un humano, vía canvas visual",
+      "compare.row2.zapier": "Un humano, vía canvas visual",
+      "compare.row3.h": "Agregar una integración",
+      "compare.row3.goflow": "JSON + JS, importado en una sola llamada a la API",
+      "compare.row3.n8n": "Escribir un nodo en TypeScript, compilarlo, publicarlo",
+      "compare.row3.zapier": "Pedirla, o armar el HTTP crudo vos mismo",
+      "compare.row4.h": "Antes de aceptar un guardado",
+      "compare.row4.goflow": "Los ejemplos funcionales realmente se <em>ejecutan</em>",
+      "compare.row4.n8n": "Solo validación estructural",
+      "compare.row4.zapier": "Solo validación estructural",
+      "compare.row5.h": "Historial de versiones + rollback",
+      "compare.row5.goflow": "De flows <em>y</em> de piezas individuales",
+      "compare.row5.n8n": "De flows, en planes pagos",
+      "compare.row5.zapier": "Limitado o inexistente",
+      "compare.row6.h": "Reproducir una corrida pasada",
+      "compare.row6.goflow": "Contra la definición actual, para probar que un cambio es seguro",
+      "compare.row7.h": "Licencia",
+      "compare.row7.goflow": "Apache 2.0 — código abierto completo",
+      "compare.row7.n8n": "Código disponible, con uso restringido",
+      "compare.row7.zapier": "Cerrado",
+      "trust.eyebrow": "Garantías, no promesas",
+      "trust.h2": "Todo guardado se verifica. Todo cambio se puede revertir.",
+      "trust.card1.mark": "// los ejemplos se ejecutan de verdad",
+      "trust.card1.h": "Nada se guarda sin probar",
+      "trust.card1.p": "Los ejemplos funcionales de una pieza no son solo pistas de esquema — goflow ejecuta cada uno antes de persistir. Una pieza rota nunca llega al catálogo.",
+      "trust.card2.mark": "// nada se sobrescribe jamás",
+      "trust.card2.h": "Historial completo, a un rollback de distancia",
+      "trust.card2.p": "Cada guardado de un flow — o de una sola pieza — registra una versión inmutable. El rollback pasa por el mismo control que un guardado en vivo, sin excepciones.",
+      "trust.card3.mark": "// probalo antes de confiar",
+      "trust.card3.h": "Reproducí tráfico real contra un cambio",
+      "trust.card3.p": "Tomá cualquier corrida pasada y volvé a disparar su trigger exacto contra la definición actual del flow — para ver si tu cambio realmente alteró el comportamiento, antes de que se entere otra persona.",
+      "footprint.eyebrow": "Ficha técnica",
+      "footprint.h2": "Lo bastante chico para leerlo entero, honesto sobre lo que no es",
+      "footprint.lede": "Pensado para apoyarse en la stdlib. Una sola dependencia real, para el sandbox de JS. Sin cola, sin caché, sin necesitar un servicio de base de datos para arrancar.",
+      "footprint.language": "Lenguaje",
+      "footprint.binary": "Tamaño del binario",
+      "footprint.services": "Servicios externos requeridos",
+      "footprint.none": "ninguno",
+      "footprint.sandbox": "Sandbox de JS",
+      "footprint.transport": "Transporte",
+      "footprint.auth": "Autenticación",
+      "footprint.authval": "token bearer u OAuth 2.1",
+      "footprint.license": "Licencia",
+      "cta.h2": "Leé el código antes de creernos de palabra.",
+      "cta.lede": "Es un repo público, Apache 2.0, un solo binario para compilar. Clonalo, apuntale un cliente MCP, y mirá qué hace en realidad.",
+      "footer.source": "Código fuente",
+      "footer.docs": "Documentación",
+      "footer.issues": "Issues",
+      "meta.title": "goflow — automatización pensada para que la opere un agente",
+      "meta.description": "goflow es un motor de workflows autoalojado, con licencia Apache 2.0, que un agente de IA puede leer, extender y ejecutar por MCP — en vez de un canvas de arrastrar y soltar que solo puede mirar."
+    },
+    pt: {
+      "nav.compare": "Comparativo",
+      "nav.how": "Como funciona",
+      "nav.trust": "Garantias",
+      "nav.footprint": "Especificações",
+      "hero.eyebrow": "Auto-hospedado · Nativo em MCP · Apache 2.0",
+      "hero.h1": "Automação feita para ser <span class=\"accent\">operada por agentes</span>, não clicada por humanos.",
+      "hero.sub": "goflow é um motor de workflows que um agente de IA lê, estende e executa através de um único protocolo — MCP — com o mesmo poder que um humano tem a partir de uma interface. Sem canvas. Nem existe canvas.",
+      "hero.ctaPrimary": "Ver código-fonte no GitHub",
+      "hero.ctaGhost": "Ler a spec completa ↗",
+      "hero.stat.tools": "ferramentas MCP acionáveis por um agente",
+      "hero.stat.pieces": "peças embutidas",
+      "hero.stat.binary": "binário, ~22 MB",
+      "hero.stat.services": "serviços externos exigidos",
+      "positioning.eyebrow": "Posicionamento",
+      "positioning.h2": "n8n e Zapier foram feitos para uma pessoa clicar.<br>goflow foi feito para um agente operar.",
+      "positioning.p1": "A maioria das plataformas de automação adicionou um nó de IA a um canvas já existente. Isso te dá um chatbot capaz de <em>configurar</em> o canvas por você — mas ainda termina numa interface que um humano precisa abrir, revisar e clicar em \"ativar\".",
+      "positioning.p2": "goflow não tem <strong>canvas</strong>. Um flow é JSON. Uma peça é JSON com uma função JavaScript dentro. Os dois são criados, versionados, executados e revertidos pela mesma superfície de ferramentas MCP que um humano usaria via HTTP — ou seja, um agente não precisa de permissão especial para agir diferente de uma pessoa; ele já tem exatamente a mesma superfície que uma pessoa tem.",
+      "positioning.p3": "Essa é a aposta real: não é \"automação assistida por IA\", é automação em que o agente <strong>é</strong> o operador principal, com uma API projetada para isso desde a primeira linha de código — não adaptada depois em cima de uma ferramenta de arrastar e soltar pensada para outro público.",
+      "how.eyebrow": "Como funciona na prática",
+      "how.h2": "Um agente cria e executa um flow em uma única troca",
+      "how.lede": "Sem tela para abrir, sem nó para arrastar. Esse é o percurso completo — descrever o catálogo, salvar uma peça, executá-la.",
+      "how.step1.n": "01 — Descobrir",
+      "how.step1.p": "O agente pergunta o que está disponível — cada peça embutida e cada uma escrita em JS, com seus esquemas de entrada reais — antes de escrever uma única linha.",
+      "how.step2.n": "02 — Criar",
+      "how.step2.p": "Uma nova integração é um nome, uma função JS e pelo menos um exemplo funcional. O goflow realmente <em>executa</em> cada exemplo antes de aceitar a peça — sem exemplo, não salva.",
+      "how.step3.n": "03 — Executar",
+      "how.step3.p": "O flow é salvo, validado contra o registro em tempo real e executado — fica registrado no histórico, e pode ser reproduzido depois contra o que o flow for naquele momento.",
+      "compare.eyebrow": "Ficha técnica",
+      "compare.h2": "O que realmente muda, lado a lado",
+      "compare.lede": "Não é uma lista de marketing — são os mecanismos concretos que mudam com o que um agente, ou uma equipe, pode contar.",
+      "compare.caption": "Comparação entre goflow, n8n e Zapier/Make",
+      "compare.col.capability": "Capacidade",
+      "compare.row1.h": "Onde roda",
+      "compare.row1.goflow": "No seu próprio servidor — um único binário em Go",
+      "compare.row1.n8n": "Auto-hospedado (Node.js) ou a nuvem deles",
+      "compare.row1.zapier": "Só a nuvem deles",
+      "compare.row2.h": "Operador principal",
+      "compare.row2.goflow": "Um agente, via MCP — o mesmo acesso que um humano tem",
+      "compare.row2.n8n": "Um humano, via canvas visual",
+      "compare.row2.zapier": "Um humano, via canvas visual",
+      "compare.row3.h": "Adicionar uma integração",
+      "compare.row3.goflow": "JSON + JS, importado em uma única chamada de API",
+      "compare.row3.n8n": "Escrever um nó em TypeScript, compilar, publicar",
+      "compare.row3.zapier": "Pedir para adicionarem, ou montar o HTTP puro você mesmo",
+      "compare.row4.h": "Antes de aceitar um salvamento",
+      "compare.row4.goflow": "Exemplos funcionais realmente <em>executam</em>",
+      "compare.row4.n8n": "Só validação estrutural",
+      "compare.row4.zapier": "Só validação estrutural",
+      "compare.row5.h": "Histórico de versões + rollback",
+      "compare.row5.goflow": "De flows <em>e</em> de peças individuais",
+      "compare.row5.n8n": "De flows, nos planos pagos",
+      "compare.row5.zapier": "Limitado ou inexistente",
+      "compare.row6.h": "Reproduzir uma execução passada",
+      "compare.row6.goflow": "Contra a definição atual, para provar que uma mudança é segura",
+      "compare.row7.h": "Licença",
+      "compare.row7.goflow": "Apache 2.0 — totalmente open source",
+      "compare.row7.n8n": "Código disponível, uso restrito",
+      "compare.row7.zapier": "Fechado",
+      "trust.eyebrow": "Garantias, não promessas",
+      "trust.h2": "Todo salvamento é verificado. Toda alteração é reversível.",
+      "trust.card1.mark": "// exemplos executam de verdade",
+      "trust.card1.h": "Nada é salvo sem ser testado",
+      "trust.card1.p": "Os exemplos funcionais de uma peça não são só dicas de esquema — o goflow executa cada um antes de persistir. Uma peça quebrada nunca chega ao catálogo.",
+      "trust.card2.mark": "// nada é sobrescrito",
+      "trust.card2.h": "Histórico completo, a um rollback de distância",
+      "trust.card2.p": "Todo salvamento de um flow — ou de uma única peça — registra uma versão imutável. O rollback passa pelo mesmo controle que um salvamento ao vivo, sem exceções.",
+      "trust.card3.mark": "// prove antes de confiar",
+      "trust.card3.h": "Reproduza tráfego real contra uma alteração",
+      "trust.card3.p": "Pegue qualquer execução passada e dispare de novo seu gatilho exato contra a definição atual do flow — veja se sua mudança realmente alterou o comportamento, antes que outra pessoa descubra.",
+      "footprint.eyebrow": "Especificações",
+      "footprint.h2": "Pequeno o suficiente para ler inteiro, honesto sobre o que não é",
+      "footprint.lede": "Pensado para depender da stdlib. Uma única dependência real, para o sandbox de JS. Sem fila, sem cache, sem exigir um serviço de banco de dados para começar.",
+      "footprint.language": "Linguagem",
+      "footprint.binary": "Tamanho do binário",
+      "footprint.services": "Serviços externos exigidos",
+      "footprint.none": "nenhum",
+      "footprint.sandbox": "Sandbox de JS",
+      "footprint.transport": "Transporte",
+      "footprint.auth": "Autenticação",
+      "footprint.authval": "token bearer ou OAuth 2.1",
+      "footprint.license": "Licença",
+      "cta.h2": "Leia o código antes de confiar na nossa palavra.",
+      "cta.lede": "É um repositório público, Apache 2.0, um único binário para compilar. Clone, aponte um cliente MCP para ele, e veja o que ele realmente faz.",
+      "footer.source": "Código-fonte",
+      "footer.docs": "Documentação",
+      "footer.issues": "Issues",
+      "meta.title": "goflow — automação feita para ser operada por agentes",
+      "meta.description": "goflow é um motor de workflows auto-hospedado, com licença Apache 2.0, que um agente de IA pode ler, estender e executar via MCP — em vez de um canvas de arrastar e soltar que ele só consegue observar."
+    }
+  };
+
+  var SUPPORTED = ['en', 'es', 'pt'];
+  var metaDesc = document.querySelector('meta[name="description"]');
+  var titleEl = document.querySelector('title');
+
+  function detectLang() {
+    var saved = localStorage.getItem('goflow-lang');
+    if (saved && SUPPORTED.indexOf(saved) !== -1) return saved;
+    var nav = (navigator.language || 'en').slice(0, 2).toLowerCase();
+    return SUPPORTED.indexOf(nav) !== -1 ? nav : 'en';
+  }
+
+  function applyLang(lang) {
+    if (SUPPORTED.indexOf(lang) === -1) lang = 'en';
+    var t = I18N[lang];
+    document.documentElement.setAttribute('lang', lang);
+    if (titleEl && t['meta.title']) titleEl.textContent = t['meta.title'];
+    if (metaDesc && t['meta.description']) metaDesc.setAttribute('content', t['meta.description']);
+
+    document.querySelectorAll('[data-i18n]').forEach(function (el) {
+      var key = el.getAttribute('data-i18n');
+      if (t[key]) el.textContent = t[key];
+    });
+    document.querySelectorAll('[data-i18n-html]').forEach(function (el) {
+      var key = el.getAttribute('data-i18n-html');
+      if (t[key]) el.innerHTML = t[key];
+    });
+    document.querySelectorAll('[data-lang-btn]').forEach(function (btn) {
+      var isActive = btn.getAttribute('data-lang-btn') === lang;
+      btn.setAttribute('aria-current', isActive ? 'true' : 'false');
+    });
+  }
+
+  document.querySelectorAll('[data-lang-btn]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var lang = btn.getAttribute('data-lang-btn');
+      localStorage.setItem('goflow-lang', lang);
+      applyLang(lang);
+    });
+  });
+
+  applyLang(detectLang());
+})();
+</script>
+</body>
+</html>
